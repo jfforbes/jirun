@@ -1,0 +1,5 @@
+# Never commit secrets or local cache
+credentials.txt
+.env
+bpm-cache.json
+node_modules/
