@@ -36,7 +36,7 @@
   .searchwrap{position:relative}
   .results{position:absolute;left:0;right:0;top:calc(100% + 4px);background:var(--surface);border:1px solid var(--line);border-radius:4px;overflow:hidden;z-index:20;max-height:280px;overflow-y:auto;box-shadow:0 8px 16px rgba(9,30,66,.15)}
   .results .r{padding:9px 12px;cursor:pointer;border-bottom:1px solid var(--line);display:flex;justify-content:space-between;gap:10px;align-items:center}
-  .results .r:last-child{border:none}.results .r:hover{background:var(--surface-2)}
+  .results .r:last-child{border:none}.results .r:hover,.results .r.hl{background:var(--surface-2)}
   .results .r .title{font-size:13.5px}
   .results .r .g{font-family:var(--mono);font-size:10px;color:var(--pace);text-transform:uppercase}
   .results .empty{padding:12px;color:var(--muted);font-size:12px;text-align:center}
@@ -88,17 +88,21 @@
 </head>
 <body>
   <h1><span class="logo">j</span> jirun</h1>
-  <p class="sub">Sprint planning for people who actually sprint. Groom your backlog, estimate your zones, ship the playlist.</p>
+  <p class="sub">Sprint planning for people who actually sprint. Refine your backlog, estimate your zones, ship the playlist.</p>
 
   <section class="hero" aria-label="Backlog">
+    <div class="modes" id="serviceTabs">
+      <button data-svc="tidal" aria-pressed="true">Tidal</button>
+      <button data-svc="spotify" aria-pressed="false">Spotify</button>
+    </div>
     <div id="tidalSetup">
       <div class="conn off" id="connStatus" style="margin-top:2px">Checking login…</div>
-      <button class="btn" id="loginBtn" style="display:none">Log in with Tidal</button>
-      <div class="hint" style="margin-top:8px">One-time login through the local bridge. Make sure <code>server.mjs</code> is running and this page is at <code>http://localhost:8080/</code>.</div>
+      <button class="btn" id="loginBtn" style="display:none">Log in</button>
+      <div class="hint" style="margin-top:8px">One-time login through the local bridge. Playlists land in whichever service you're logged into.</div>
     </div>
     <p class="eyebrow" style="margin-top:14px">Backlog <span class="seedcount" id="seedCount">0</span></p>
     <div class="searchwrap">
-      <input id="search" placeholder="Groom the backlog — search a song or artist…" autocomplete="off" />
+      <input id="search" placeholder="Refine the backlog — search an artist…" autocomplete="off" />
       <div id="results" class="results" hidden></div>
     </div>
     <div class="seeds" id="seeds"></div>
@@ -134,8 +138,8 @@
   <section aria-label="Automation">
     <p class="eyebrow">Automation · match rules</p>
     <div class="controls">
-      <label>Tolerance <span class="rowval" id="tolVal">±2</span> bpm
-        <input type="range" id="tol" min="1" max="10" value="2" style="padding:0;height:28px" /></label>
+      <label>Tolerance <span class="rowval" id="tolVal">±3</span> bpm
+        <input type="range" id="tol" min="1" max="12" value="3" style="padding:0;height:28px" /></label>
       <label>Sync
         <div class="seg-modes">
           <span class="chip" id="mDirect" aria-pressed="true" role="button" tabindex="0">Direct</span>
@@ -149,7 +153,7 @@
 
   <div id="results-area"></div>
   <footer style="text-align:center;font-size:11px;color:var(--muted);margin:14px 0 4px">BPM data by <a href="https://getsongbpm.com" target="_blank" rel="noopener" style="color:var(--pace);font-weight:600">GetSongBPM</a></footer>
-  <div class="cta"><button id="build" disabled>Groom the backlog first</button></div>
+  <div class="cta"><button id="build" disabled>Refine the backlog first</button></div>
 
 <script type="module">
 /* ===================== ENGINE (verified) ===================== */
@@ -170,21 +174,17 @@ function buildPlaylist(segments,candidates,opts){const{cadenceModel,tol=2,modes=
   return{plan,totalPlannedSec:totalPlanned,totalFilledSec:plan.reduce((s,p)=>s+p.filledSec,0),trackCount:plan.reduce((n,p)=>n+p.tracks.length,0)};}
 
 /* ===================== DEMO POOL ===================== */
-/* Tidal-only: all songs come from the bridge. */
-
-/* ===================== TIDAL VIA LOCAL BRIDGE =====================
-   v2 talks to a tiny local server (server.mjs) that holds your Tidal client
-   id + secret and calls the official API server-side. Same-origin, so the
-   browser never touches OAuth or CORS. See server.mjs for the endpoints. */
-let LOGGEDIN=false;
+/* ===================== BRIDGE (Tidal + Spotify) ===================== */
+let LOGGEDIN=false, HEALTH={};
 const api={
-  async health(){try{const r=await fetch("/api/health");const j=await r.json();LOGGEDIN=!!j.loggedIn;return j;}catch(e){LOGGEDIN=false;return{ok:false,loggedIn:false,error:e.message};}},
-  async search(q){const r=await fetch(`/api/search?q=${encodeURIComponent(q)}`);const j=await r.json();if(!r.ok)throw new Error(j.error||r.status);return j;},
-  async pool(seeds){const ids=seeds.map(s=>s.id).join(",");const r=await fetch(`/api/pool?ids=${encodeURIComponent(ids)}`);const j=await r.json();if(!r.ok)throw new Error(j.error||r.status);return j;}
+  async health(){try{const r=await fetch("/api/health");HEALTH=await r.json();LOGGEDIN=!!(HEALTH[state.service]?.loggedIn);return HEALTH;}catch(e){HEALTH={};LOGGEDIN=false;return{ok:false,error:e.message};}},
+  async search(q){const r=await fetch(`/api/search?service=${state.service}&q=${encodeURIComponent(q)}`);const j=await r.json();if(!r.ok)throw new Error(j.error||r.status);return j;},
+  async pool(seeds){const r=await fetch(`/api/pool`,{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify({service:state.service,seeds:seeds.map(s=>({id:s.id,name:s.name||s.title||""}))})});const j=await r.json();if(!r.ok)throw new Error(j.error||r.status);return j;},
+  async export(name,refs){const r=await fetch(`/api/export`,{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify({service:state.service,name,refs})});const j=await r.json();if(!r.ok)throw new Error(j.error||r.status);return j;}
 };
 
 /* ===================== STATE + UI ===================== */
-const state={seeds:[],maxHR:195,
+const state={service:"tidal",seeds:[],maxHR:195,
   // HR zones (50/60/70/80/90% of max HR; "to" is exclusive upper bound)
   zones:[
     {name:"Z1",from:98,to:117},
@@ -201,38 +201,58 @@ const state={seeds:[],maxHR:195,
     {zone:"Z5",pace:"7:40",cadence:176,n:0},
   ],
   segs:[{startMile:0,endMile:3,pace:"9:15"},{startMile:3,endMile:20,pace:"8:40"},{startMile:20,endMile:26.2,pace:"8:25"}],
-  tol:2,modes:{direct:true,half:true},repeat:false,planMode:"pace"};
+  tol:3,modes:{direct:true,half:true},repeat:false,planMode:"pace"};
 function saveCal(){try{localStorage.setItem("pb_cal",JSON.stringify({zones:state.zones,cal:state.cal,maxHR:state.maxHR}));}catch(_){}}
 function loadCal(){try{const s=JSON.parse(localStorage.getItem("pb_cal"));if(s){if(Array.isArray(s.zones))state.zones=s.zones;if(Array.isArray(s.cal))state.cal=s.cal;if(s.maxHR)state.maxHR=s.maxHR;}}catch(_){}}
 const $=(s)=>document.querySelector(s);
 
-async function checkLogin(){const j=await api.health();const btn=$("#loginBtn");
-  if(j.loggedIn){setConn("on",j.bpmKey?"Logged in — searching your Tidal library.":"Logged in, but no BPM key. Add GETSONGBPM_API_KEY to credentials.txt.");btn.style.display="none";}
-  else if(j.ok){setConn("off","Not logged in yet — tap below.");btn.style.display="block";}
-  else{setConn("off","Bridge not reachable. Start server.mjs and open http://localhost:8080/");btn.style.display="none";}}
-$("#loginBtn").onclick=()=>{location.href="/login";};
+const SVC_NAME={tidal:"Tidal",spotify:"Spotify"};
+async function checkLogin(){await api.health();const btn=$("#loginBtn");const svc=state.service;const h=HEALTH[svc]||{};
+  btn.textContent=`Log in with ${SVC_NAME[svc]}`;
+  if(!HEALTH.ok){setConn("off","Bridge not reachable. Start server.mjs and open http://localhost:8080/");btn.style.display="none";return;}
+  if(h.loggedIn){setConn("on",HEALTH.bpmKey?`Logged in — playlists will land in ${SVC_NAME[svc]}.`:"Logged in, but no BPM key. Add GETSONGBPM_API_KEY to credentials.txt.");btn.style.display="none";}
+  else if(h.hasCreds){setConn("off",`Not logged in to ${SVC_NAME[svc]} — tap below.`);btn.style.display="block";}
+  else{setConn("err",`No ${SVC_NAME[svc]} credentials. Add ${svc.toUpperCase()}_CLIENT_ID / _SECRET to credentials.txt.`);btn.style.display="none";}}
+function setService(svc){state.service=svc;document.querySelectorAll("#serviceTabs button").forEach(b=>b.setAttribute("aria-pressed",b.dataset.svc===svc));state.seeds=[];renderSeeds();$("#results").hidden=true;checkLogin();}
+document.querySelectorAll("#serviceTabs button").forEach(b=>b.onclick=()=>setService(b.dataset.svc));
+$("#loginBtn").onclick=()=>{location.href=`/login?service=${state.service}`;};
 function setConn(cls,msg){const el=$("#connStatus");el.className="conn "+cls;el.textContent=msg;}
 
 let searchTimer;
 $("#search").addEventListener("input",(e)=>{clearTimeout(searchTimer);const q=e.target.value;searchTimer=setTimeout(()=>runSearch(q),220);});
 $("#search").addEventListener("blur",()=>setTimeout(()=>{$("#results").hidden=true;},150));
+let currentHits=[], hlIndex=-1;
+function renderResultsList(){
+  const box=$("#results");
+  if(!currentHits.length){box.hidden=true;return;}
+  box.hidden=false;
+  box.innerHTML=currentHits.map((t,i)=>`<div class="r${i===hlIndex?" hl":""}" data-i="${i}"><div class="title">${t.name||t.title||"?"}</div></div>`).join("");
+  box.querySelectorAll(".r").forEach((el)=>el.addEventListener("mousedown",(ev)=>{ev.preventDefault();addSeed(currentHits[+el.dataset.i]);}));
+  const hl=box.querySelector(".r.hl");if(hl)hl.scrollIntoView({block:"nearest"});
+}
 async function runSearch(q){
-  const box=$("#results");if(!q.trim()){box.hidden=true;return;}
-  if(!LOGGEDIN){box.hidden=false;box.innerHTML=`<div class="empty">Log in with Tidal first (button up top).</div>`;return;}
+  const box=$("#results");if(!q.trim()){box.hidden=true;currentHits=[];hlIndex=-1;return;}
+  if(!LOGGEDIN){currentHits=[];box.hidden=false;box.innerHTML=`<div class="empty">Log in first (button up top).</div>`;return;}
   let hits=[];
   try{hits=await api.search(q);}
-  catch(err){box.hidden=false;box.innerHTML=`<div class="empty">Search error: ${err.message}</div>`;return;}
+  catch(err){currentHits=[];box.hidden=false;box.innerHTML=`<div class="empty">Search error: ${err.message}</div>`;return;}
+  currentHits=hits;hlIndex=-1;
   if(!hits.length){box.hidden=false;box.innerHTML=`<div class="empty">No matches for "${q}".</div>`;return;}
-  box.hidden=false;
-  box.innerHTML=hits.map((t,i)=>`<div class="r" data-i="${i}"><div class="title">${t.artist?t.artist+" - ":""}${t.title}</div><div class="g">${(t.genres||[])[0]||""}</div></div>`).join("");
-  box.querySelectorAll(".r").forEach((el)=>el.addEventListener("mousedown",(ev)=>{ev.preventDefault();addSeed(hits[+el.dataset.i]);}));
+  renderResultsList();
 }
-function addSeed(t){if(state.seeds.some(s=>s.id===t.id))return;state.seeds.push(t);$("#search").value="";$("#results").hidden=true;renderSeeds();}
+$("#search").addEventListener("keydown",(e)=>{
+  if($("#results").hidden||!currentHits.length)return;
+  if(e.key==="ArrowDown"){e.preventDefault();hlIndex=Math.min(hlIndex+1,currentHits.length-1);renderResultsList();}
+  else if(e.key==="ArrowUp"){e.preventDefault();hlIndex=Math.max(hlIndex-1,0);renderResultsList();}
+  else if(e.key==="Enter"){if(hlIndex>=0){e.preventDefault();addSeed(currentHits[hlIndex]);}}
+  else if(e.key==="Escape"){$("#results").hidden=true;}
+});
+function addSeed(t){if(state.seeds.some(s=>s.id===t.id))return;state.seeds.push(t);$("#search").value="";$("#results").hidden=true;currentHits=[];hlIndex=-1;renderSeeds();}
 function renderSeeds(){
-  const wrap=$("#seeds");wrap.innerHTML=state.seeds.map((s,i)=>`<span class="seedchip"><span class="t">${s.title}<span class="art"> · ${s.artist||""}</span></span><button data-seed="${i}" aria-label="remove">×</button></span>`).join("");
+  const wrap=$("#seeds");wrap.innerHTML=state.seeds.map((s,i)=>`<span class="seedchip"><span class="t">${s.name||s.title||"?"}</span><button data-seed="${i}" aria-label="remove">×</button></span>`).join("");
   wrap.querySelectorAll("button").forEach(b=>b.onclick=()=>{state.seeds.splice(+b.dataset.seed,1);renderSeeds();});
   $("#seedCount").textContent=`${state.seeds.length}`;
-  const has=state.seeds.length>0;const btn=$("#build");btn.disabled=!has;btn.textContent=has?"Ship it 🚀":"Groom the backlog first";
+  const has=state.seeds.length>0;const btn=$("#build");btn.disabled=!has;btn.textContent=has?"Ship it 🚀":"Refine the backlog first";
 }
 
 function renderZones(){const tb=$("#zoneTable tbody");tb.innerHTML="";state.zones.forEach((z,i)=>{const tr=document.createElement("tr");tr.innerHTML=`<td style="font-family:var(--mono);color:var(--muted);padding-left:4px">${z.name}</td><td><input data-z="from" data-i="${i}" value="${z.from}" inputmode="numeric"/></td><td><input data-z="to" data-i="${i}" value="${z.to}" inputmode="numeric"/></td>`;tb.appendChild(tr);});}
@@ -318,10 +338,12 @@ $("#build").onclick=async()=>{
   const modes=Object.entries(state.modes).filter(([,v])=>v).map(([k])=>k);
   const area=$("#results-area");
   if(!modes.length){area.innerHTML=`<section><div class="empty">Turn on at least one sync mode (Automation).</div></section>`;return;}
-  if(!LOGGEDIN){area.innerHTML=`<section><div class="empty">Log in with Tidal first (button up top).</div></section>`;return;}
-  area.innerHTML=`<section><div class="empty">Grooming the backlog…</div></section>`;
+  if(!LOGGEDIN){area.innerHTML=`<section><div class="empty">Log in first (button up top).</div></section>`;return;}
+  const stopLoading=startLoading(area);
   let candidates;
-  try{candidates=await api.pool(state.seeds);}catch(e){area.innerHTML=`<section><div class="empty">Sprint blocked: ${e.message}</div></section>`;return;}
+  try{candidates=await api.pool(state.seeds);}
+  catch(e){stopLoading();area.innerHTML=`<section><div class="empty">Sprint blocked: ${e.message}</div></section>`;return;}
+  stopLoading();
   if(!candidates.length){area.innerHTML=`<section><div class="empty">No candidates with BPM came back. Add more seeds, widen tolerance, or check /api/bpmtest.</div></section>`;return;}
   const cadenceModel=makeCadenceModel(state.cal);
   const genres=new Set(candidates.flatMap(t=>(t.genres||[]).map(g=>g.toLowerCase())));
@@ -333,21 +355,28 @@ $("#build").onclick=async()=>{
   lastPlaylist=res.plan.flatMap(p=>p.tracks);
   renderResults(res);
 };
+const LOADING_MSGS=["reticulating splines","packing the sprint","removing impediments","planning the quarter","inspecting and adapting"];
+function startLoading(area){
+  let mi=Math.floor(Math.random()*LOADING_MSGS.length),dots=0,tick=0;
+  const render=()=>{area.innerHTML=`<section><div class="empty">${LOADING_MSGS[mi]}${".".repeat(dots)}</div></section>`;};
+  render();
+  const iv=setInterval(()=>{tick++;dots=(dots+1)%4;if(tick%9===0){let n;do{n=Math.floor(Math.random()*LOADING_MSGS.length);}while(n===mi&&LOADING_MSGS.length>1);mi=n;}render();},380);
+  return ()=>clearInterval(iv);
+}
 let lastPlaylist=[];
 function planName(){const dist=Math.max(0,...state.segs.map(s=>+s.endMile||0)).toFixed(1).replace(/\.0$/,"");const d=new Date().toISOString().slice(0,10);return `run ${dist}mi ${d}`;}
-async function exportToTidal(btn){
-  const ids=lastPlaylist.map(t=>t.id).filter(Boolean);
-  if(!ids.length)return;
-  btn.disabled=true;const old=btn.textContent;btn.textContent="Saving to Tidal…";
+async function shipPlaylist(btn){
+  const refs=lastPlaylist.map(t=>t.ref||t.id).filter(Boolean);
+  if(!refs.length)return;
+  const svc=SVC_NAME[state.service];
+  btn.disabled=true;const old=btn.textContent;btn.textContent=`Shipping to ${svc}…`;
   try{
-    const r=await fetch("/api/export",{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify({name:planName(),ids})});
-    const j=await r.json();
-    if(!r.ok)throw new Error(j.error||r.status);
-    btn.textContent="✓ Saved to Tidal";btn.style.background="var(--good)";btn.style.color="#062018";
-    const link=document.createElement("a");link.href=j.url;link.target="_blank";link.textContent=`Open "${j.name}" in Tidal (${j.count} tracks)`;
+    const j=await api.export(planName(),refs);
+    btn.textContent=`✓ Shipped to ${svc}`;btn.style.background="var(--good)";btn.style.color="#fff";
+    const link=document.createElement("a");link.href=j.url;link.target="_blank";link.textContent=`Open "${j.name}" in ${svc} (${j.count} tracks)`;
     link.style.cssText="display:block;text-align:center;color:var(--pace);font-size:12.5px;margin-top:8px";
     btn.after(link);
-  }catch(e){btn.disabled=false;btn.textContent=old;btn.style.background="";const m=document.createElement("div");m.className="note";m.textContent="Export failed: "+e.message;btn.after(m);}
+  }catch(e){btn.disabled=false;btn.textContent=old;btn.style.background="";const m=document.createElement("div");m.className="note";m.textContent="Ship failed: "+e.message;btn.after(m);}
 }
 function renderResults(res){
   const strip=res.plan.map(p=>{const w=res.totalPlannedSec?Math.max(6,(p.segDuration/res.totalPlannedSec)*100):33;return`<div class="band" style="flex:${w} 1 0;background:${cadColor(p.cadence)}">${Math.round(p.cadence)}</div>`;}).join("");
@@ -357,15 +386,15 @@ function renderResults(res){
     const note=p.shortfallSec>30?`<div class="note">▲ short by ${fmtClock(p.shortfallSec)} — allow repeats or add seeds</div>`:"";
     return`<section><div class="seg-head"><span class="miles">Miles ${p.segment.startMile}–${p.segment.endMile} <span style="color:var(--muted);font-weight:400">@ ${p.label}</span></span><span class="cad">${Math.round(p.cadence)} spm · need ${fmtClock(p.segDuration)}</span></div>${tracks}${note}</section>`;
   }).join("");
-  const canExport=LOGGEDIN&&lastPlaylist.some(t=>t.id);
-  const exportBtn=canExport?`<button class="btn" id="exportBtn" style="margin-top:6px">Ship to Tidal · "${planName()}"</button>`:"";
+  const canExport=LOGGEDIN&&lastPlaylist.some(t=>t.ref||t.id);
+  const exportBtn=canExport?`<button class="btn" id="exportBtn" style="margin-top:6px">Ship to ${SVC_NAME[state.service]} · "${planName()}"</button>`:"";
   $("#results-area").innerHTML=`<div class="readout"><div><div class="k">Tracks</div><div class="v">${res.trackCount}</div></div><div><div class="k">Planned</div><div class="v">${fmtClock(res.totalPlannedSec)}</div></div><div><div class="k">Music</div><div class="v">${fmtClock(res.totalFilledSec)}</div></div></div><div class="strip">${strip}</div>${segs}${exportBtn}`;
-  const eb=$("#exportBtn");if(eb)eb.onclick=()=>exportToTidal(eb);
+  const eb=$("#exportBtn");if(eb)eb.onclick=()=>shipPlaylist(eb);
   $("#results-area").scrollIntoView({behavior:matchMedia("(prefers-reduced-motion:reduce)").matches?"auto":"smooth",block:"start"});
 }
 
 loadCal();$("#maxHR").value=state.maxHR;renderZones();renderCal();renderSegs();renderSeeds();
-checkLogin();
+const _svc=new URLSearchParams(location.search).get("service");if(_svc&&(_svc==="tidal"||_svc==="spotify"))setService(_svc);else checkLogin();
 </script>
 </body>
 </html>
