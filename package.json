@@ -1,0 +1,12 @@
+{
+  "name": "jirun",
+  "version": "1.0.0",
+  "description": "jirun — sprint planning for your run. Matches song BPM to running cadence.",
+  "type": "module",
+  "engines": {
+    "node": ">=18"
+  },
+  "scripts": {
+    "start": "node server.mjs"
+  }
+}
