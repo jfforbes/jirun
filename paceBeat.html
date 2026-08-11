@@ -3,27 +3,47 @@
 <head>
 <meta charset="utf-8" />
 <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover" />
-<meta name="theme-color" content="#0C66E4" />
+<meta name="theme-color" content="#F7F8F9" id="metaTheme" />
 <title>jirun</title>
+<script>
+(function(){try{var p=localStorage.getItem("pb_theme")||"system";if(p!=="light"&&p!=="dark"&&p!=="system")p="system";var r=p==="system"?(matchMedia("(prefers-color-scheme: dark)").matches?"dark":"light"):p;document.documentElement.setAttribute("data-theme",r);document.documentElement.setAttribute("data-theme-pref",p);}catch(e){document.documentElement.setAttribute("data-theme","light");document.documentElement.setAttribute("data-theme-pref","system");}})();
+</script>
 <style>
   :root{
     --bg:#F7F8F9;--surface:#FFFFFF;--surface-2:#F1F2F4;--line:#DFE1E6;
-    --text:#172B4D;--muted:#626F86;--pace:#0C66E4;--beat:#8270DB;--warn:#974F0C;--good:#216E4E;
+    --text:#172B4D;--muted:#626F86;--pace:#0C66E4;--pace-hover:#0055CC;--beat:#8270DB;--warn:#974F0C;--good:#216E4E;
+    --chip:#E9F2FF;--chip-line:#CCE0FF;--chip-direct-bg:#F3F0FF;--chip-direct:#5E4DB2;
+    --hero-line:#8FB8F6;--btn-hover:#DCDFE4;--cta-disabled-bg:#F1F2F4;
+    --shadow:rgba(9,30,66,.06);--shadow-lg:rgba(9,30,66,.15);
     --mono:ui-monospace,"SF Mono",SFMono-Regular,Menlo,Consolas,monospace;
     --sans:-apple-system,BlinkMacSystemFont,"Segoe UI",Roboto,"Helvetica Neue",Arial,sans-serif;
+    color-scheme:light;
+  }
+  html[data-theme="dark"]{
+    --bg:#0D1117;--surface:#161B22;--surface-2:#21262D;--line:#30363D;
+    --text:#E6EDF3;--muted:#8B949E;--pace:#4493F8;--pace-hover:#2F81F7;--beat:#A371F7;--warn:#D29922;--good:#3FB950;
+    --chip:#12253F;--chip-line:#1F3A5F;--chip-direct-bg:#2A1F3D;--chip-direct:#D2A8FF;
+    --hero-line:#1F3A5F;--btn-hover:#30363D;--cta-disabled-bg:#21262D;
+    --shadow:rgba(0,0,0,.25);--shadow-lg:rgba(0,0,0,.45);
+    color-scheme:dark;
   }
   *{box-sizing:border-box}html,body{margin:0}
   body{background:var(--bg);color:var(--text);font-family:var(--sans);-webkit-font-smoothing:antialiased;line-height:1.45;
     padding:max(16px,env(safe-area-inset-top)) 16px calc(96px + env(safe-area-inset-bottom));max-width:560px;margin:0 auto}
+  .topbar{display:flex;align-items:flex-start;justify-content:space-between;gap:12px;margin:0 0 6px}
+  .topbar h1{margin:0}
+  .theme{display:flex;gap:2px;background:var(--surface-2);border:1px solid var(--line);border-radius:6px;padding:2px;flex:none}
+  .theme button{background:none;border:none;color:var(--muted);font-size:11px;font-weight:600;padding:5px 8px;border-radius:4px;cursor:pointer;line-height:1.2}
+  .theme button[aria-pressed="true"]{background:var(--surface);color:var(--pace);box-shadow:0 1px 2px var(--shadow)}
   h1{font-size:20px;font-weight:600;letter-spacing:-.01em;margin:0;display:flex;align-items:center;gap:10px;color:var(--text)}
-  .logo{width:26px;height:26px;border-radius:6px;background:linear-gradient(135deg,#0C66E4,#1868DB);display:flex;align-items:center;justify-content:center;flex:none;color:#fff;font-weight:800;font-size:15px}
+  .logo{width:26px;height:26px;border-radius:6px;background:linear-gradient(135deg,var(--pace),#1868DB);display:flex;align-items:center;justify-content:center;flex:none;color:#fff;font-weight:800;font-size:15px}
   .sub{color:var(--muted);font-size:13px;margin:6px 0 18px}
   .eyebrow{font-size:11px;letter-spacing:.03em;text-transform:uppercase;color:var(--muted);font-weight:700;margin:0 0 10px;display:flex;justify-content:space-between;align-items:center}
-  section{background:var(--surface);border:1px solid var(--line);border-radius:8px;padding:16px;margin-bottom:12px;box-shadow:0 1px 1px rgba(9,30,66,.06)}
-  section.hero{border-color:#8FB8F6}
+  section{background:var(--surface);border:1px solid var(--line);border-radius:8px;padding:16px;margin-bottom:12px;box-shadow:0 1px 1px var(--shadow)}
+  section.hero{border-color:var(--hero-line)}
   .modes{display:flex;gap:4px;background:var(--surface-2);border-radius:6px;padding:3px;margin-bottom:14px}
   .modes button{flex:1;background:none;border:none;color:var(--muted);font-size:13px;font-weight:600;padding:7px;border-radius:4px;cursor:pointer}
-  .modes button[aria-pressed="true"]{background:var(--surface);color:var(--pace);box-shadow:0 1px 2px rgba(9,30,66,.14)}
+  .modes button[aria-pressed="true"]{background:var(--surface);color:var(--pace);box-shadow:0 1px 2px var(--shadow)}
   .conn{font-size:12px;margin-top:10px;font-weight:600}
   .conn.on{color:var(--good)}.conn.off{color:var(--muted)}.conn.err{color:var(--warn)}
   input,select{width:100%;background:var(--surface);border:1px solid var(--line);color:var(--text);font-family:var(--sans);font-size:14px;border-radius:3px;padding:8px 10px}
@@ -32,16 +52,16 @@
   .field{display:flex;flex-direction:column;gap:6px;margin-top:10px}
   .field label{font-size:11px;color:var(--muted)}
   .btn{background:var(--surface-2);border:none;color:var(--text);font-size:14px;font-weight:600;padding:9px;border-radius:3px;cursor:pointer;width:100%;margin-top:10px}
-  .btn:hover{background:#DCDFE4}
+  .btn:hover{background:var(--btn-hover)}
   .searchwrap{position:relative}
-  .results{position:absolute;left:0;right:0;top:calc(100% + 4px);background:var(--surface);border:1px solid var(--line);border-radius:4px;overflow:hidden;z-index:20;max-height:280px;overflow-y:auto;box-shadow:0 8px 16px rgba(9,30,66,.15)}
+  .results{position:absolute;left:0;right:0;top:calc(100% + 4px);background:var(--surface);border:1px solid var(--line);border-radius:4px;overflow:hidden;z-index:20;max-height:280px;overflow-y:auto;box-shadow:0 8px 16px var(--shadow-lg)}
   .results .r{padding:9px 12px;cursor:pointer;border-bottom:1px solid var(--line);display:flex;justify-content:space-between;gap:10px;align-items:center}
   .results .r:last-child{border:none}.results .r:hover,.results .r.hl{background:var(--surface-2)}
   .results .r .title{font-size:13.5px}
   .results .r .g{font-family:var(--mono);font-size:10px;color:var(--pace);text-transform:uppercase}
   .results .empty{padding:12px;color:var(--muted);font-size:12px;text-align:center}
   .seeds{display:flex;flex-wrap:wrap;gap:7px;margin-top:12px;min-height:4px}
-  .seedchip{display:flex;align-items:center;gap:7px;background:#E9F2FF;border:1px solid #CCE0FF;border-radius:3px;padding:5px 6px 5px 10px;font-size:12.5px;max-width:100%}
+  .seedchip{display:flex;align-items:center;gap:7px;background:var(--chip);border:1px solid var(--chip-line);border-radius:3px;padding:5px 6px 5px 10px;font-size:12.5px;max-width:100%}
   .seedchip .t{white-space:nowrap;overflow:hidden;text-overflow:ellipsis;color:var(--text)}
   .seedchip .art{color:var(--muted);font-size:11px}
   .seedchip button{background:none;border:none;color:var(--muted);font-size:16px;cursor:pointer;line-height:1;padding:0 2px}
@@ -58,12 +78,12 @@
   .rowval{font-family:var(--mono);color:var(--text)}
   .seg-modes{display:flex;gap:8px}
   .chip{flex:1;text-align:center;padding:8px;border-radius:3px;border:1px solid var(--line);background:var(--surface);color:var(--muted);font-size:12px;cursor:pointer;user-select:none}
-  .chip[aria-pressed="true"]{color:var(--pace);border-color:var(--pace);background:#E9F2FF}
+  .chip[aria-pressed="true"]{color:var(--pace);border-color:var(--pace);background:var(--chip)}
   .toggle{display:flex;align-items:center;gap:8px;font-size:12.5px;color:var(--muted);cursor:pointer}
   .cta{position:fixed;left:0;right:0;bottom:0;padding:12px 16px calc(12px + env(safe-area-inset-bottom));background:linear-gradient(transparent,var(--bg) 32%);max-width:560px;margin:0 auto}
   .cta button{width:100%;background:var(--pace);color:#fff;border:none;font-weight:600;font-size:15px;padding:13px;border-radius:3px;cursor:pointer}
-  .cta button:hover:not(:disabled){background:#0055CC}
-  .cta button:disabled{background:#F1F2F4;color:var(--muted);cursor:not-allowed}
+  .cta button:hover:not(:disabled){background:var(--pace-hover)}
+  .cta button:disabled{background:var(--cta-disabled-bg);color:var(--muted);cursor:not-allowed}
   .cta button:active:not(:disabled){transform:translateY(1px)}
   .readout{display:flex;border:1px solid var(--line);border-radius:8px;overflow:hidden;margin-bottom:14px;background:var(--surface)}
   .readout div{flex:1;padding:12px 8px;text-align:center;border-right:1px solid var(--line)}
@@ -79,15 +99,23 @@
   .track .art{font-size:11px;color:var(--muted);white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
   .track .bpm{font-family:var(--mono);font-size:13px;color:var(--muted)}
   .tag{font-family:var(--mono);font-size:10.5px;padding:2px 7px;border-radius:3px;white-space:nowrap;font-weight:700}
-  .tag.half{color:var(--pace);background:#E9F2FF}.tag.direct{color:#5E4DB2;background:#F3F0FF}
+  .tag.half{color:var(--pace);background:var(--chip)}.tag.direct{color:var(--chip-direct);background:var(--chip-direct-bg)}
   .dur{font-family:var(--mono);font-size:11px;color:var(--muted);text-align:right}
   .note{font-size:12px;color:var(--warn);margin-top:10px;font-weight:600}
   .empty{color:var(--muted);font-size:13px;text-align:center;padding:24px 8px}
   .legend{display:flex;gap:14px;font-size:11px;color:var(--muted);margin-top:6px;flex-wrap:wrap}
+  a{color:var(--pace)}
 </style>
 </head>
 <body>
-  <h1><span class="logo">j</span> jirun</h1>
+  <div class="topbar">
+    <h1><span class="logo">j</span> jirun</h1>
+    <div class="theme" id="themeTabs" role="group" aria-label="Theme">
+      <button type="button" data-theme="light" aria-pressed="false">Light</button>
+      <button type="button" data-theme="dark" aria-pressed="false">Dark</button>
+      <button type="button" data-theme="system" aria-pressed="true">System</button>
+    </div>
+  </div>
   <p class="sub">Sprint planning for people who actually sprint. Refine your backlog, estimate your zones, ship the playlist.</p>
 
   <section class="hero" aria-label="Backlog">
@@ -99,7 +127,7 @@
       <div class="conn off" id="connStatus" style="margin-top:2px">Checking login…</div>
       <button class="btn" id="loginBtn" style="display:none">Log in</button>
       <button class="btn" id="logoutBtn" style="display:none">Log out</button>
-      <div class="hint" style="margin-top:8px">One-time login through the local bridge. Playlists land in whichever service you're logged into.</div>
+      <div class="hint" style="margin-top:8px">One-time login through the local bridge. Playlists land in whichever service you're logged into. If Tidal search stops working after an update, log out and back in.</div>
     </div>
     <p class="eyebrow" style="margin-top:14px">Backlog <span class="seedcount" id="seedCount">0</span></p>
     <div class="searchwrap">
@@ -277,6 +305,23 @@ const state={service:"tidal",seeds:[],maxHR:195,
 function saveCal(){try{localStorage.setItem("pb_cal",JSON.stringify({zones:state.zones,cal:state.cal,maxHR:state.maxHR}));}catch(_){}}
 function loadCal(){try{const s=JSON.parse(localStorage.getItem("pb_cal"));if(s){if(Array.isArray(s.zones))state.zones=s.zones;if(Array.isArray(s.cal))state.cal=s.cal;if(s.maxHR)state.maxHR=s.maxHR;}}catch(_){}}
 const $=(s)=>document.querySelector(s);
+
+/* ---- Theme: light / dark / system ---- */
+function resolveTheme(pref){return pref==="system"?(matchMedia("(prefers-color-scheme: dark)").matches?"dark":"light"):pref;}
+function applyTheme(pref){
+  const p=(pref==="light"||pref==="dark"||pref==="system")?pref:"system";
+  const resolved=resolveTheme(p);
+  document.documentElement.setAttribute("data-theme",resolved);
+  document.documentElement.setAttribute("data-theme-pref",p);
+  try{localStorage.setItem("pb_theme",p);}catch(_){}
+  const meta=$("#metaTheme");if(meta)meta.setAttribute("content",resolved==="dark"?"#0D1117":"#F7F8F9");
+  document.querySelectorAll("#themeTabs button").forEach((b)=>b.setAttribute("aria-pressed",b.dataset.theme===p?"true":"false"));
+}
+document.querySelectorAll("#themeTabs button").forEach((b)=>b.onclick=()=>applyTheme(b.dataset.theme));
+matchMedia("(prefers-color-scheme: dark)").addEventListener("change",()=>{
+  if((document.documentElement.getAttribute("data-theme-pref")||"system")==="system")applyTheme("system");
+});
+applyTheme(document.documentElement.getAttribute("data-theme-pref")||localStorage.getItem("pb_theme")||"system");
 
 const SVC_NAME={tidal:"Tidal",spotify:"Spotify"};
 async function checkLogin(){await api.health();const btn=$("#loginBtn");const svc=state.service;const h=HEALTH[svc]||{};
