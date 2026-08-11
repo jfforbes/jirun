@@ -169,12 +169,55 @@ async function lastfmSimilar(name, limit = 40) {
 }
 
 /* ============ TIDAL ============ */
+/** App-only token for catalog/search. User tokens without search.read redact search to empty. */
+const tidalCatalogAuth = { access: null, exp: 0 };
+async function tidalCatalogToken() {
+  if (tidalCatalogAuth.access && Date.now() < tidalCatalogAuth.exp) return tidalCatalogAuth.access;
+  const s = SERVICES.tidal;
+  if (!s.clientId || !s.clientSecret) throw new Error("Tidal credentials missing");
+  const body = new URLSearchParams({ grant_type: "client_credentials" });
+  const r = await fetch(s.token, { method: "POST", headers: { Authorization: basicAuth(s), "Content-Type": "application/x-www-form-urlencoded" }, body });
+  if (!r.ok) throw new Error(`tidal client_credentials ${r.status}: ${(await r.text()).slice(0, 200)}`);
+  const j = await r.json();
+  tidalCatalogAuth.access = j.access_token;
+  tidalCatalogAuth.exp = Date.now() + ((j.expires_in || 3600) - 60) * 1000;
+  return tidalCatalogAuth.access;
+}
+const TIDAL_ACCEPTS = ["application/vnd.api+json", "application/vnd.tidal.v1+json", "application/json"];
+async function tidalFetch(pq, { token, accept = TIDAL_ACCEPTS[0] } = {}) {
+  const r = await fetch(`${TIDAL_API}${pq}`, {
+    headers: { Authorization: `Bearer ${token}`, Accept: accept, "User-Agent": "jirun/1.0" },
+  });
+  const text = await r.text();
+  let json = null; try { json = text ? JSON.parse(text) : {}; } catch (_) { json = { raw: text.slice(0, 300) }; }
+  return { ok: r.ok, status: r.status, json, text: text.slice(0, 300) };
+}
 async function tapi(pq) {
   let t = await accessToken("tidal");
-  let r = await fetch(`${TIDAL_API}${pq}`, { headers: { Authorization: `Bearer ${t}`, Accept: "application/vnd.api+json", "User-Agent": "jirun/1.0" } });
-  if (r.status === 401 && SERVICES.tidal.store.refresh) { await refresh("tidal"); t = SERVICES.tidal.store.access; r = await fetch(`${TIDAL_API}${pq}`, { headers: { Authorization: `Bearer ${t}`, Accept: "application/vnd.api+json", "User-Agent": "jirun/1.0" } }); }
-  if (!r.ok) throw new Error(`${r.status} on ${pq}: ${(await r.text()).slice(0, 200)}`);
-  return r.json();
+  let res = await tidalFetch(pq, { token: t });
+  if (res.status === 401 && SERVICES.tidal.store.refresh) {
+    await refresh("tidal");
+    t = SERVICES.tidal.store.access;
+    res = await tidalFetch(pq, { token: t });
+  }
+  if (!res.ok) throw new Error(`${res.status} on ${pq}: ${res.text}`);
+  return res.json;
+}
+/** Catalog calls (search, artist metadata) — client credentials, no user login required. */
+async function tapiCatalog(pq) {
+  let t = await tidalCatalogToken();
+  let res = await tidalFetch(pq, { token: t });
+  if (res.status === 401) {
+    tidalCatalogAuth.access = null; tidalCatalogAuth.exp = 0;
+    t = await tidalCatalogToken();
+    res = await tidalFetch(pq, { token: t });
+  }
+  // Some Tidal stacks prefer the v1 accept header
+  if (!res.ok && (res.status === 406 || res.status === 415)) {
+    res = await tidalFetch(pq, { token: t, accept: "application/vnd.tidal.v1+json" });
+  }
+  if (!res.ok) throw new Error(`${res.status} on ${pq}: ${res.text}`);
+  return res.json;
 }
 async function tapiPost(pq, body) {
   let t = await accessToken("tidal");
@@ -196,7 +239,8 @@ function tidalExtractArtists(payload) {
   const byId = {};
   const remember = (x) => {
     if (!x || x.type !== "artists" || !x.id) return;
-    byId[x.id] = { id: x.id, name: (x.attributes && x.attributes.name) || byId[x.id]?.name || "?" };
+    const nm = (x.attributes && x.attributes.name) || byId[x.id]?.name || "";
+    byId[x.id] = { id: x.id, name: nm };
   };
   for (const x of payload.included || []) remember(x);
   const raw = payload.data;
@@ -208,7 +252,7 @@ function tidalExtractArtists(payload) {
     const id = typeof ref === "string" ? ref : ref?.id;
     const type = typeof ref === "string" ? "artists" : ref?.type;
     if (!id || (type && type !== "artists")) return;
-    if (!byId[id]) byId[id] = { id, name: "?" };
+    if (!byId[id]) byId[id] = { id, name: "" };
     if (!order.includes(id)) order.push(id);
   };
   for (const x of dataArr) {
@@ -217,43 +261,96 @@ function tidalExtractArtists(payload) {
     for (const r of x.relationships?.topHits?.data || []) push(r);
     for (const r of x.relationships?.directHits?.data || []) push(r);
   }
-  // relationships endpoint sometimes only returns linkage rows
+  // Relationship docs: primary data is an array of {type,id} linkages
+  if (Array.isArray(raw)) for (const r of raw) push(r);
   if (!order.length) for (const id of Object.keys(byId)) push(id);
   return order.slice(0, 10).map((id) => byId[id]).filter(Boolean);
 }
 async function tidalHydrateArtistNames(artists) {
-  const need = artists.filter((a) => a && a.id && (!a.name || a.name === "?"));
+  const need = artists.filter((a) => a && a.id && !a.name);
   if (!need.length) return artists.map((a) => ({ id: a.id, name: a.name || "?" }));
   try {
     const ids = [...new Set(need.map((a) => a.id))].slice(0, 20);
-    const j = await tapi(`/artists?filter[id]=${ids.join(",")}&countryCode=${COUNTRY}`);
+    const j = await tapiCatalog(`/artists?filter[id]=${ids.join(",")}&countryCode=${COUNTRY}`);
     const names = {};
-    for (const a of j.data || []) if (a?.type === "artists") names[a.id] = a.attributes?.name || "?";
-    return artists.map((a) => ({ id: a.id, name: (a.name && a.name !== "?" ? a.name : names[a.id]) || "?" }));
+    for (const a of j.data || []) if (a?.type === "artists") names[a.id] = a.attributes?.name || "";
+    return artists.map((a) => ({ id: a.id, name: a.name || names[a.id] || "?" }));
   } catch (_) {
     return artists.map((a) => ({ id: a.id, name: a.name || "?" }));
   }
 }
-async function tidalSearchArtists(q) {
+function tidalRelPath(link) {
+  if (!link) return null;
+  let p = String(link);
+  if (p.startsWith("http")) p = p.replace(/^https?:\/\/openapi\.tidal\.com\/v2/i, "");
+  if (p.startsWith("/v2/")) p = p.slice(3);
+  if (!p.startsWith("/")) p = `/${p}`;
+  return p;
+}
+async function tidalSearchArtists(q, { debug = false } = {}) {
   const query = (q || "").trim();
-  if (query.length < 1) return [];
+  if (query.length < 1) return debug ? { artists: [], debug: [] } : [];
   const enc = encodeURIComponent(query);
-  // Prefer the main search document. Do not escalate relationship 400s to the UI —
-  // Tidal often rejects partial typeahead queries on /relationships/artists.
-  const tries = [
-    `/searchResults/${enc}?countryCode=${COUNTRY}&explicitFilter=INCLUDE&include=artists,topHits`,
-    `/searchResults/${enc}?countryCode=${COUNTRY}&explicitFilter=INCLUDE&include=artists`,
-    `/searchSuggestions/${enc}?countryCode=${COUNTRY}&explicitFilter=INCLUDE&include=directHits`,
-    `/searchResults/${enc}/relationships/artists?countryCode=${COUNTRY}&explicitFilter=INCLUDE&include=artists`,
-  ];
-  for (const url of tries) {
+  const debugLog = [];
+  const finish = async (payload, via) => {
+    const extracted = tidalExtractArtists(payload || {});
+    const out = (await tidalHydrateArtistNames(extracted)).filter((a) => a.name && a.name !== "?");
+    if (debug) debugLog.push({ via, extracted: extracted.length, named: out.length, sample: out.slice(0, 3) });
+    return out;
+  };
+  const withInclude = (path, inc) => {
+    if (!path) return null;
+    if (path.includes("include=")) return path;
+    return `${path}${path.includes("?") ? "&" : "?"}include=${inc}`;
+  };
+
+  // 1) Main search document with artists + topHits embedded
+  try {
+    const s = await tapiCatalog(`/searchResults/${enc}?countryCode=${COUNTRY}&explicitFilter=INCLUDE&include=artists,topHits`);
+    const out = await finish(s, "searchResults+include");
+    if (out.length) return debug ? { artists: out, debug: debugLog } : out;
+    // Follow the artists relationship link (catalog token; user tokens often redact search)
+    const relUrl = withInclude(
+      tidalRelPath(s?.data?.relationships?.artists?.links?.self) ||
+        `/searchResults/${enc}/relationships/artists?countryCode=${COUNTRY}&explicitFilter=INCLUDE`,
+      "artists"
+    );
     try {
-      const s = await tapi(url);
-      const out = (await tidalHydrateArtistNames(tidalExtractArtists(s))).filter((a) => a.name && a.name !== "?");
-      if (out.length) return out;
-    } catch (_) { /* try next shape */ }
+      const rel = await tapiCatalog(relUrl);
+      const out2 = await finish(rel, "relationships/artists");
+      if (out2.length) return debug ? { artists: out2, debug: debugLog } : out2;
+    } catch (e) {
+      if (debug) debugLog.push({ via: "relationships/artists", error: String(e.message || e) });
+    }
+  } catch (e) {
+    if (debug) debugLog.push({ via: "searchResults+include", error: String(e.message || e) });
   }
-  return [];
+
+  // 2) Suggestions / direct hits (typeahead-friendly)
+  try {
+    const s = await tapiCatalog(`/searchSuggestions/${enc}?countryCode=${COUNTRY}&explicitFilter=INCLUDE&include=directHits`);
+    const out = await finish(s, "searchSuggestions");
+    if (out.length) return debug ? { artists: out, debug: debugLog } : out;
+    const relUrl = withInclude(tidalRelPath(s?.data?.relationships?.directHits?.links?.self), "directHits");
+    if (relUrl) {
+      const rel = await tapiCatalog(relUrl);
+      const out2 = await finish(rel, "directHits");
+      if (out2.length) return debug ? { artists: out2, debug: debugLog } : out2;
+    }
+  } catch (e) {
+    if (debug) debugLog.push({ via: "searchSuggestions", error: String(e.message || e) });
+  }
+
+  // 3) Last resort relationships path
+  try {
+    const rel = await tapiCatalog(`/searchResults/${enc}/relationships/artists?countryCode=${COUNTRY}&explicitFilter=INCLUDE&include=artists`);
+    const out = await finish(rel, "relationships/direct");
+    if (out.length) return debug ? { artists: out, debug: debugLog } : out;
+  } catch (e) {
+    if (debug) debugLog.push({ via: "relationships/direct", error: String(e.message || e) });
+  }
+
+  return debug ? { artists: [], debug: debugLog } : [];
 }
 const tidalArtistIdCache = {};
 async function tidalResolveArtist(name) {
@@ -514,6 +611,9 @@ const server = http.createServer(async (req, res) => {
       const svc = url.searchParams.get("service") || "tidal";
       const q = url.searchParams.get("q") || "";
       if (!q.trim()) return sendJSON(res, 400, { error: "empty query" });
+      if (svc === "tidal" && url.searchParams.get("debug") === "1") {
+        return sendJSON(res, 200, await tidalSearchArtists(q, { debug: true }));
+      }
       return sendJSON(res, 200, await searchArtists(svc, q));
     }
     if (url.pathname === "/api/pool" && req.method === "POST") {
