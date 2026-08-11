@@ -52,7 +52,7 @@ const SERVICES = {
   tidal: {
     clientId: env("TIDAL_CLIENT_ID"), clientSecret: env("TIDAL_CLIENT_SECRET"),
     authorize: "https://login.tidal.com/authorize", token: "https://auth.tidal.com/v1/oauth2/token",
-    scopes: env("TIDAL_SCOPES") || "r_usr user.read collection.read collection.write playlists.read playlists.write search.read",
+    scopes: env("TIDAL_SCOPES") || "user.read collection.read collection.write playlists.read playlists.write search.read",
     pkce: true, store: { access: null, refresh: null, exp: 0 }, verifier: null,
   },
   spotify: {
