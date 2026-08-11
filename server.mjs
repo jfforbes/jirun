@@ -347,6 +347,7 @@ async function tidalSearchArtists(q, { debug = false } = {}) {
     if (debug) debugLog.push({ via, extracted: extracted.length, named: out.length, sample: out.slice(0, 3) });
     return out;
   };
+  const done = (artists) => (debug ? { artists, debug: debugLog, build: "search-user-openapi-16e45e2" } : artists);
   const withInclude = (path, inc) => {
     if (!path) return null;
     if (path.includes("include=")) return path;
@@ -358,6 +359,24 @@ async function tidalSearchArtists(q, { debug = false } = {}) {
     if (debug) debugLog.push({ via: "openapi/auth-user", error: String(e.message || e) });
   }
   getters.push({ kind: "catalog", get: tapiCatalog });
+
+  // 0) Artist handle lookup (works without searchResults for simple names like "underoath")
+  const handle = query.toLowerCase().replace(/[^a-z0-9]+/g, "");
+  if (handle.length >= 2) {
+    for (const { kind, get } of getters) {
+      try {
+        const s = await get(`/artists?filter[handle]=${encodeURIComponent(handle)}&countryCode=${COUNTRY}`);
+        const out = (s.data || [])
+          .filter((a) => a?.type === "artists" && a.id)
+          .map((a) => ({ id: String(a.id), name: a.attributes?.name || handle }))
+          .filter((a) => a.name);
+        if (debug) debugLog.push({ via: `handle/${kind}`, named: out.length, sample: out.slice(0, 3) });
+        if (out.length) return done(out);
+      } catch (e) {
+        if (debug) debugLog.push({ via: `handle/${kind}`, error: String(e.message || e) });
+      }
+    }
+  }
 
   const openApiQs = [
     `countryCode=${COUNTRY}&include=artists,topHits`,
@@ -371,7 +390,7 @@ async function tidalSearchArtists(q, { debug = false } = {}) {
       try {
         const s = await get(`/searchResults/${enc}?${qs}`);
         const out = await finish(s, `openapi/${kind}:${qs.slice(0, 48)}`);
-        if (out.length) return debug ? { artists: out, debug: debugLog } : out;
+        if (out.length) return done(out);
         const relUrl = withInclude(
           tidalRelPath(s?.data?.relationships?.artists?.links?.self) ||
             `/searchResults/${enc}/relationships/artists?countryCode=${COUNTRY}&explicitFilter=INCLUDE`,
@@ -380,7 +399,7 @@ async function tidalSearchArtists(q, { debug = false } = {}) {
         try {
           const rel = await get(relUrl);
           const out2 = await finish(rel, `openapi/${kind}/relationships`);
-          if (out2.length) return debug ? { artists: out2, debug: debugLog } : out2;
+          if (out2.length) return done(out2);
         } catch (e) {
           if (debug) debugLog.push({ via: `openapi/${kind}/relationships`, error: String(e.message || e) });
         }
@@ -392,19 +411,19 @@ async function tidalSearchArtists(q, { debug = false } = {}) {
     try {
       const s = await get(`/searchSuggestions/${enc}?countryCode=${COUNTRY}&include=directHits`);
       const out = await finish(s, `suggestions/${kind}`);
-      if (out.length) return debug ? { artists: out, debug: debugLog } : out;
+      if (out.length) return done(out);
     } catch (e) {
       if (debug) debugLog.push({ via: `suggestions/${kind}`, error: String(e.message || e) });
     }
   }
 
-  // Classic v1 (needs r_usr on user token)
+  // Classic v1 (needs r_usr on user token — often unavailable on modern apps)
   {
     const v1 = await tidalSearchArtistsV1(query, { debug, debugLog });
-    if (v1.length) return debug ? { artists: v1, debug: debugLog } : v1;
+    if (v1.length) return done(v1);
   }
 
-  return debug ? { artists: [], debug: debugLog } : [];
+  return done([]);
 }
 const tidalArtistIdCache = {};
 async function tidalResolveArtist(name) {
