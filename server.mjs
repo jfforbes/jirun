@@ -52,7 +52,7 @@ const SERVICES = {
   tidal: {
     clientId: env("TIDAL_CLIENT_ID"), clientSecret: env("TIDAL_CLIENT_SECRET"),
     authorize: "https://login.tidal.com/authorize", token: "https://auth.tidal.com/v1/oauth2/token",
-    scopes: env("TIDAL_SCOPES") || "user.read collection.read collection.write playlists.read playlists.write",
+    scopes: env("TIDAL_SCOPES") || "user.read collection.read collection.write playlists.read playlists.write search.read",
     pkce: true, store: { access: null, refresh: null, exp: 0 }, verifier: null,
   },
   spotify: {
@@ -192,28 +192,67 @@ function tidalMapTrack(res, included = []) {
   const genres = included.filter((x) => x.type === "genres" && gids.includes(x.id)).map((x) => x.attributes?.name).filter(Boolean);
   return { id: res.id, ref: res.id, title: a.title || "?", artist, bpm: null, durationSec: isoToSec(a.duration), genres };
 }
-async function tidalSearchArtists(q) {
-  const enc = encodeURIComponent((q || "").trim());
-  if (!enc) return [];
-  const attempts = [
-    `/searchResults/${enc}?countryCode=${COUNTRY}&explicitFilter=INCLUDE&include=artists`,
-    `/searchResults/${enc}/relationships/artists?countryCode=${COUNTRY}&include=artists`,
-  ];
-  let lastErr = null;
-  for (const url of attempts) {
-    for (let attempt = 0; attempt < 2; attempt++) {
-      try {
-        const s = await tapi(url);
-        const inc = (s.included || []).filter((x) => x.type === "artists");
-        const byId = {}; for (const a of inc) byId[a.id] = { id: a.id, name: a.attributes?.name || "?" };
-        let ids = Array.isArray(s.data) ? s.data.map((d) => d.id) : (s.data?.relationships?.artists?.data || []).map((d) => d.id);
-        if (!ids.length) ids = inc.map((a) => a.id);
-        const out = ids.slice(0, 10).map((id) => byId[id]).filter(Boolean);
-        if (out.length) return out;
-      } catch (e) { lastErr = e; }
-    }
+function tidalExtractArtists(payload) {
+  const byId = {};
+  const remember = (x) => {
+    if (!x || x.type !== "artists" || !x.id) return;
+    byId[x.id] = { id: x.id, name: (x.attributes && x.attributes.name) || byId[x.id]?.name || "?" };
+  };
+  for (const x of payload.included || []) remember(x);
+  const raw = payload.data;
+  const dataArr = Array.isArray(raw) ? raw : raw ? [raw] : [];
+  for (const x of dataArr) remember(x);
+
+  const order = [];
+  const push = (ref) => {
+    const id = typeof ref === "string" ? ref : ref?.id;
+    const type = typeof ref === "string" ? "artists" : ref?.type;
+    if (!id || (type && type !== "artists")) return;
+    if (!byId[id]) byId[id] = { id, name: "?" };
+    if (!order.includes(id)) order.push(id);
+  };
+  for (const x of dataArr) {
+    if (x.type === "artists") push(x);
+    for (const r of x.relationships?.artists?.data || []) push(r);
+    for (const r of x.relationships?.topHits?.data || []) push(r);
+    for (const r of x.relationships?.directHits?.data || []) push(r);
   }
-  if (lastErr) throw lastErr;
+  // relationships endpoint sometimes only returns linkage rows
+  if (!order.length) for (const id of Object.keys(byId)) push(id);
+  return order.slice(0, 10).map((id) => byId[id]).filter(Boolean);
+}
+async function tidalHydrateArtistNames(artists) {
+  const need = artists.filter((a) => a && a.id && (!a.name || a.name === "?"));
+  if (!need.length) return artists.map((a) => ({ id: a.id, name: a.name || "?" }));
+  try {
+    const ids = [...new Set(need.map((a) => a.id))].slice(0, 20);
+    const j = await tapi(`/artists?filter[id]=${ids.join(",")}&countryCode=${COUNTRY}`);
+    const names = {};
+    for (const a of j.data || []) if (a?.type === "artists") names[a.id] = a.attributes?.name || "?";
+    return artists.map((a) => ({ id: a.id, name: (a.name && a.name !== "?" ? a.name : names[a.id]) || "?" }));
+  } catch (_) {
+    return artists.map((a) => ({ id: a.id, name: a.name || "?" }));
+  }
+}
+async function tidalSearchArtists(q) {
+  const query = (q || "").trim();
+  if (query.length < 1) return [];
+  const enc = encodeURIComponent(query);
+  // Prefer the main search document. Do not escalate relationship 400s to the UI —
+  // Tidal often rejects partial typeahead queries on /relationships/artists.
+  const tries = [
+    `/searchResults/${enc}?countryCode=${COUNTRY}&explicitFilter=INCLUDE&include=artists,topHits`,
+    `/searchResults/${enc}?countryCode=${COUNTRY}&explicitFilter=INCLUDE&include=artists`,
+    `/searchSuggestions/${enc}?countryCode=${COUNTRY}&explicitFilter=INCLUDE&include=directHits`,
+    `/searchResults/${enc}/relationships/artists?countryCode=${COUNTRY}&explicitFilter=INCLUDE&include=artists`,
+  ];
+  for (const url of tries) {
+    try {
+      const s = await tapi(url);
+      const out = (await tidalHydrateArtistNames(tidalExtractArtists(s))).filter((a) => a.name && a.name !== "?");
+      if (out.length) return out;
+    } catch (_) { /* try next shape */ }
+  }
   return [];
 }
 const tidalArtistIdCache = {};
