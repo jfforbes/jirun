@@ -347,7 +347,7 @@ async function tidalSearchArtists(q, { debug = false } = {}) {
     if (debug) debugLog.push({ via, extracted: extracted.length, named: out.length, sample: out.slice(0, 3) });
     return out;
   };
-  const done = (artists) => (debug ? { artists, debug: debugLog, build: "search-user-openapi-16e45e2" } : artists);
+  const done = (artists) => (debug ? { artists, debug: debugLog, build: "search-handle-b6d629b" } : artists);
   const withInclude = (path, inc) => {
     if (!path) return null;
     if (path.includes("include=")) return path;
