@@ -98,6 +98,7 @@
     <div id="tidalSetup">
       <div class="conn off" id="connStatus" style="margin-top:2px">Checking login…</div>
       <button class="btn" id="loginBtn" style="display:none">Log in</button>
+      <button class="btn" id="logoutBtn" style="display:none">Log out</button>
       <div class="hint" style="margin-top:8px">One-time login through the local bridge. Playlists land in whichever service you're logged into.</div>
     </div>
     <p class="eyebrow" style="margin-top:14px">Backlog <span class="seedcount" id="seedCount">0</span></p>
@@ -106,6 +107,8 @@
       <div id="results" class="results" hidden></div>
     </div>
     <div class="seeds" id="seeds"></div>
+    <button class="btn" id="loadPlaylists" style="display:none;margin-top:12px">Import seeds from a playlist</button>
+    <select id="playlistPick" style="display:none;margin-top:8px"><option value="">Pick a playlist…</option></select>
   </section>
 
   <section aria-label="Estimates">
@@ -179,8 +182,11 @@ let LOGGEDIN=false, HEALTH={};
 const api={
   async health(){try{const r=await fetch("/api/health");HEALTH=await r.json();LOGGEDIN=!!(HEALTH[state.service]?.loggedIn);return HEALTH;}catch(e){HEALTH={};LOGGEDIN=false;return{ok:false,error:e.message};}},
   async search(q){const r=await fetch(`/api/search?service=${state.service}&q=${encodeURIComponent(q)}`);const j=await r.json();if(!r.ok)throw new Error(j.error||r.status);return j;},
-  async pool(seeds){const r=await fetch(`/api/pool`,{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify({service:state.service,seeds:seeds.map(s=>({id:s.id,name:s.name||s.title||""}))})});const j=await r.json();if(!r.ok)throw new Error(j.error||r.status);return j;},
-  async export(name,refs){const r=await fetch(`/api/export`,{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify({service:state.service,name,refs})});const j=await r.json();if(!r.ok)throw new Error(j.error||r.status);return j;}
+  async pool(seeds,targetSec){const r=await fetch(`/api/pool`,{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify({service:state.service,targetSec:targetSec||0,seeds:seeds.map(s=>({id:s.id,name:s.name||s.title||""}))})});const j=await r.json();if(!r.ok)throw new Error(j.error||r.status);return j;},
+  async export(name,refs){const r=await fetch(`/api/export`,{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify({service:state.service,name,refs})});const j=await r.json();if(!r.ok)throw new Error(j.error||r.status);return j;},
+  async playlists(){const r=await fetch(`/api/playlists?service=${state.service}`);const j=await r.json();if(!r.ok)throw new Error(j.error||r.status);return j;},
+  async playlistArtists(id){const r=await fetch(`/api/playlist-artists?service=${state.service}&id=${encodeURIComponent(id)}`);const j=await r.json();if(!r.ok)throw new Error(j.error||r.status);return j;},
+  async logout(){try{await fetch(`/api/logout?service=${state.service}`,{method:"POST"});}catch(_){}LOGGEDIN=false;}
 };
 
 /* ===================== STATE + UI ===================== */
@@ -209,13 +215,27 @@ const $=(s)=>document.querySelector(s);
 const SVC_NAME={tidal:"Tidal",spotify:"Spotify"};
 async function checkLogin(){await api.health();const btn=$("#loginBtn");const svc=state.service;const h=HEALTH[svc]||{};
   btn.textContent=`Log in with ${SVC_NAME[svc]}`;
-  if(!HEALTH.ok){setConn("off","Bridge not reachable. Start server.mjs and open http://localhost:8080/");btn.style.display="none";return;}
-  if(h.loggedIn){setConn("on",HEALTH.bpmKey?`Logged in — playlists will land in ${SVC_NAME[svc]}.`:"Logged in, but no BPM key. Add GETSONGBPM_API_KEY to credentials.txt.");btn.style.display="none";}
-  else if(h.hasCreds){setConn("off",`Not logged in to ${SVC_NAME[svc]} — tap below.`);btn.style.display="block";}
-  else{setConn("err",`No ${SVC_NAME[svc]} credentials. Add ${svc.toUpperCase()}_CLIENT_ID / _SECRET to credentials.txt.`);btn.style.display="none";}}
+  const imp=$("#loadPlaylists"),pick=$("#playlistPick");
+  const showImport=(on)=>{imp.style.display=on?"block":"none";$("#logoutBtn").style.display=on?"block":"none";if(!on){pick.style.display="none";pick.value="";}};
+  if(!HEALTH.ok){setConn("off","Bridge not reachable. Start server.mjs and open the app URL.");btn.style.display="none";showImport(false);return;}
+  if(h.loggedIn){setConn("on",HEALTH.bpmKey?`Logged in — playlists will land in ${SVC_NAME[svc]}.`:"Logged in, but no BPM key. Add GETSONGBPM_API_KEY to credentials.txt.");btn.style.display="none";showImport(true);}
+  else if(h.hasCreds){setConn("off",`Not logged in to ${SVC_NAME[svc]} — tap below.`);btn.style.display="block";showImport(false);}
+  else{setConn("err",`No ${SVC_NAME[svc]} credentials. Add ${svc.toUpperCase()}_CLIENT_ID / _SECRET to credentials.txt.`);btn.style.display="none";showImport(false);}}
 function setService(svc){state.service=svc;document.querySelectorAll("#serviceTabs button").forEach(b=>b.setAttribute("aria-pressed",b.dataset.svc===svc));state.seeds=[];renderSeeds();$("#results").hidden=true;checkLogin();}
 document.querySelectorAll("#serviceTabs button").forEach(b=>b.onclick=()=>setService(b.dataset.svc));
 $("#loginBtn").onclick=()=>{location.href=`/login?service=${state.service}`;};
+$("#logoutBtn").onclick=async()=>{await api.logout();state.seeds=[];renderSeeds();$("#results-area").innerHTML="";await checkLogin();};
+$("#loadPlaylists").onclick=async()=>{
+  const sel=$("#playlistPick");sel.style.display="block";sel.innerHTML=`<option value="">Loading playlists…</option>`;
+  try{const pls=await api.playlists();sel.innerHTML=`<option value="">Import from a playlist…</option>`+pls.map(p=>`<option value="${p.id}">${(p.name||"Untitled").replace(/</g,"&lt;")}</option>`).join("");}
+  catch(e){sel.innerHTML=`<option value="">Couldn't load playlists</option>`;setConn("err","Playlist load failed: "+e.message);}
+};
+$("#playlistPick").onchange=async(e)=>{
+  const id=e.target.value;if(!id)return;e.target.disabled=true;setConn("off","Importing artists from that playlist…");
+  try{const arts=await api.playlistArtists(id);let added=0;for(const a of arts){if(a&&a.id&&!state.seeds.some(s=>s.id===a.id)){state.seeds.push({id:a.id,name:a.name});added++;}}renderSeeds();setConn("on",`Added ${added} artist(s) from that playlist. Add more, or ship it.`);}
+  catch(err){setConn("err","Playlist import failed: "+err.message);}
+  e.target.disabled=false;e.target.value="";
+};
 function setConn(cls,msg){const el=$("#connStatus");el.className="conn "+cls;el.textContent=msg;}
 
 let searchTimer;
@@ -341,7 +361,7 @@ $("#build").onclick=async()=>{
   if(!LOGGEDIN){area.innerHTML=`<section><div class="empty">Log in first (button up top).</div></section>`;return;}
   const stopLoading=startLoading(area);
   let candidates;
-  try{candidates=await api.pool(state.seeds);}
+  try{candidates=await api.pool(state.seeds,plannedSeconds());}
   catch(e){stopLoading();area.innerHTML=`<section><div class="empty">Sprint blocked: ${e.message}</div></section>`;return;}
   stopLoading();
   if(!candidates.length){area.innerHTML=`<section><div class="empty">No candidates with BPM came back. Add more seeds, widen tolerance, or check /api/bpmtest.</div></section>`;return;}
@@ -365,6 +385,7 @@ function startLoading(area){
 }
 let lastPlaylist=[];
 function planName(){const dist=Math.max(0,...state.segs.map(s=>+s.endMile||0)).toFixed(1).replace(/\.0$/,"");const d=new Date().toISOString().slice(0,10);return `run ${dist}mi ${d}`;}
+function plannedSeconds(){let s=0;for(const seg of state.segs){let paceSec;if(state.planMode==="zone"){const a=zoneAnchorFor(seg.zone)||state.cal[0]||{pace:"9:00"};paceSec=paceToSeconds(a.pace);}else paceSec=paceToSeconds(seg.pace||"9:00");s+=Math.max(0,(+seg.endMile-+seg.startMile))*paceSec;}return Math.round(s);}
 async function shipPlaylist(btn){
   const refs=lastPlaylist.map(t=>t.ref||t.id).filter(Boolean);
   if(!refs.length)return;

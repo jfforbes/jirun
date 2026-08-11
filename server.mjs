@@ -58,7 +58,7 @@ const SERVICES = {
   spotify: {
     clientId: env("SPOTIFY_CLIENT_ID"), clientSecret: env("SPOTIFY_CLIENT_SECRET"),
     authorize: "https://accounts.spotify.com/authorize", token: "https://accounts.spotify.com/api/token",
-    scopes: "playlist-modify-private playlist-modify-public",
+    scopes: "playlist-modify-private playlist-modify-public playlist-read-private playlist-read-collaborative",
     pkce: false, store: { access: null, refresh: null, exp: 0 }, verifier: null,
   },
 };
@@ -140,14 +140,14 @@ async function lastfmSimilar(name, limit = 40) {
 /* ============ TIDAL ============ */
 async function tapi(pq) {
   let t = await accessToken("tidal");
-  let r = await fetch(`${TIDAL_API}${pq}`, { headers: { Authorization: `Bearer ${t}`, Accept: "application/vnd.api+json" } });
-  if (r.status === 401 && SERVICES.tidal.store.refresh) { await refresh("tidal"); t = SERVICES.tidal.store.access; r = await fetch(`${TIDAL_API}${pq}`, { headers: { Authorization: `Bearer ${t}`, Accept: "application/vnd.api+json" } }); }
+  let r = await fetch(`${TIDAL_API}${pq}`, { headers: { Authorization: `Bearer ${t}`, Accept: "application/vnd.api+json", "User-Agent": "jirun/1.0" } });
+  if (r.status === 401 && SERVICES.tidal.store.refresh) { await refresh("tidal"); t = SERVICES.tidal.store.access; r = await fetch(`${TIDAL_API}${pq}`, { headers: { Authorization: `Bearer ${t}`, Accept: "application/vnd.api+json", "User-Agent": "jirun/1.0" } }); }
   if (!r.ok) throw new Error(`${r.status} on ${pq}: ${(await r.text()).slice(0, 200)}`);
   return r.json();
 }
 async function tapiPost(pq, body) {
   let t = await accessToken("tidal");
-  const opts = { method: "POST", headers: { Authorization: `Bearer ${t}`, "Content-Type": "application/vnd.api+json", Accept: "application/vnd.api+json" }, body: JSON.stringify(body) };
+  const opts = { method: "POST", headers: { Authorization: `Bearer ${t}`, "Content-Type": "application/vnd.api+json", Accept: "application/vnd.api+json", "User-Agent": "jirun/1.0" }, body: JSON.stringify(body) };
   let r = await fetch(`${TIDAL_API}${pq}`, opts);
   if (r.status === 401 && SERVICES.tidal.store.refresh) { await refresh("tidal"); opts.headers.Authorization = `Bearer ${SERVICES.tidal.store.access}`; r = await fetch(`${TIDAL_API}${pq}`, opts); }
   if (!r.ok) throw new Error(`${r.status} on ${pq}: ${(await r.text()).slice(0, 300)}`);
@@ -162,13 +162,28 @@ function tidalMapTrack(res, included = []) {
   return { id: res.id, ref: res.id, title: a.title || "?", artist, bpm: null, durationSec: isoToSec(a.duration), genres };
 }
 async function tidalSearchArtists(q) {
-  const s = await tapi(`/searchResults/${encodeURIComponent(q)}?countryCode=${COUNTRY}&include=artists`);
-  let ids = (s.data?.relationships?.artists?.data || []).map((d) => d.id);
-  if (!ids.length) ids = (s.included || []).filter((x) => x.type === "artists").map((a) => a.id);
-  ids = ids.slice(0, 10);
-  const byId = {};
-  for (const a of (s.included || []).filter((x) => x.type === "artists")) byId[a.id] = { id: a.id, name: a.attributes?.name || "?" };
-  return ids.map((id) => byId[id]).filter(Boolean);
+  const enc = encodeURIComponent((q || "").trim());
+  if (!enc) return [];
+  const attempts = [
+    `/searchResults/${enc}?countryCode=${COUNTRY}&explicitFilter=INCLUDE&include=artists`,
+    `/searchResults/${enc}/relationships/artists?countryCode=${COUNTRY}&include=artists`,
+  ];
+  let lastErr = null;
+  for (const url of attempts) {
+    for (let attempt = 0; attempt < 2; attempt++) {
+      try {
+        const s = await tapi(url);
+        const inc = (s.included || []).filter((x) => x.type === "artists");
+        const byId = {}; for (const a of inc) byId[a.id] = { id: a.id, name: a.attributes?.name || "?" };
+        let ids = Array.isArray(s.data) ? s.data.map((d) => d.id) : (s.data?.relationships?.artists?.data || []).map((d) => d.id);
+        if (!ids.length) ids = inc.map((a) => a.id);
+        const out = ids.slice(0, 10).map((id) => byId[id]).filter(Boolean);
+        if (out.length) return out;
+      } catch (e) { lastErr = e; }
+    }
+  }
+  if (lastErr) throw lastErr;
+  return [];
 }
 const tidalArtistIdCache = {};
 async function tidalResolveArtist(name) {
@@ -177,33 +192,44 @@ async function tidalResolveArtist(name) {
   let id = null; try { const a = await tidalSearchArtists(name); id = a[0]?.id || null; } catch (_) {}
   tidalArtistIdCache[k] = id; return id;
 }
-async function tidalPool(seeds) {
+async function tidalPool(seeds, targetSec = 0) {
   if (!GSB_KEY) throw new Error("GETSONGBPM_API_KEY not set — add it to credentials.txt");
   const seedList = seeds.map((s) => (typeof s === "string" ? { id: s, name: "" } : s));
   const seedIds = seedList.map((s) => String(s.id));
-  const tidalIds = [];
-  for (const s of seedList) { try { const j = await tapi(`/artists/${s.id}/relationships/similarArtists?countryCode=${COUNTRY}`); for (const d of j.data || []) tidalIds.push(d.id); } catch (_) {} }
-  let lastfmIds = [];
-  if (LASTFM_KEY) {
-    const names = new Set();
-    for (const s of seedList) { if (s.name) (await lastfmSimilar(s.name, 35)).slice(0, 30).forEach((n) => names.add(n)); }
-    lastfmIds = (await mapLimit([...names], 6, (n) => tidalResolveArtist(n))).filter(Boolean);
+  const seedNames = seedList.map((s) => s.name).filter(Boolean);
+  const need = targetSec > 0 ? targetSec * 4 : 0; // pool headroom (only a slice matches a given cadence)
+  const ARTIST_CAP = 260, TRACK_CAP = 950;
+  const knownNames = new Map(); seedNames.forEach((n) => knownNames.set(n.toLowerCase(), n));
+  const doneArtists = new Set(), allTrackIds = new Set(), candidates = []; let totalDur = 0;
+  async function fetchArtists(ids, seedWeight) {
+    const fresh = ids.filter((a) => a && !doneArtists.has(a)); fresh.forEach((a) => doneArtists.add(a));
+    if (!fresh.length) return;
+    const trackLists = await mapLimit(fresh, 6, async (aid) => { try { const j = await tapi(`/artists/${aid}/relationships/tracks?countryCode=${COUNTRY}&collapseBy=FINGERPRINT`); return (j.data || []).map((d) => d.id).slice(0, seedWeight ? 25 : 12); } catch (_) { return []; } });
+    const newIds = []; for (const tl of trackLists) for (const id of tl) if (!allTrackIds.has(id)) { allTrackIds.add(id); newIds.push(id); }
+    const meta = [];
+    for (let i = 0; i < newIds.length; i += 20) { const chunk = newIds.slice(i, i + 20); try { const t = await tapi(`/tracks?filter[id]=${chunk.join(",")}&countryCode=${COUNTRY}&include=artists,genres`); for (const tr of t.data || []) meta.push(tidalMapTrack(tr, t.included)); } catch (_) {} }
+    const enriched = await mapLimit(meta, 8, async (t) => { const b = await bpmFor(t.artist, t.title).catch(() => null); return b ? { ...t, bpm: b } : null; });
+    for (const t of enriched) if (t) { candidates.push(t); totalDur += t.durationSec || 210; }
   }
-  const inter = [], mx = Math.max(lastfmIds.length, tidalIds.length);
-  for (let i = 0; i < mx; i++) { if (lastfmIds[i]) inter.push(lastfmIds[i]); if (tidalIds[i]) inter.push(tidalIds[i]); }
-  const useArtists = [...new Set([...seedIds, ...inter])].slice(0, 50);
-  const trackLists = await mapLimit(useArtists, 6, async (aid) => { try { const j = await tapi(`/artists/${aid}/relationships/tracks?countryCode=${COUNTRY}&collapseBy=FINGERPRINT`); return (j.data || []).map((d) => d.id); } catch (_) { return []; } });
-  const seedSet = new Set(seedIds), seedTracks = [], similarLists = [];
-  useArtists.forEach((aid, i) => { if (seedSet.has(aid)) seedTracks.push(...(trackLists[i] || []).slice(0, 25)); else similarLists.push(trackLists[i] || []); });
-  const rr = [], maxT = Math.max(0, ...similarLists.map((l) => l.length));
-  for (let i = 0; i < maxT; i++) for (const tl of similarLists) if (tl[i]) rr.push(tl[i]);
-  const seenT = new Set(), trackIds = [];
-  for (const id of [...seedTracks, ...rr]) if (!seenT.has(id)) { seenT.add(id); trackIds.push(id); }
-  const pick = trackIds.slice(0, 400), meta = [];
-  for (let i = 0; i < pick.length; i += 20) { const chunk = pick.slice(i, i + 20); try { const j = await tapi(`/tracks?filter[id]=${chunk.join(",")}&countryCode=${COUNTRY}&include=artists,genres`); for (const t of j.data || []) meta.push(tidalMapTrack(t, j.included)); } catch (_) {} }
-  const enriched = await mapLimit(meta, 8, async (t) => { const b = await bpmFor(t.artist, t.title).catch(() => null); return b ? { ...t, bpm: b } : null; });
+  await fetchArtists(seedIds, true); // seeds, weighted
+  const tidalSim = [];
+  for (const s of seedList) { try { const j = await tapi(`/artists/${s.id}/relationships/similarArtists?countryCode=${COUNTRY}`); for (const d of j.data || []) tidalSim.push(d.id); } catch (_) {} }
+  await fetchArtists(tidalSim, false);
+  // expand the similarity graph one ring at a time until full (or capped)
+  let frontier = [...seedNames];
+  for (let level = 1; level <= 5; level++) {
+    if (need && totalDur >= need) break;
+    if (doneArtists.size >= ARTIST_CAP || allTrackIds.size >= TRACK_CAP) break;
+    if (!LASTFM_KEY || !frontier.length) break;
+    const lists = await mapLimit(frontier, 6, (n) => lastfmSimilar(n, level === 1 ? 35 : 15));
+    const newNames = [];
+    for (const names of lists) for (const nm of names) { const k = nm.toLowerCase(); if (!knownNames.has(k)) { knownNames.set(k, nm); newNames.push(nm); } }
+    frontier = newNames;
+    const newIds = (await mapLimit(newNames, 6, (n) => tidalResolveArtist(n))).filter(Boolean);
+    await fetchArtists(newIds, false);
+  }
   saveBpmCache();
-  return enriched.filter(Boolean);
+  return candidates;
 }
 async function tidalCreatePlaylist(name, refs) {
   const created = await tapiPost(`/playlists?countryCode=${COUNTRY}`, { data: { type: "playlists", attributes: { name, accessType: "UNLISTED" } } });
@@ -231,25 +257,38 @@ async function spotifyArtistTracks(name) {
   const j = await sapi(`/search?q=${encodeURIComponent(`artist:"${name}"`)}&type=track&limit=10`);
   return (j.tracks?.items || []).map((t) => ({ id: t.id, ref: t.uri, title: t.name, artist: t.artists?.[0]?.name || name, durationSec: Math.round((t.duration_ms || 210000) / 1000), genres: [] }));
 }
-async function spotifyPool(seeds) {
+async function spotifyPool(seeds, targetSec = 0) {
   if (!GSB_KEY) throw new Error("GETSONGBPM_API_KEY not set — add it to credentials.txt");
   const seedList = seeds.map((s) => (typeof s === "string" ? { name: s } : s));
   const seedNames = seedList.map((s) => s.name).filter(Boolean);
-  const sim = new Set();
-  if (LASTFM_KEY) for (const nm of seedNames) (await lastfmSimilar(nm, 35)).slice(0, 30).forEach((n) => sim.add(n));
-  const artistNames = [...new Set([...seedNames, ...sim])].slice(0, 50);
-  const trackLists = await mapLimit(artistNames, 5, async (nm) => { try { return await spotifyArtistTracks(nm); } catch (_) { return []; } });
+  const need = targetSec > 0 ? targetSec * 4 : 0;
+  const ARTIST_CAP = 260, TRACK_CAP = 950;
+  const knownNames = new Map(); seedNames.forEach((n) => knownNames.set(n.toLowerCase(), n));
   const seedNameSet = new Set(seedNames.map((n) => n.toLowerCase()));
-  const seedTracks = [], similarLists = [];
-  artistNames.forEach((nm, i) => { if (seedNameSet.has(nm.toLowerCase())) seedTracks.push(...(trackLists[i] || []).slice(0, 25)); else similarLists.push(trackLists[i] || []); });
-  const rr = [], maxT = Math.max(0, ...similarLists.map((l) => l.length));
-  for (let i = 0; i < maxT; i++) for (const tl of similarLists) if (tl[i]) rr.push(tl[i]);
-  const seen = new Set(), cand = [];
-  for (const t of [...seedTracks, ...rr]) if (t && !seen.has(t.ref)) { seen.add(t.ref); cand.push(t); }
-  const pick = cand.slice(0, 400);
-  const enriched = await mapLimit(pick, 8, async (t) => { const b = await bpmFor(t.artist, t.title).catch(() => null); return b ? { ...t, bpm: b } : null; });
+  const doneNames = new Set(), seenRef = new Set(), candidates = []; let totalDur = 0;
+  async function fetchNames(names) {
+    const fresh = names.filter((n) => n && !doneNames.has(n.toLowerCase())); fresh.forEach((n) => doneNames.add(n.toLowerCase()));
+    if (!fresh.length) return;
+    const lists = await mapLimit(fresh, 5, (nm) => spotifyArtistTracks(nm).catch(() => []));
+    const toBpm = [];
+    lists.forEach((tl, i) => { const isSeed = seedNameSet.has(fresh[i].toLowerCase()); for (const t of (isSeed ? tl.slice(0, 25) : tl.slice(0, 12))) if (t && !seenRef.has(t.ref)) { seenRef.add(t.ref); toBpm.push(t); } });
+    const enriched = await mapLimit(toBpm, 8, async (t) => { const b = await bpmFor(t.artist, t.title).catch(() => null); return b ? { ...t, bpm: b } : null; });
+    for (const t of enriched) if (t) { candidates.push(t); totalDur += t.durationSec || 210; }
+  }
+  await fetchNames(seedNames);
+  let frontier = [...seedNames];
+  for (let level = 1; level <= 5; level++) {
+    if (need && totalDur >= need) break;
+    if (doneNames.size >= ARTIST_CAP || candidates.length >= TRACK_CAP) break;
+    if (!LASTFM_KEY || !frontier.length) break;
+    const lists = await mapLimit(frontier, 6, (n) => lastfmSimilar(n, level === 1 ? 35 : 15));
+    const newNames = [];
+    for (const names of lists) for (const nm of names) { const k = nm.toLowerCase(); if (!knownNames.has(k)) { knownNames.set(k, nm); newNames.push(nm); } }
+    frontier = newNames;
+    await fetchNames(newNames);
+  }
   saveBpmCache();
-  return enriched.filter(Boolean);
+  return candidates;
 }
 async function spotifyCreatePlaylist(name, uris) {
   await sapi(`/me`); // verify token/user
@@ -260,10 +299,68 @@ async function spotifyCreatePlaylist(name, uris) {
   return { id, url: `https://open.spotify.com/playlist/${id}` };
 }
 
+/* ============ import seeds from a playlist ============ */
+function jwtSub(token) { try { const p = JSON.parse(Buffer.from((token || "").split(".")[1] || "", "base64").toString("utf8")); return p.uid || p.userId || p.sub || null; } catch (_) { return null; } }
+async function tidalMyPlaylists() {
+  const uid = jwtSub(SERVICES.tidal.store.access);
+  if (!uid) throw new Error("couldn't read Tidal user id from token");
+  const map = new Map();
+  const rel = (n) => (n ? (n.startsWith("http") ? n.replace(TIDAL_API, "") : n) : null);
+  // source 1: playlists owned by the user (paginated)
+  let pathq = `/playlists?filter[owners.id]=${uid}&countryCode=${COUNTRY}`;
+  for (let p = 0; p < 12 && pathq; p++) {
+    try { const j = await tapi(pathq); for (const pl of j.data || []) if (pl.type === "playlists" && !map.has(pl.id)) map.set(pl.id, { id: pl.id, name: pl.attributes?.name || "Untitled" }); pathq = rel(j.links?.next); } catch (_) { break; }
+  }
+  // source 2: the user's library collection (includes private + saved playlists), paginated
+  let pathq2 = `/userCollectionPlaylists/${uid}/relationships/items?countryCode=${COUNTRY}&include=items`;
+  for (let p = 0; p < 12 && pathq2; p++) {
+    try {
+      const j = await tapi(pathq2);
+      const names = {}; for (const x of j.included || []) if (x.type === "playlists") names[x.id] = x.attributes?.name;
+      for (const d of j.data || []) if (d.type === "playlists" && !map.has(d.id)) map.set(d.id, { id: d.id, name: names[d.id] || "Untitled" });
+      pathq2 = rel(j.links?.next);
+    } catch (_) { break; }
+  }
+  return [...map.values()];
+}
+async function tidalPlaylistArtists(id) {
+  const rel = (n) => (n ? (n.startsWith("http") ? n.replace(TIDAL_API, "") : n) : null);
+  const ids = new Set();
+  let pathq = `/playlists/${id}/relationships/items?include=items&countryCode=${COUNTRY}`;
+  for (let p = 0; p < 25 && pathq; p++) {
+    const j = await tapi(pathq);
+    for (const d of j.data || []) if (d.type === "tracks") ids.add(d.id);
+    for (const x of j.included || []) if (x.type === "tracks") ids.add(x.id);
+    pathq = rel(j.links?.next);
+  }
+  const trackIds = [...ids].slice(0, 600), artists = new Map();
+  for (let i = 0; i < trackIds.length; i += 20) {
+    const chunk = trackIds.slice(i, i + 20);
+    try { const t = await tapi(`/tracks?filter[id]=${chunk.join(",")}&countryCode=${COUNTRY}&include=artists`); for (const tr of t.data || []) { const aid = tr.relationships?.artists?.data?.[0]?.id; const nm = (t.included || []).find((x) => x.type === "artists" && x.id === aid)?.attributes?.name; if (aid && nm && !artists.has(aid)) artists.set(aid, { id: aid, name: nm }); } } catch (_) {}
+  }
+  return [...artists.values()];
+}
+async function spotifyMyPlaylists() {
+  const j = await sapi(`/me/playlists?limit=50`);
+  return (j.items || []).map((p) => ({ id: p.id, name: p.name }));
+}
+async function spotifyPlaylistArtists(id) {
+  const artists = new Map();
+  let pathq = `/playlists/${id}/tracks?limit=100`;
+  for (let page = 0; page < 8 && pathq; page++) {
+    const j = await sapi(pathq);
+    for (const it of j.items || []) { const t = it.track; if (!t) continue; for (const a of t.artists || []) if (a.id && !artists.has(a.id)) artists.set(a.id, { id: a.id, name: a.name }); }
+    pathq = j.next ? j.next.replace(SPOTIFY_API, "") : null;
+  }
+  return [...artists.values()];
+}
+
 /* ============ dispatch ============ */
 const searchArtists = (svc, q) => (svc === "spotify" ? spotifySearchArtists(q) : tidalSearchArtists(q));
-const buildPool = (svc, seeds) => (svc === "spotify" ? spotifyPool(seeds) : tidalPool(seeds));
+const buildPool = (svc, seeds, targetSec) => (svc === "spotify" ? spotifyPool(seeds, targetSec) : tidalPool(seeds, targetSec));
 const createPlaylist = (svc, name, refs) => (svc === "spotify" ? spotifyCreatePlaylist(name, refs) : tidalCreatePlaylist(name, refs));
+const myPlaylists = (svc) => (svc === "spotify" ? spotifyMyPlaylists() : tidalMyPlaylists());
+const playlistArtists = (svc, id) => (svc === "spotify" ? spotifyPlaylistArtists(id) : tidalPlaylistArtists(id));
 
 /* ============ http ============ */
 const sendJSON = (res, code, obj) => { res.writeHead(code, { "Content-Type": "application/json", "Access-Control-Allow-Origin": "*" }); res.end(JSON.stringify(obj)); };
@@ -288,6 +385,11 @@ const server = http.createServer(async (req, res) => {
       try { await exchangeCode(svc, code); res.writeHead(302, { Location: `/?service=${svc}` }); return res.end(); }
       catch (e) { return sendHTML(res, 200, page(`${svc} login failed`, `<pre style="white-space:pre-wrap;background:#fff;padding:12px;border-radius:8px">${e.message}</pre>`)); }
     }
+    if (url.pathname === "/api/logout") {
+      const svc = url.searchParams.get("service") || "tidal";
+      if (SERVICES[svc]) { SERVICES[svc].store = { access: null, refresh: null, exp: 0 }; SERVICES[svc].verifier = null; }
+      return sendJSON(res, 200, { ok: true, service: svc });
+    }
     if (url.pathname === "/api/health") {
       return sendJSON(res, 200, {
         ok: true,
@@ -307,7 +409,7 @@ const server = http.createServer(async (req, res) => {
       const svc = body.service || "tidal";
       const seeds = Array.isArray(body.seeds) ? body.seeds : [];
       if (!seeds.length) return sendJSON(res, 400, { error: "no seeds" });
-      return sendJSON(res, 200, await buildPool(svc, seeds));
+      return sendJSON(res, 200, await buildPool(svc, seeds, +body.targetSec || 0));
     }
     if (url.pathname === "/api/export" && req.method === "POST") {
       const body = await readBody(req);
@@ -317,6 +419,16 @@ const server = http.createServer(async (req, res) => {
       if (!refs.length) return sendJSON(res, 400, { error: "no tracks to export" });
       const r = await createPlaylist(svc, name, refs);
       return sendJSON(res, 200, { ...r, count: refs.length, name });
+    }
+    if (url.pathname === "/api/playlists") {
+      const svc = url.searchParams.get("service") || "tidal";
+      return sendJSON(res, 200, await myPlaylists(svc));
+    }
+    if (url.pathname === "/api/playlist-artists") {
+      const svc = url.searchParams.get("service") || "tidal";
+      const id = url.searchParams.get("id");
+      if (!id) return sendJSON(res, 400, { error: "no playlist id" });
+      return sendJSON(res, 200, await playlistArtists(svc, id));
     }
     if (url.pathname === "/api/bpmtest") {
       if (!GSB_KEY) return sendJSON(res, 200, { error: "GETSONGBPM_API_KEY not set" });
