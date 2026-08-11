@@ -287,6 +287,54 @@ function tidalRelPath(link) {
   if (!p.startsWith("/")) p = `/${p}`;
   return p;
 }
+/** Classic api.tidal.com v1 search — used by python-tidal; more reliable than openapi searchResults for many apps. */
+async function tidalSearchArtistsV1(query, { debug = false, debugLog = [] } = {}) {
+  const params = new URLSearchParams({
+    query,
+    limit: "15",
+    offset: "0",
+    countryCode: COUNTRY,
+  });
+  const paths = [
+    `https://api.tidal.com/v1/search/artists?${params}`,
+    `https://api.tidal.com/v1/search?${params}&types=ARTISTS`,
+  ];
+  // Prefer user token (session search); fall back to catalog token.
+  const tokens = [];
+  try { tokens.push({ kind: "user", token: await accessToken("tidal") }); } catch (e) {
+    if (debug) debugLog.push({ via: "v1/auth-user", error: String(e.message || e) });
+  }
+  try { tokens.push({ kind: "catalog", token: await tidalCatalogToken() }); } catch (e) {
+    if (debug) debugLog.push({ via: "v1/auth-catalog", error: String(e.message || e) });
+  }
+  for (const { kind, token } of tokens) {
+    for (const url of paths) {
+      try {
+        const r = await fetch(url, {
+          headers: {
+            Authorization: `Bearer ${token}`,
+            Accept: "application/json",
+            "User-Agent": "Mozilla/5.0 (compatible; jirun/1.0)",
+            "x-tidal-client-version": "2025.7.16",
+          },
+        });
+        const text = await r.text();
+        let j = null; try { j = text ? JSON.parse(text) : {}; } catch (_) { j = {}; }
+        if (!r.ok) {
+          if (debug) debugLog.push({ via: `v1/${kind}`, status: r.status, error: text.slice(0, 180), url });
+          continue;
+        }
+        const items = j.items || j.artists?.items || [];
+        const out = items.slice(0, 10).map((a) => ({ id: String(a.id), name: a.name || "?" })).filter((a) => a.id && a.name && a.name !== "?");
+        if (debug) debugLog.push({ via: `v1/${kind}`, status: r.status, named: out.length, sample: out.slice(0, 3) });
+        if (out.length) return out;
+      } catch (e) {
+        if (debug) debugLog.push({ via: `v1/${kind}`, error: String(e.message || e) });
+      }
+    }
+  }
+  return [];
+}
 async function tidalSearchArtists(q, { debug = false } = {}) {
   const query = (q || "").trim();
   if (query.length < 1) return debug ? { artists: [], debug: [] } : [];
@@ -303,51 +351,49 @@ async function tidalSearchArtists(q, { debug = false } = {}) {
     if (path.includes("include=")) return path;
     return `${path}${path.includes("?") ? "&" : "?"}include=${inc}`;
   };
+  const openApiQs = [
+    `countryCode=${COUNTRY}&deviceType=BROWSER&systemType=WEB`,
+    `countryCode=${COUNTRY}&explicitFilter=INCLUDE&deviceType=BROWSER&systemType=WEB`,
+    `countryCode=${COUNTRY}&explicitFilter=include&deviceType=BROWSER&systemType=WEB`,
+    `countryCode=${COUNTRY}`,
+  ];
 
-  // 1) Main search document with artists + topHits embedded
-  try {
-    const s = await tapiCatalog(`/searchResults/${enc}?countryCode=${COUNTRY}&explicitFilter=INCLUDE&include=artists,topHits`);
-    const out = await finish(s, "searchResults+include");
-    if (out.length) return debug ? { artists: out, debug: debugLog } : out;
-    // Follow the artists relationship link (catalog token; user tokens often redact search)
-    const relUrl = withInclude(
-      tidalRelPath(s?.data?.relationships?.artists?.links?.self) ||
-        `/searchResults/${enc}/relationships/artists?countryCode=${COUNTRY}&explicitFilter=INCLUDE`,
-      "artists"
-    );
-    try {
-      const rel = await tapiCatalog(relUrl);
-      const out2 = await finish(rel, "relationships/artists");
-      if (out2.length) return debug ? { artists: out2, debug: debugLog } : out2;
-    } catch (e) {
-      if (debug) debugLog.push({ via: "relationships/artists", error: String(e.message || e) });
-    }
-  } catch (e) {
-    if (debug) debugLog.push({ via: "searchResults+include", error: String(e.message || e) });
+  // 0) Classic v1 search first — openapi searchResults often 400s for third-party apps
+  {
+    const v1 = await tidalSearchArtistsV1(query, { debug, debugLog });
+    if (v1.length) return debug ? { artists: v1, debug: debugLog } : v1;
   }
 
-  // 2) Suggestions / direct hits (typeahead-friendly)
+  // 1) OpenAPI searchResults (several query shapes)
+  for (const qs of openApiQs) {
+    try {
+      const s = await tapiCatalog(`/searchResults/${enc}?${qs}&include=artists,topHits`);
+      const out = await finish(s, `searchResults+include:${qs.slice(0, 40)}`);
+      if (out.length) return debug ? { artists: out, debug: debugLog } : out;
+      const relUrl = withInclude(
+        tidalRelPath(s?.data?.relationships?.artists?.links?.self) ||
+          `/searchResults/${enc}/relationships/artists?${qs}`,
+        "artists"
+      );
+      try {
+        const rel = await tapiCatalog(relUrl);
+        const out2 = await finish(rel, "relationships/artists");
+        if (out2.length) return debug ? { artists: out2, debug: debugLog } : out2;
+      } catch (e) {
+        if (debug) debugLog.push({ via: "relationships/artists", error: String(e.message || e) });
+      }
+    } catch (e) {
+      if (debug) debugLog.push({ via: "searchResults+include", error: String(e.message || e) });
+    }
+  }
+
+  // 2) Suggestions / direct hits
   try {
-    const s = await tapiCatalog(`/searchSuggestions/${enc}?countryCode=${COUNTRY}&explicitFilter=INCLUDE&include=directHits`);
+    const s = await tapiCatalog(`/searchSuggestions/${enc}?countryCode=${COUNTRY}&deviceType=BROWSER&systemType=WEB&include=directHits`);
     const out = await finish(s, "searchSuggestions");
     if (out.length) return debug ? { artists: out, debug: debugLog } : out;
-    const relUrl = withInclude(tidalRelPath(s?.data?.relationships?.directHits?.links?.self), "directHits");
-    if (relUrl) {
-      const rel = await tapiCatalog(relUrl);
-      const out2 = await finish(rel, "directHits");
-      if (out2.length) return debug ? { artists: out2, debug: debugLog } : out2;
-    }
   } catch (e) {
     if (debug) debugLog.push({ via: "searchSuggestions", error: String(e.message || e) });
-  }
-
-  // 3) Last resort relationships path
-  try {
-    const rel = await tapiCatalog(`/searchResults/${enc}/relationships/artists?countryCode=${COUNTRY}&explicitFilter=INCLUDE&include=artists`);
-    const out = await finish(rel, "relationships/direct");
-    if (out.length) return debug ? { artists: out, debug: debugLog } : out;
-  } catch (e) {
-    if (debug) debugLog.push({ via: "relationships/direct", error: String(e.message || e) });
   }
 
   return debug ? { artists: [], debug: debugLog } : [];
