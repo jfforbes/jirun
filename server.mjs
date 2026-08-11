@@ -52,7 +52,7 @@ const SERVICES = {
   tidal: {
     clientId: env("TIDAL_CLIENT_ID"), clientSecret: env("TIDAL_CLIENT_SECRET"),
     authorize: "https://login.tidal.com/authorize", token: "https://auth.tidal.com/v1/oauth2/token",
-    scopes: env("TIDAL_SCOPES") || "user.read collection.read collection.write playlists.read playlists.write search.read",
+    scopes: env("TIDAL_SCOPES") || "r_usr user.read collection.read collection.write playlists.read playlists.write search.read",
     pkce: true, store: { access: null, refresh: null, exp: 0 }, verifier: null,
   },
   spotify: {
@@ -269,15 +269,17 @@ function tidalExtractArtists(payload) {
 async function tidalHydrateArtistNames(artists) {
   const need = artists.filter((a) => a && a.id && !a.name);
   if (!need.length) return artists.map((a) => ({ id: a.id, name: a.name || "?" }));
-  try {
-    const ids = [...new Set(need.map((a) => a.id))].slice(0, 20);
-    const j = await tapiCatalog(`/artists?filter[id]=${ids.join(",")}&countryCode=${COUNTRY}`);
-    const names = {};
-    for (const a of j.data || []) if (a?.type === "artists") names[a.id] = a.attributes?.name || "";
-    return artists.map((a) => ({ id: a.id, name: a.name || names[a.id] || "?" }));
-  } catch (_) {
-    return artists.map((a) => ({ id: a.id, name: a.name || "?" }));
+  const ids = [...new Set(need.map((a) => a.id))].slice(0, 20);
+  const path = `/artists?filter[id]=${ids.join(",")}&countryCode=${COUNTRY}`;
+  for (const getter of [tapi, tapiCatalog]) {
+    try {
+      const j = await getter(path);
+      const names = {};
+      for (const a of j.data || []) if (a?.type === "artists") names[a.id] = a.attributes?.name || "";
+      return artists.map((a) => ({ id: a.id, name: a.name || names[a.id] || "?" }));
+    } catch (_) { /* try next auth */ }
   }
+  return artists.map((a) => ({ id: a.id, name: a.name || "?" }));
 }
 function tidalRelPath(link) {
   if (!link) return null;
@@ -287,7 +289,7 @@ function tidalRelPath(link) {
   if (!p.startsWith("/")) p = `/${p}`;
   return p;
 }
-/** Classic api.tidal.com v1 search — used by python-tidal; more reliable than openapi searchResults for many apps. */
+/** Classic api.tidal.com v1 search — needs legacy r_usr scope on the user token. */
 async function tidalSearchArtistsV1(query, { debug = false, debugLog = [] } = {}) {
   const params = new URLSearchParams({
     query,
@@ -299,7 +301,6 @@ async function tidalSearchArtistsV1(query, { debug = false, debugLog = [] } = {}
     `https://api.tidal.com/v1/search/artists?${params}`,
     `https://api.tidal.com/v1/search?${params}&types=ARTISTS`,
   ];
-  // Prefer user token (session search); fall back to catalog token.
   const tokens = [];
   try { tokens.push({ kind: "user", token: await accessToken("tidal") }); } catch (e) {
     if (debug) debugLog.push({ via: "v1/auth-user", error: String(e.message || e) });
@@ -351,49 +352,56 @@ async function tidalSearchArtists(q, { debug = false } = {}) {
     if (path.includes("include=")) return path;
     return `${path}${path.includes("?") ? "&" : "?"}include=${inc}`;
   };
+  // User token (search.read) first — catalog/client_credentials often lacks search access tier.
+  const getters = [];
+  try { await accessToken("tidal"); getters.push({ kind: "user", get: tapi }); } catch (e) {
+    if (debug) debugLog.push({ via: "openapi/auth-user", error: String(e.message || e) });
+  }
+  getters.push({ kind: "catalog", get: tapiCatalog });
+
   const openApiQs = [
-    `countryCode=${COUNTRY}&deviceType=BROWSER&systemType=WEB`,
-    `countryCode=${COUNTRY}&explicitFilter=INCLUDE&deviceType=BROWSER&systemType=WEB`,
-    `countryCode=${COUNTRY}&explicitFilter=include&deviceType=BROWSER&systemType=WEB`,
-    `countryCode=${COUNTRY}`,
+    `countryCode=${COUNTRY}&include=artists,topHits`,
+    `countryCode=${COUNTRY}&deviceType=BROWSER&systemType=WEB&include=artists,topHits`,
+    `countryCode=${COUNTRY}&explicitFilter=INCLUDE&include=artists,topHits`,
+    `countryCode=${COUNTRY}&explicitFilter=INCLUDE&deviceType=BROWSER&systemType=WEB&include=artists,topHits`,
   ];
 
-  // 0) Classic v1 search first — openapi searchResults often 400s for third-party apps
-  {
-    const v1 = await tidalSearchArtistsV1(query, { debug, debugLog });
-    if (v1.length) return debug ? { artists: v1, debug: debugLog } : v1;
-  }
-
-  // 1) OpenAPI searchResults (several query shapes)
-  for (const qs of openApiQs) {
-    try {
-      const s = await tapiCatalog(`/searchResults/${enc}?${qs}&include=artists,topHits`);
-      const out = await finish(s, `searchResults+include:${qs.slice(0, 40)}`);
-      if (out.length) return debug ? { artists: out, debug: debugLog } : out;
-      const relUrl = withInclude(
-        tidalRelPath(s?.data?.relationships?.artists?.links?.self) ||
-          `/searchResults/${enc}/relationships/artists?${qs}`,
-        "artists"
-      );
+  for (const { kind, get } of getters) {
+    for (const qs of openApiQs) {
       try {
-        const rel = await tapiCatalog(relUrl);
-        const out2 = await finish(rel, "relationships/artists");
-        if (out2.length) return debug ? { artists: out2, debug: debugLog } : out2;
+        const s = await get(`/searchResults/${enc}?${qs}`);
+        const out = await finish(s, `openapi/${kind}:${qs.slice(0, 48)}`);
+        if (out.length) return debug ? { artists: out, debug: debugLog } : out;
+        const relUrl = withInclude(
+          tidalRelPath(s?.data?.relationships?.artists?.links?.self) ||
+            `/searchResults/${enc}/relationships/artists?countryCode=${COUNTRY}&explicitFilter=INCLUDE`,
+          "artists"
+        );
+        try {
+          const rel = await get(relUrl);
+          const out2 = await finish(rel, `openapi/${kind}/relationships`);
+          if (out2.length) return debug ? { artists: out2, debug: debugLog } : out2;
+        } catch (e) {
+          if (debug) debugLog.push({ via: `openapi/${kind}/relationships`, error: String(e.message || e) });
+        }
       } catch (e) {
-        if (debug) debugLog.push({ via: "relationships/artists", error: String(e.message || e) });
+        if (debug) debugLog.push({ via: `openapi/${kind}`, error: String(e.message || e) });
+        break; // same auth will fail similarly across qs variants
       }
+    }
+    try {
+      const s = await get(`/searchSuggestions/${enc}?countryCode=${COUNTRY}&include=directHits`);
+      const out = await finish(s, `suggestions/${kind}`);
+      if (out.length) return debug ? { artists: out, debug: debugLog } : out;
     } catch (e) {
-      if (debug) debugLog.push({ via: "searchResults+include", error: String(e.message || e) });
+      if (debug) debugLog.push({ via: `suggestions/${kind}`, error: String(e.message || e) });
     }
   }
 
-  // 2) Suggestions / direct hits
-  try {
-    const s = await tapiCatalog(`/searchSuggestions/${enc}?countryCode=${COUNTRY}&deviceType=BROWSER&systemType=WEB&include=directHits`);
-    const out = await finish(s, "searchSuggestions");
-    if (out.length) return debug ? { artists: out, debug: debugLog } : out;
-  } catch (e) {
-    if (debug) debugLog.push({ via: "searchSuggestions", error: String(e.message || e) });
+  // Classic v1 (needs r_usr on user token)
+  {
+    const v1 = await tidalSearchArtistsV1(query, { debug, debugLog });
+    if (v1.length) return debug ? { artists: v1, debug: debugLog } : v1;
   }
 
   return debug ? { artists: [], debug: debugLog } : [];
