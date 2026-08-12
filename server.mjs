@@ -114,29 +114,78 @@ function bpmMatch(bpm, cad, tol, modes) {
   for (const target of c) if (Math.abs(bpm - target) <= tol) return true;
   return false;
 }
-function matchedDuration(candidates, targets) {
-  if (!targets?.cadences?.length) return candidates.reduce((s, t) => s + (t.durationSec || 210), 0);
-  const tol = +targets.tol || 3;
-  const modes = Array.isArray(targets.modes) && targets.modes.length ? targets.modes : ["direct", "half"];
-  const cads = targets.cadences.map(Number).filter((x) => x > 0);
-  let sum = 0;
+/**
+ * Per-cadence fill status. Tracks are assigned exclusively (no repeats across segments),
+ * matching how the client packs — so "enough 170spm music" doesn't count toward a 150spm segment.
+ */
+function poolNeed(targetSec, targets, candidates) {
+  const tol = +targets?.tol || 3;
+  const modes = Array.isArray(targets?.modes) && targets.modes.length ? targets.modes : ["direct", "half"];
+  let needs = Array.isArray(targets?.cadenceNeeds)
+    ? targets.cadenceNeeds.map((n) => ({ cadence: +n.cadence, need: Math.max(0, +n.sec || 0), filled: 0 })).filter((n) => n.cadence > 0 && n.need > 0)
+    : [];
+  if (!needs.length && Array.isArray(targets?.cadences) && targets.cadences.length && targetSec > 0) {
+    const share = targetSec / targets.cadences.length;
+    needs = targets.cadences.map((c) => ({ cadence: +c, need: share, filled: 0 })).filter((n) => n.cadence > 0);
+  }
+  if (!needs.length) {
+    const raw = candidates.reduce((s, t) => s + (t.durationSec || 210), 0);
+    const matched = candidates.reduce((s, t) => s + (t.bpm != null ? (t.durationSec || 210) : 0), 0);
+    const fillNeed = Math.max(0, targetSec);
+    return {
+      rawNeed: fillNeed * 8, matchNeed: fillNeed * 1.5, fillNeed, matched, raw,
+      canFill: fillNeed <= 0 || matched >= fillNeed, enough: fillNeed <= 0 || matched >= fillNeed * 1.5,
+      byCadence: [],
+    };
+  }
+
+  // Merge duplicate cadence rows
+  const byCad = new Map();
+  for (const n of needs) {
+    const k = Math.round(n.cadence);
+    const prev = byCad.get(k);
+    if (prev) prev.need += n.need;
+    else byCad.set(k, { cadence: k, need: n.need, filled: 0 });
+  }
+  needs = [...byCad.values()];
+
+  const tracks = [];
   for (const t of candidates) {
     if (t.bpm == null) continue;
-    if (cads.some((cad) => bpmMatch(t.bpm, cad, tol, modes))) sum += t.durationSec || 210;
+    const cads = needs.filter((n) => bpmMatch(t.bpm, n.cadence, tol, modes)).map((n) => n.cadence);
+    if (cads.length) tracks.push({ dur: t.durationSec || 210, cads });
   }
-  return sum;
-}
-function poolNeed(targetSec, targets, candidates) {
-  if (!(targetSec > 0)) return { rawNeed: 0, matchNeed: 0, fillNeed: 0, matched: 0, raw: 0, canFill: false, enough: false };
-  // Packing needs ~1× run length in cadence-matched tracks; keep a little spare for multi-segment plans.
-  const fillNeed = targetSec;
-  const matchNeed = targetSec * 1.5;
-  const rawNeed = targetSec * 8;
-  const matched = matchedDuration(candidates, targets);
+  tracks.sort((a, b) => b.dur - a.dur);
+  for (const t of tracks) {
+    let best = null, bestDeficit = 0;
+    for (const n of needs) {
+      if (!t.cads.includes(n.cadence)) continue;
+      const deficit = n.need - n.filled;
+      if (deficit > bestDeficit) { bestDeficit = deficit; best = n; }
+    }
+    if (best) best.filled += t.dur;
+  }
+
+  const fillNeed = needs.reduce((s, n) => s + n.need, 0);
+  const matched = needs.reduce((s, n) => s + Math.min(n.filled, n.need), 0);
   const raw = candidates.reduce((s, t) => s + (t.durationSec || 210), 0);
-  const canFill = matched >= fillNeed;
-  const enough = matched >= matchNeed || (raw >= rawNeed && matched >= fillNeed);
-  return { rawNeed, matchNeed, fillNeed, matched, raw, canFill, enough };
+  const canFill = needs.every((n) => n.filled >= n.need * 0.98);
+  const enough = needs.every((n) => n.filled >= n.need * 1.35);
+  return {
+    rawNeed: fillNeed * 8,
+    matchNeed: fillNeed * 1.35,
+    fillNeed,
+    matched,
+    raw,
+    canFill,
+    enough,
+    byCadence: needs.map((n) => ({
+      cadence: n.cadence,
+      need: Math.round(n.need),
+      filled: Math.round(n.filled),
+      short: Math.max(0, Math.round(n.need - n.filled)),
+    })),
+  };
 }
 
 /* ---- GetSongBPM (tempo) ---- */
@@ -491,7 +540,7 @@ async function tidalArtistTrackIds(aid, limit) {
   }
   return ids.slice(0, limit);
 }
-const POOL_BUDGET_MS = 12 * 60 * 1000; // absolute ceiling; keep expanding until the run can be filled
+const POOL_BUDGET_MS = 15 * 60 * 1000; // absolute ceiling; keep expanding until each cadence can be filled
 async function tidalPool(seeds, targetSec = 0, targets = null, onProgress = null) {
   if (!GSB_KEY) throw new Error("GETSONGBPM_API_KEY not set — add it to credentials.txt");
   const started = Date.now();
@@ -499,7 +548,7 @@ async function tidalPool(seeds, targetSec = 0, targets = null, onProgress = null
   const seedList = seeds.map((s) => (typeof s === "string" ? { id: s, name: "" } : s));
   const seedIds = seedList.map((s) => String(s.id));
   const seedNames = seedList.map((s) => s.name).filter(Boolean);
-  const ARTIST_CAP = 400, TRACK_CAP = 2000, MAX_LEVELS = 12;
+  const ARTIST_CAP = 600, TRACK_CAP = 3000, MAX_LEVELS = 20;
   const knownNames = new Map(); seedNames.forEach((n) => knownNames.set(n.toLowerCase(), n));
   const doneArtists = new Set(), allTrackIds = new Set(), candidates = [];
   const idToName = new Map();
@@ -507,6 +556,8 @@ async function tidalPool(seeds, targetSec = 0, targets = null, onProgress = null
   const report = (phase, extra = {}) => {
     if (!onProgress) return;
     const need = poolNeed(targetSec, targets, candidates);
+    const short = (need.byCadence || []).filter((c) => c.short > 30).slice(0, 4)
+      .map((c) => `${c.cadence}spm needs ${Math.round(c.short / 60)}m more`);
     try {
       onProgress({
         phase,
@@ -515,15 +566,16 @@ async function tidalPool(seeds, targetSec = 0, targets = null, onProgress = null
         matchedSec: Math.round(need.matched || 0),
         needSec: Math.round(need.fillNeed || need.matchNeed || 0),
         elapsedSec: Math.round((Date.now() - started) / 1000),
+        shortCadences: short,
         ...extra,
       });
     } catch (_) {}
   };
   async function enrichBpm(meta, detail) {
-    // Always finish BPM for fetched tracks unless the run is already fillable or we hit the hard ceiling.
     let i = 0;
     while (i < meta.length) {
-      if (poolNeed(targetSec, targets, candidates).canFill || hardStop()) break;
+      // Stop early only once every cadence band can be filled, or we hit the hard ceiling.
+      if (poolNeed(targetSec, targets, candidates).enough || hardStop()) break;
       const batch = meta.slice(i, i + 24);
       i += batch.length;
       report("bpm", { detail, bpmDone: i, bpmTotal: meta.length });
@@ -546,7 +598,7 @@ async function tidalPool(seeds, targetSec = 0, targets = null, onProgress = null
     fresh.forEach((a) => doneArtists.add(a));
     if (!fresh.length) return [];
     report("tracks", { detail, pendingArtists: fresh.length });
-    const perArtist = seedWeight ? 50 : 35;
+    const perArtist = seedWeight ? 80 : 45;
     const trackLists = await mapLimit(fresh, 6, async (aid) => {
       try { return await tidalArtistTrackIds(aid, perArtist); } catch (_) { return []; }
     });
@@ -587,38 +639,39 @@ async function tidalPool(seeds, targetSec = 0, targets = null, onProgress = null
   report("start", { detail: "seed artists" });
   await fetchArtists(seedIds, true, "seed artists");
 
-  // BFS: related artists of related artists (Tidal similar + Last.fm) until the run can be filled.
+  // BFS: related artists of related artists until every cadence band can be filled.
   let frontierIds = [...seedIds];
   let frontierNames = [...seedNames];
   for (let level = 1; level <= MAX_LEVELS; level++) {
     const need = poolNeed(targetSec, targets, candidates);
     if (need.enough) break;
-    // Once we can fill the run, do a couple more rings for packing spare, then stop.
-    if (need.canFill && level > 3) break;
     if (hardStop()) break;
     if (doneArtists.size >= ARTIST_CAP || allTrackIds.size >= TRACK_CAP) break;
     if (!frontierIds.length && !frontierNames.length) break;
 
-    report("expand", { detail: `related artists ring ${level}`, level });
+    const shortNote = (need.byCadence || []).filter((c) => c.short > 30)
+      .map((c) => `${c.cadence}spm`).slice(0, 3).join(", ");
+    report("expand", {
+      detail: shortNote ? `related artists ring ${level} (still short on ${shortNote})` : `related artists ring ${level}`,
+      level,
+    });
     const nextIds = [];
     const nextNames = [];
 
-    // Tidal similar artists of the current frontier
     if (frontierIds.length && doneArtists.size < ARTIST_CAP) {
-      const sim = await tidalSimilarIds(frontierIds.slice(0, 40), `Tidal similar · ring ${level}`);
+      const sim = await tidalSimilarIds(frontierIds.slice(0, 50), `Tidal similar · ring ${level}`);
       for (const id of sim) if (!doneArtists.has(id)) nextIds.push(id);
     }
 
-    // Last.fm similar names → resolve to Tidal ids
     if (LASTFM_KEY && frontierNames.length && doneArtists.size < ARTIST_CAP) {
-      const lists = await mapLimit(frontierNames.slice(0, 30), 6, (n) => lastfmSimilar(n, level === 1 ? 30 : 16));
+      const lists = await mapLimit(frontierNames.slice(0, 40), 6, (n) => lastfmSimilar(n, level === 1 ? 35 : 20));
       const newNames = [];
       for (const names of lists) for (const nm of names) {
         const k = nm.toLowerCase();
         if (!knownNames.has(k)) { knownNames.set(k, nm); newNames.push(nm); }
       }
       const room = Math.max(0, ARTIST_CAP - doneArtists.size - nextIds.length);
-      const slice = newNames.slice(0, Math.min(room, level === 1 ? 50 : 35));
+      const slice = newNames.slice(0, Math.min(room, level === 1 ? 60 : 45));
       report("resolve", { detail: `resolving ${slice.length} Last.fm artists · ring ${level}`, level });
       const resolved = await mapLimit(slice, 6, async (n) => {
         const id = await tidalResolveArtist(n);
@@ -629,7 +682,6 @@ async function tidalPool(seeds, targetSec = 0, targets = null, onProgress = null
       for (const n of slice) nextNames.push(n);
     }
 
-    // Dedupe while preserving order
     const uniq = [];
     const seen = new Set();
     for (const id of nextIds) {
@@ -652,19 +704,19 @@ async function tidalPool(seeds, targetSec = 0, targets = null, onProgress = null
     frontierNames = batch.map((id) => idToName.get(id)).filter(Boolean);
     if (!frontierNames.length) frontierNames = nextNames;
 
-    // If we can already fill the run and have a bit of spare, stop; otherwise keep recursing.
-    const after = poolNeed(targetSec, targets, candidates);
-    if (after.enough) break;
+    if (poolNeed(targetSec, targets, candidates).enough) break;
   }
 
   saveBpmCache();
   const finalNeed = poolNeed(targetSec, targets, candidates);
   report("done", {
-    detail: finalNeed.canFill
+    detail: finalNeed.enough
       ? "pool ready"
-      : hardStop()
-        ? "time ceiling reached — packing what we have"
-        : "expanded as far as caps allow — packing what we have",
+      : finalNeed.canFill
+        ? "pool can fill — packing"
+        : hardStop()
+          ? "time ceiling reached — packing what we have"
+          : "expanded as far as caps allow — packing what we have",
   });
   return candidates;
 }
@@ -724,7 +776,7 @@ async function spotifyPool(seeds, targetSec = 0, targets = null, onProgress = nu
   const hardStop = () => Date.now() - started > POOL_BUDGET_MS;
   const seedList = seeds.map((s) => (typeof s === "string" ? { name: s } : s));
   const seedNames = seedList.map((s) => s.name).filter(Boolean);
-  const ARTIST_CAP = 400, TRACK_CAP = 2000, MAX_LEVELS = 12;
+  const ARTIST_CAP = 600, TRACK_CAP = 3000, MAX_LEVELS = 20;
   const knownNames = new Map(); seedNames.forEach((n) => knownNames.set(n.toLowerCase(), n));
   const seedNameSet = new Set(seedNames.map((n) => n.toLowerCase()));
   const seedIdByName = new Map(); for (const s of seedList) if (s.name && s.id) seedIdByName.set(String(s.name).toLowerCase(), String(s.id));
@@ -732,6 +784,8 @@ async function spotifyPool(seeds, targetSec = 0, targets = null, onProgress = nu
   const report = (phase, extra = {}) => {
     if (!onProgress) return;
     const need = poolNeed(targetSec, targets, candidates);
+    const short = (need.byCadence || []).filter((c) => c.short > 30).slice(0, 4)
+      .map((c) => `${c.cadence}spm needs ${Math.round(c.short / 60)}m more`);
     try {
       onProgress({
         phase,
@@ -740,6 +794,7 @@ async function spotifyPool(seeds, targetSec = 0, targets = null, onProgress = nu
         matchedSec: Math.round(need.matched || 0),
         needSec: Math.round(need.fillNeed || need.matchNeed || 0),
         elapsedSec: Math.round((Date.now() - started) / 1000),
+        shortCadences: short,
         ...extra,
       });
     } catch (_) {}
@@ -747,7 +802,7 @@ async function spotifyPool(seeds, targetSec = 0, targets = null, onProgress = nu
   async function enrichBpm(toBpm, detail) {
     let i = 0;
     while (i < toBpm.length) {
-      if (poolNeed(targetSec, targets, candidates).canFill || hardStop()) break;
+      if (poolNeed(targetSec, targets, candidates).enough || hardStop()) break;
       const batch = toBpm.slice(i, i + 24);
       i += batch.length;
       report("bpm", { detail, bpmDone: i, bpmTotal: toBpm.length });
@@ -768,7 +823,7 @@ async function spotifyPool(seeds, targetSec = 0, targets = null, onProgress = nu
       const isSeed = seedNameSet.has(nm.toLowerCase());
       let id = seedIdByName.get(nm.toLowerCase()) || null;
       if (!id) id = await spotifyResolveArtist(nm).catch(() => null);
-      return spotifyArtistTracks(nm, id, isSeed ? 50 : 35).catch(() => []);
+      return spotifyArtistTracks(nm, id, isSeed ? 70 : 45).catch(() => []);
     });
     const toBpm = [];
     for (const tl of lists) for (const t of tl) if (t && !seenRef.has(t.ref)) { seenRef.add(t.ref); toBpm.push(t); }
@@ -779,25 +834,28 @@ async function spotifyPool(seeds, targetSec = 0, targets = null, onProgress = nu
   report("start", { detail: "seed artists" });
   await fetchNames(seedNames, "seed artists");
 
-  // BFS: related artists of related artists until the run can be filled.
   let frontier = [...seedNames];
   for (let level = 1; level <= MAX_LEVELS; level++) {
     const need = poolNeed(targetSec, targets, candidates);
     if (need.enough) break;
-    if (need.canFill && level > 3) break;
     if (hardStop()) break;
     if (doneNames.size >= ARTIST_CAP || candidates.length >= TRACK_CAP) break;
     if (!LASTFM_KEY || !frontier.length) break;
 
-    report("expand", { detail: `related artists ring ${level}`, level });
-    const lists = await mapLimit(frontier.slice(0, 30), 6, (n) => lastfmSimilar(n, level === 1 ? 30 : 16));
+    const shortNote = (need.byCadence || []).filter((c) => c.short > 30)
+      .map((c) => `${c.cadence}spm`).slice(0, 3).join(", ");
+    report("expand", {
+      detail: shortNote ? `related artists ring ${level} (still short on ${shortNote})` : `related artists ring ${level}`,
+      level,
+    });
+    const lists = await mapLimit(frontier.slice(0, 40), 6, (n) => lastfmSimilar(n, level === 1 ? 35 : 20));
     const newNames = [];
     for (const names of lists) for (const nm of names) {
       const k = nm.toLowerCase();
       if (!knownNames.has(k)) { knownNames.set(k, nm); newNames.push(nm); }
     }
     const room = Math.max(0, ARTIST_CAP - doneNames.size);
-    const slice = newNames.slice(0, Math.min(room, level === 1 ? 50 : 35));
+    const slice = newNames.slice(0, Math.min(room, level === 1 ? 60 : 45));
     if (!slice.length) break;
     await fetchNames(slice, `related artists · ring ${level}`);
     frontier = slice;
@@ -806,11 +864,13 @@ async function spotifyPool(seeds, targetSec = 0, targets = null, onProgress = nu
   saveBpmCache();
   const finalNeed = poolNeed(targetSec, targets, candidates);
   report("done", {
-    detail: finalNeed.canFill
+    detail: finalNeed.enough
       ? "pool ready"
-      : hardStop()
-        ? "time ceiling reached — packing what we have"
-        : "expanded as far as caps allow — packing what we have",
+      : finalNeed.canFill
+        ? "pool can fill — packing"
+        : hardStop()
+          ? "time ceiling reached — packing what we have"
+          : "expanded as far as caps allow — packing what we have",
   });
   return candidates;
 }
