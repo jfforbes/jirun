@@ -114,27 +114,96 @@ function bpmMatch(bpm, cad, tol, modes) {
   for (const target of c) if (Math.abs(bpm - target) <= tol) return true;
   return false;
 }
-function matchedDuration(candidates, targets) {
-  if (!targets?.cadences?.length) return candidates.reduce((s, t) => s + (t.durationSec || 210), 0);
-  const tol = +targets.tol || 3;
-  const modes = Array.isArray(targets.modes) && targets.modes.length ? targets.modes : ["direct", "half"];
-  const cads = targets.cadences.map(Number).filter((x) => x > 0);
-  let sum = 0;
+/**
+ * Per-cadence fill status. Tracks are assigned exclusively (no repeats across segments),
+ * matching how the client packs — so "enough 170spm music" doesn't count toward a 150spm segment.
+ */
+function poolNeed(targetSec, targets, candidates) {
+  const tol = +targets?.tol || 3;
+  const modes = Array.isArray(targets?.modes) && targets.modes.length ? targets.modes : ["direct", "half"];
+  let needs = Array.isArray(targets?.cadenceNeeds)
+    ? targets.cadenceNeeds.map((n) => ({ cadence: +n.cadence, need: Math.max(0, +n.sec || 0), filled: 0 })).filter((n) => n.cadence > 0 && n.need > 0)
+    : [];
+  if (!needs.length && Array.isArray(targets?.cadences) && targets.cadences.length && targetSec > 0) {
+    const share = targetSec / targets.cadences.length;
+    needs = targets.cadences.map((c) => ({ cadence: +c, need: share, filled: 0 })).filter((n) => n.cadence > 0);
+  }
+  if (!needs.length) {
+    const raw = candidates.reduce((s, t) => s + (t.durationSec || 210), 0);
+    const matched = candidates.reduce((s, t) => s + (t.bpm != null ? (t.durationSec || 210) : 0), 0);
+    const fillNeed = Math.max(0, targetSec);
+    return {
+      rawNeed: fillNeed * 8, matchNeed: fillNeed * 1.5, fillNeed, matched, raw,
+      canFill: fillNeed <= 0 || matched >= fillNeed, enough: fillNeed <= 0 || matched >= fillNeed * 1.5,
+      byCadence: [],
+    };
+  }
+
+  // Merge duplicate cadence rows
+  const byCad = new Map();
+  for (const n of needs) {
+    const k = Math.round(n.cadence);
+    const prev = byCad.get(k);
+    if (prev) prev.need += n.need;
+    else byCad.set(k, { cadence: k, need: n.need, filled: 0 });
+  }
+  needs = [...byCad.values()];
+
+  const tracks = [];
   for (const t of candidates) {
     if (t.bpm == null) continue;
-    if (cads.some((cad) => bpmMatch(t.bpm, cad, tol, modes))) sum += t.durationSec || 210;
+    const cads = needs.filter((n) => bpmMatch(t.bpm, n.cadence, tol, modes)).map((n) => n.cadence);
+    if (cads.length) tracks.push({ dur: t.durationSec || 210, cads });
   }
-  return sum;
-}
-function poolNeed(targetSec, targets, candidates) {
-  if (!(targetSec > 0)) return { rawNeed: 0, matchNeed: 0, matched: 0, enough: false };
-  // Raw headroom still matters (BPM lookups fail often); match need is the real stop condition.
-  const rawNeed = targetSec * 8;
-  const matchNeed = targetSec * 2; // 2× so no-repeat multi-segment plans have spare matches
-  const matched = matchedDuration(candidates, targets);
+  tracks.sort((a, b) => b.dur - a.dur);
+  for (const t of tracks) {
+    let best = null, bestDeficit = 0;
+    for (const n of needs) {
+      if (!t.cads.includes(n.cadence)) continue;
+      const deficit = n.need - n.filled;
+      if (deficit > bestDeficit) { bestDeficit = deficit; best = n; }
+    }
+    if (best) best.filled += t.dur;
+  }
+
+  const fillNeed = needs.reduce((s, n) => s + n.need, 0);
+  const matched = needs.reduce((s, n) => s + Math.min(n.filled, n.need), 0);
   const raw = candidates.reduce((s, t) => s + (t.durationSec || 210), 0);
-  const enough = matched >= matchNeed || (raw >= rawNeed && matched >= targetSec * 0.85);
-  return { rawNeed, matchNeed, matched, raw, enough };
+  const canFill = needs.every((n) => n.filled >= n.need * 0.98);
+  const enough = needs.every((n) => n.filled >= n.need * 1.35);
+  return {
+    rawNeed: fillNeed * 8,
+    matchNeed: fillNeed * 1.35,
+    fillNeed,
+    matched,
+    raw,
+    canFill,
+    enough,
+    byCadence: needs.map((n) => ({
+      cadence: n.cadence,
+      need: Math.round(n.need),
+      filled: Math.round(n.filled),
+      short: Math.max(0, Math.round(n.need - n.filled)),
+    })),
+  };
+}
+/** Overall playlist-build % for the gather phase (never 100 — packing finishes on the client). */
+function playlistGatherPct(phase, { level = 0, maxLevels = 20, need = null, bpmDone = 0, bpmTotal = 0 } = {}) {
+  if (phase === "done") return 88;
+  const ring = Math.max(0, Math.min(1, level / Math.max(1, maxLevels)));
+  const fill = need?.fillNeed > 0 ? Math.max(0, Math.min(1, need.matched / need.fillNeed)) : 0;
+  const bpm = bpmTotal > 0 ? Math.max(0, Math.min(1, bpmDone / bpmTotal)) : 0;
+  const phaseBase = {
+    start: 4,
+    tracks: 10,
+    similar: 14,
+    expand: 18,
+    resolve: 20,
+    bpm: 22,
+  }[phase] ?? 12;
+  // Ring depth drives most of the bar so early “enough matches” can’t mark the job complete.
+  const pct = phaseBase + ring * 50 + fill * 12 + bpm * 4;
+  return Math.max(3, Math.min(86, Math.round(pct)));
 }
 
 /* ---- GetSongBPM (tempo) ---- */
@@ -287,11 +356,90 @@ function tidalRelPath(link) {
   if (!p.startsWith("/")) p = `/${p}`;
   return p;
 }
+/** Normalize an artist name into a Tidal profile handle (e.g. "Taylor Swift" → "taylorswift"). */
+function tidalNameToHandle(name) {
+  return String(name || "").toLowerCase().normalize("NFKD").replace(/[\u0300-\u036f]/g, "").replace(/[^a-z0-9]+/g, "");
+}
+/** Accept pasted Tidal artist URLs or bare numeric ids. */
+function tidalParseArtistRef(q) {
+  const s = String(q || "").trim();
+  if (!s) return null;
+  const url = s.match(/(?:tidal\.com|listen\.tidal\.com)\/(?:browse\/)?artist\/(\d+)/i);
+  if (url) return url[1];
+  if (/^\d{3,}$/.test(s)) return s;
+  return null;
+}
+async function tidalArtistById(id) {
+  if (!id) return null;
+  const path = `/artists/${encodeURIComponent(id)}?countryCode=${COUNTRY}`;
+  for (const getter of [tapiCatalog, tapi]) {
+    try {
+      const j = await getter(path);
+      const a = j?.data;
+      if (a?.type === "artists" && a.id) return { id: String(a.id), name: a.attributes?.name || String(a.id) };
+    } catch (_) { /* try next auth */ }
+  }
+  // Bulk filter works on some tokens when singular GET does not
+  try {
+    const j = await tapiCatalog(`/artists?filter[id]=${encodeURIComponent(id)}&countryCode=${COUNTRY}`);
+    const a = (j.data || []).find((x) => x?.type === "artists" && String(x.id) === String(id));
+    if (a) return { id: String(a.id), name: a.attributes?.name || String(a.id) };
+  } catch (_) {}
+  return null;
+}
+async function tidalArtistsByHandle(handle) {
+  const h = tidalNameToHandle(handle);
+  if (!h || h.length < 2) return [];
+  const path = `/artists?filter[handle]=${encodeURIComponent(h)}&countryCode=${COUNTRY}`;
+  for (const getter of [tapiCatalog, tapi]) {
+    try {
+      const j = await getter(path);
+      return (j.data || [])
+        .filter((a) => a?.type === "artists" && a.id)
+        .map((a) => ({ id: String(a.id), name: a.attributes?.name || h }));
+    } catch (_) { /* try next auth */ }
+  }
+  return [];
+}
+/** Fuzzy artist names via Last.fm (preferred) or MusicBrainz (no key). */
+async function externalArtistNames(query, limit = 8) {
+  const q = (query || "").trim();
+  if (q.length < 1) return [];
+  if (LASTFM_KEY) {
+    try {
+      const u = `${LASTFM_BASE}?method=artist.search&artist=${encodeURIComponent(q)}&api_key=${LASTFM_KEY}&format=json&limit=${limit}`;
+      const r = await fetch(u, { headers: { Accept: "application/json" } });
+      if (r.ok) {
+        const j = await r.json();
+        const raw = j.results?.artistmatches?.artist;
+        const list = Array.isArray(raw) ? raw : raw ? [raw] : [];
+        const names = list.map((a) => a?.name).filter(Boolean);
+        if (names.length) return [...new Set(names)].slice(0, limit);
+      }
+    } catch (_) {}
+  }
+  try {
+    const u = `https://musicbrainz.org/ws/2/artist?query=${encodeURIComponent(q)}&fmt=json&limit=${limit}`;
+    const r = await fetch(u, { headers: { Accept: "application/json", "User-Agent": "jirun/1.0 (https://github.com/jfforbes/jirun)" } });
+    if (r.ok) {
+      const j = await r.json();
+      const names = (j.artists || []).map((a) => a.name).filter(Boolean);
+      if (names.length) return [...new Set(names)].slice(0, limit);
+    }
+  } catch (_) {}
+  return [];
+}
+/**
+ * Tidal OpenAPI /v2/searchResults/{id} currently 400s with INVALID_RESOURCE_ID for many
+ * third-party apps (see tidal-music/discussions/366). Classic v1 wants legacy r_usr.
+ * Work around by resolving artists via handle/id and external name search.
+ */
 async function tidalSearchArtists(q, { debug = false } = {}) {
   const query = (q || "").trim();
-  if (query.length < 1) return debug ? { artists: [], debug: [] } : [];
+  if (query.length < 1) return debug ? { artists: [], debug: [], build: "search-ext-72cc" } : [];
   const enc = encodeURIComponent(query);
   const debugLog = [];
+  const done = (artists) => (debug ? { artists, debug: debugLog, build: "search-ext-72cc" } : artists);
   const finish = async (payload, via) => {
     const extracted = tidalExtractArtists(payload || {});
     const out = (await tidalHydrateArtistNames(extracted)).filter((a) => a.name && a.name !== "?");
@@ -304,60 +452,98 @@ async function tidalSearchArtists(q, { debug = false } = {}) {
     return `${path}${path.includes("?") ? "&" : "?"}include=${inc}`;
   };
 
-  // 1) Main search document with artists + topHits embedded
-  try {
-    const s = await tapiCatalog(`/searchResults/${enc}?countryCode=${COUNTRY}&explicitFilter=INCLUDE&include=artists,topHits`);
-    const out = await finish(s, "searchResults+include");
-    if (out.length) return debug ? { artists: out, debug: debugLog } : out;
-    // Follow the artists relationship link (catalog token; user tokens often redact search)
-    const relUrl = withInclude(
-      tidalRelPath(s?.data?.relationships?.artists?.links?.self) ||
-        `/searchResults/${enc}/relationships/artists?countryCode=${COUNTRY}&explicitFilter=INCLUDE`,
-      "artists"
-    );
+  // 0) Pasted Tidal artist URL / numeric id
+  const directId = tidalParseArtistRef(query);
+  if (directId) {
     try {
-      const rel = await tapiCatalog(relUrl);
-      const out2 = await finish(rel, "relationships/artists");
-      if (out2.length) return debug ? { artists: out2, debug: debugLog } : out2;
+      const a = await tidalArtistById(directId);
+      if (debug) debugLog.push({ via: "direct-id", id: directId, named: a ? 1 : 0, sample: a ? [a] : [] });
+      if (a) return done([a]);
     } catch (e) {
-      if (debug) debugLog.push({ via: "relationships/artists", error: String(e.message || e) });
+      if (debug) debugLog.push({ via: "direct-id", error: String(e.message || e) });
     }
-  } catch (e) {
-    if (debug) debugLog.push({ via: "searchResults+include", error: String(e.message || e) });
   }
 
-  // 2) Suggestions / direct hits (typeahead-friendly)
+  // 1) Direct handle for the typed query (fast path for names like "underoath")
   try {
-    const s = await tapiCatalog(`/searchSuggestions/${enc}?countryCode=${COUNTRY}&explicitFilter=INCLUDE&include=directHits`);
-    const out = await finish(s, "searchSuggestions");
-    if (out.length) return debug ? { artists: out, debug: debugLog } : out;
-    const relUrl = withInclude(tidalRelPath(s?.data?.relationships?.directHits?.links?.self), "directHits");
-    if (relUrl) {
-      const rel = await tapiCatalog(relUrl);
-      const out2 = await finish(rel, "directHits");
-      if (out2.length) return debug ? { artists: out2, debug: debugLog } : out2;
+    const byHandle = await tidalArtistsByHandle(query);
+    if (debug) debugLog.push({ via: "handle/query", handle: tidalNameToHandle(query), named: byHandle.length, sample: byHandle.slice(0, 3) });
+    if (byHandle.length) return done(byHandle);
+  } catch (e) {
+    if (debug) debugLog.push({ via: "handle/query", error: String(e.message || e) });
+  }
+
+  // 2) External fuzzy name search → resolve each candidate on Tidal by handle
+  //    (bypasses broken searchResults; see github.com/orgs/tidal-music/discussions/366)
+  if (query.length >= 2) {
+    try {
+      const names = await externalArtistNames(query, 10);
+      if (debug) debugLog.push({ via: "external/names", count: names.length, sample: names.slice(0, 5) });
+      const handleList = [];
+      const seenHandle = new Set();
+      for (const name of names) {
+        const handle = tidalNameToHandle(name);
+        if (!handle || handle.length < 2 || seenHandle.has(handle)) continue;
+        seenHandle.add(handle);
+        handleList.push(handle);
+      }
+      const batches = await mapLimit(handleList.slice(0, 12), 4, (h) => tidalArtistsByHandle(h));
+      const resolved = [];
+      for (const hits of batches) {
+        for (const a of hits || []) {
+          if (!resolved.some((x) => x.id === a.id)) resolved.push(a);
+        }
+      }
+      if (debug) debugLog.push({ via: "external/resolve", tried: handleList.length, named: resolved.length, sample: resolved.slice(0, 3) });
+      if (resolved.length) return done(resolved.slice(0, 10));
+    } catch (e) {
+      if (debug) debugLog.push({ via: "external", error: String(e.message || e) });
     }
-  } catch (e) {
-    if (debug) debugLog.push({ via: "searchSuggestions", error: String(e.message || e) });
   }
 
-  // 3) Last resort relationships path
-  try {
-    const rel = await tapiCatalog(`/searchResults/${enc}/relationships/artists?countryCode=${COUNTRY}&explicitFilter=INCLUDE&include=artists`);
-    const out = await finish(rel, "relationships/direct");
-    if (out.length) return debug ? { artists: out, debug: debugLog } : out;
-  } catch (e) {
-    if (debug) debugLog.push({ via: "relationships/direct", error: String(e.message || e) });
+  // 3) Native OpenAPI search last — currently broken for many third-party apps, but
+  //    keep it so we pick it up automatically if Tidal fixes access.
+  const getters = [];
+  try { await accessToken("tidal"); getters.push({ kind: "user", get: tapi }); } catch (e) {
+    if (debug) debugLog.push({ via: "openapi/auth-user", error: String(e.message || e) });
+  }
+  getters.push({ kind: "catalog", get: tapiCatalog });
+  for (const { kind, get } of getters) {
+    try {
+      const s = await get(`/searchResults/${enc}?countryCode=${COUNTRY}&include=artists,topHits`);
+      const out = await finish(s, `openapi/${kind}`);
+      if (out.length) return done(out);
+      const relUrl = withInclude(
+        tidalRelPath(s?.data?.relationships?.artists?.links?.self) ||
+          `/searchResults/${enc}/relationships/artists?countryCode=${COUNTRY}`,
+        "artists"
+      );
+      try {
+        const rel = await get(relUrl);
+        const out2 = await finish(rel, `openapi/${kind}/relationships`);
+        if (out2.length) return done(out2);
+      } catch (e) {
+        if (debug) debugLog.push({ via: `openapi/${kind}/relationships`, error: String(e.message || e) });
+      }
+    } catch (e) {
+      if (debug) debugLog.push({ via: `openapi/${kind}`, error: String(e.message || e) });
+    }
   }
 
-  return debug ? { artists: [], debug: debugLog } : [];
+  return done([]);
 }
 const tidalArtistIdCache = {};
+/** Pool expansion only needs a Tidal id for a known name — skip fuzzy/OpenAPI search. */
 async function tidalResolveArtist(name) {
   const k = (name || "").toLowerCase();
   if (k in tidalArtistIdCache) return tidalArtistIdCache[k];
-  let id = null; try { const a = await tidalSearchArtists(name); id = a[0]?.id || null; } catch (_) {}
-  tidalArtistIdCache[k] = id; return id;
+  let id = null;
+  try {
+    const hits = await tidalArtistsByHandle(name);
+    id = hits[0]?.id || null;
+  } catch (_) {}
+  tidalArtistIdCache[k] = id;
+  return id;
 }
 async function tidalArtistTrackIds(aid, limit) {
   const ids = [];
@@ -372,43 +558,197 @@ async function tidalArtistTrackIds(aid, limit) {
   }
   return ids.slice(0, limit);
 }
-async function tidalPool(seeds, targetSec = 0, targets = null) {
+const POOL_BUDGET_MS = 15 * 60 * 1000; // absolute ceiling; keep expanding until each cadence can be filled
+async function tidalPool(seeds, targetSec = 0, targets = null, onProgress = null) {
   if (!GSB_KEY) throw new Error("GETSONGBPM_API_KEY not set — add it to credentials.txt");
+  const started = Date.now();
+  const hardStop = () => Date.now() - started > POOL_BUDGET_MS;
   const seedList = seeds.map((s) => (typeof s === "string" ? { id: s, name: "" } : s));
   const seedIds = seedList.map((s) => String(s.id));
   const seedNames = seedList.map((s) => s.name).filter(Boolean);
-  const ARTIST_CAP = 360, TRACK_CAP = 1600;
+  const ARTIST_CAP = 600, TRACK_CAP = 3000, MAX_LEVELS = 20;
   const knownNames = new Map(); seedNames.forEach((n) => knownNames.set(n.toLowerCase(), n));
   const doneArtists = new Set(), allTrackIds = new Set(), candidates = [];
-  async function fetchArtists(ids, seedWeight) {
-    const fresh = ids.filter((a) => a && !doneArtists.has(a)); fresh.forEach((a) => doneArtists.add(a));
-    if (!fresh.length) return;
-    const perArtist = seedWeight ? 50 : 30;
-    const trackLists = await mapLimit(fresh, 6, async (aid) => { try { return await tidalArtistTrackIds(aid, perArtist); } catch (_) { return []; } });
-    const newIds = []; for (const tl of trackLists) for (const id of tl) if (!allTrackIds.has(id)) { allTrackIds.add(id); newIds.push(id); }
+  const idToName = new Map();
+  let currentLevel = 0;
+  for (const s of seedList) if (s.id && s.name) idToName.set(String(s.id), s.name);
+  const report = (phase, extra = {}) => {
+    if (!onProgress) return;
+    const need = poolNeed(targetSec, targets, candidates);
+    const level = extra.level != null ? extra.level : currentLevel;
+    const short = (need.byCadence || []).filter((c) => c.short > 30).slice(0, 4)
+      .map((c) => `${c.cadence}spm needs ${Math.round(c.short / 60)}m more`);
+    try {
+      onProgress({
+        stage: "gather",
+        phase,
+        pct: playlistGatherPct(phase, {
+          level,
+          maxLevels: MAX_LEVELS,
+          need,
+          bpmDone: extra.bpmDone || 0,
+          bpmTotal: extra.bpmTotal || 0,
+        }),
+        level,
+        maxLevels: MAX_LEVELS,
+        artists: doneArtists.size,
+        tracks: candidates.length,
+        matchedSec: Math.round(need.matched || 0),
+        needSec: Math.round(need.fillNeed || need.matchNeed || 0),
+        elapsedSec: Math.round((Date.now() - started) / 1000),
+        shortCadences: short,
+        ...extra,
+      });
+    } catch (_) {}
+  };
+  async function enrichBpm(meta, detail) {
+    let i = 0;
+    while (i < meta.length) {
+      // Stop early only once every cadence band has spare coverage, or we hit the hard ceiling.
+      if (poolNeed(targetSec, targets, candidates).enough || hardStop()) break;
+      const batch = meta.slice(i, i + 24);
+      i += batch.length;
+      report("bpm", { detail, bpmDone: i, bpmTotal: meta.length });
+      const enriched = await mapLimit(batch, 8, async (t) => {
+        const b = await bpmFor(t.artist, t.title).catch(() => null);
+        return b ? { ...t, bpm: b } : null;
+      });
+      for (const t of enriched) if (t) {
+        candidates.push(t);
+        if (t.artist) {
+          const k = t.artist.toLowerCase();
+          if (!knownNames.has(k)) knownNames.set(k, t.artist);
+        }
+      }
+      if (cacheDirty) saveBpmCache();
+    }
+  }
+  async function fetchArtists(ids, seedWeight, detail) {
+    const fresh = ids.filter((a) => a && !doneArtists.has(a));
+    fresh.forEach((a) => doneArtists.add(a));
+    if (!fresh.length) return [];
+    report("tracks", { detail, pendingArtists: fresh.length });
+    const perArtist = seedWeight ? 80 : 45;
+    const trackLists = await mapLimit(fresh, 6, async (aid) => {
+      try { return await tidalArtistTrackIds(aid, perArtist); } catch (_) { return []; }
+    });
+    const newIds = [];
+    for (const tl of trackLists) for (const id of tl) if (!allTrackIds.has(id)) { allTrackIds.add(id); newIds.push(id); }
     const meta = [];
-    for (let i = 0; i < newIds.length; i += 20) { const chunk = newIds.slice(i, i + 20); try { const t = await tapi(`/tracks?filter[id]=${chunk.join(",")}&countryCode=${COUNTRY}&include=artists,genres`); for (const tr of t.data || []) meta.push(tidalMapTrack(tr, t.included)); } catch (_) {} }
-    const enriched = await mapLimit(meta, 8, async (t) => { const b = await bpmFor(t.artist, t.title).catch(() => null); return b ? { ...t, bpm: b } : null; });
-    for (const t of enriched) if (t) candidates.push(t);
+    for (let i = 0; i < newIds.length; i += 20) {
+      if (hardStop()) break;
+      const chunk = newIds.slice(i, i + 20);
+      try {
+        const t = await tapi(`/tracks?filter[id]=${chunk.join(",")}&countryCode=${COUNTRY}&include=artists,genres`);
+        for (const tr of t.data || []) {
+          const mapped = tidalMapTrack(tr, t.included);
+          meta.push(mapped);
+          const aid = tr.relationships?.artists?.data?.[0]?.id;
+          if (aid && mapped.artist) idToName.set(String(aid), mapped.artist);
+        }
+      } catch (_) {}
+      report("tracks", { detail, trackMeta: meta.length, trackIds: newIds.length });
+    }
+    await enrichBpm(meta, detail);
+    return fresh;
   }
-  await fetchArtists(seedIds, true); // seeds, weighted
-  const tidalSim = [];
-  for (const s of seedList) { try { const j = await tapi(`/artists/${s.id}/relationships/similarArtists?countryCode=${COUNTRY}`); for (const d of j.data || []) tidalSim.push(d.id); } catch (_) {} }
-  await fetchArtists(tidalSim, false);
-  // expand the similarity graph one ring at a time until cadence-matched pool is full (or capped)
-  let frontier = [...seedNames];
-  for (let level = 1; level <= 6; level++) {
-    if (poolNeed(targetSec, targets, candidates).enough) break;
+  async function tidalSimilarIds(ids, detail) {
+    const out = [];
+    const fresh = ids.filter(Boolean);
+    if (!fresh.length) return out;
+    report("similar", { detail, pendingArtists: fresh.length });
+    await mapLimit(fresh, 6, async (aid) => {
+      try {
+        const j = await tapi(`/artists/${aid}/relationships/similarArtists?countryCode=${COUNTRY}`);
+        for (const d of j.data || []) if (d?.id) out.push(String(d.id));
+      } catch (_) {}
+    });
+    return out;
+  }
+
+  report("start", { detail: "Gathering songs from seed artists" });
+  await fetchArtists(seedIds, true, "seed artists");
+
+  // BFS: related artists of related artists until every cadence band can be filled.
+  let frontierIds = [...seedIds];
+  let frontierNames = [...seedNames];
+  for (let level = 1; level <= MAX_LEVELS; level++) {
+    currentLevel = level;
+    const need = poolNeed(targetSec, targets, candidates);
+    if (need.enough) break;
+    if (hardStop()) break;
     if (doneArtists.size >= ARTIST_CAP || allTrackIds.size >= TRACK_CAP) break;
-    if (!LASTFM_KEY || !frontier.length) break;
-    const lists = await mapLimit(frontier, 6, (n) => lastfmSimilar(n, level === 1 ? 40 : 20));
-    const newNames = [];
-    for (const names of lists) for (const nm of names) { const k = nm.toLowerCase(); if (!knownNames.has(k)) { knownNames.set(k, nm); newNames.push(nm); } }
-    frontier = newNames;
-    const newIds = (await mapLimit(newNames, 6, (n) => tidalResolveArtist(n))).filter(Boolean);
-    await fetchArtists(newIds, false);
+    if (!frontierIds.length && !frontierNames.length) break;
+
+    const shortNote = (need.byCadence || []).filter((c) => c.short > 30)
+      .map((c) => `${c.cadence}spm`).slice(0, 3).join(", ");
+    report("expand", {
+      detail: shortNote ? `Gathering songs · ring ${level} (still short on ${shortNote})` : `Gathering songs · related artists ring ${level}`,
+      level,
+    });
+    const nextIds = [];
+    const nextNames = [];
+
+    if (frontierIds.length && doneArtists.size < ARTIST_CAP) {
+      const sim = await tidalSimilarIds(frontierIds.slice(0, 50), `Tidal similar · ring ${level}`);
+      for (const id of sim) if (!doneArtists.has(id)) nextIds.push(id);
+    }
+
+    if (LASTFM_KEY && frontierNames.length && doneArtists.size < ARTIST_CAP) {
+      const lists = await mapLimit(frontierNames.slice(0, 40), 6, (n) => lastfmSimilar(n, level === 1 ? 35 : 20));
+      const newNames = [];
+      for (const names of lists) for (const nm of names) {
+        const k = nm.toLowerCase();
+        if (!knownNames.has(k)) { knownNames.set(k, nm); newNames.push(nm); }
+      }
+      const room = Math.max(0, ARTIST_CAP - doneArtists.size - nextIds.length);
+      const slice = newNames.slice(0, Math.min(room, level === 1 ? 60 : 45));
+      report("resolve", { detail: `resolving ${slice.length} Last.fm artists · ring ${level}`, level });
+      const resolved = await mapLimit(slice, 6, async (n) => {
+        const id = await tidalResolveArtist(n);
+        if (id) idToName.set(String(id), n);
+        return id;
+      });
+      for (const id of resolved) if (id && !doneArtists.has(id)) nextIds.push(id);
+      for (const n of slice) nextNames.push(n);
+    }
+
+    const uniq = [];
+    const seen = new Set();
+    for (const id of nextIds) {
+      if (!id || seen.has(id) || doneArtists.has(id)) continue;
+      seen.add(id);
+      uniq.push(id);
+    }
+    if (!uniq.length) {
+      frontierIds = [];
+      frontierNames = nextNames;
+      if (!frontierNames.length) break;
+      continue;
+    }
+
+    const room = Math.max(0, ARTIST_CAP - doneArtists.size);
+    const batch = uniq.slice(0, room);
+    await fetchArtists(batch, false, `related artists · ring ${level}`);
+
+    frontierIds = batch;
+    frontierNames = batch.map((id) => idToName.get(id)).filter(Boolean);
+    if (!frontierNames.length) frontierNames = nextNames;
+
+    if (poolNeed(targetSec, targets, candidates).enough) break;
   }
+
   saveBpmCache();
+  const finalNeed = poolNeed(targetSec, targets, candidates);
+  report("done", {
+    detail: finalNeed.enough
+      ? "Song pool ready — building playlist"
+      : finalNeed.canFill
+        ? "Song pool can fill — building playlist"
+        : hardStop()
+          ? "Time ceiling reached — building playlist with what we have"
+          : "Expanded as far as caps allow — building playlist",
+  });
   return candidates;
 }
 async function tidalCreatePlaylist(name, refs) {
@@ -461,42 +801,121 @@ async function spotifyArtistTracks(name, id = null, limit = 40) {
   }
   return [...byRef.values()].slice(0, limit);
 }
-async function spotifyPool(seeds, targetSec = 0, targets = null) {
+async function spotifyPool(seeds, targetSec = 0, targets = null, onProgress = null) {
   if (!GSB_KEY) throw new Error("GETSONGBPM_API_KEY not set — add it to credentials.txt");
+  const started = Date.now();
+  const hardStop = () => Date.now() - started > POOL_BUDGET_MS;
   const seedList = seeds.map((s) => (typeof s === "string" ? { name: s } : s));
   const seedNames = seedList.map((s) => s.name).filter(Boolean);
-  const ARTIST_CAP = 360, TRACK_CAP = 1600;
+  const ARTIST_CAP = 600, TRACK_CAP = 3000, MAX_LEVELS = 20;
   const knownNames = new Map(); seedNames.forEach((n) => knownNames.set(n.toLowerCase(), n));
   const seedNameSet = new Set(seedNames.map((n) => n.toLowerCase()));
   const seedIdByName = new Map(); for (const s of seedList) if (s.name && s.id) seedIdByName.set(String(s.name).toLowerCase(), String(s.id));
   const doneNames = new Set(), seenRef = new Set(), candidates = [];
-  async function fetchNames(names) {
-    const fresh = names.filter((n) => n && !doneNames.has(n.toLowerCase())); fresh.forEach((n) => doneNames.add(n.toLowerCase()));
-    if (!fresh.length) return;
+  let currentLevel = 0;
+  const report = (phase, extra = {}) => {
+    if (!onProgress) return;
+    const need = poolNeed(targetSec, targets, candidates);
+    const level = extra.level != null ? extra.level : currentLevel;
+    const short = (need.byCadence || []).filter((c) => c.short > 30).slice(0, 4)
+      .map((c) => `${c.cadence}spm needs ${Math.round(c.short / 60)}m more`);
+    try {
+      onProgress({
+        stage: "gather",
+        phase,
+        pct: playlistGatherPct(phase, {
+          level,
+          maxLevels: MAX_LEVELS,
+          need,
+          bpmDone: extra.bpmDone || 0,
+          bpmTotal: extra.bpmTotal || 0,
+        }),
+        level,
+        maxLevels: MAX_LEVELS,
+        artists: doneNames.size,
+        tracks: candidates.length,
+        matchedSec: Math.round(need.matched || 0),
+        needSec: Math.round(need.fillNeed || need.matchNeed || 0),
+        elapsedSec: Math.round((Date.now() - started) / 1000),
+        shortCadences: short,
+        ...extra,
+      });
+    } catch (_) {}
+  };
+  async function enrichBpm(toBpm, detail) {
+    let i = 0;
+    while (i < toBpm.length) {
+      if (poolNeed(targetSec, targets, candidates).enough || hardStop()) break;
+      const batch = toBpm.slice(i, i + 24);
+      i += batch.length;
+      report("bpm", { detail, bpmDone: i, bpmTotal: toBpm.length });
+      const enriched = await mapLimit(batch, 8, async (t) => {
+        const b = await bpmFor(t.artist, t.title).catch(() => null);
+        return b ? { ...t, bpm: b } : null;
+      });
+      for (const t of enriched) if (t) candidates.push(t);
+      if (cacheDirty) saveBpmCache();
+    }
+  }
+  async function fetchNames(names, detail) {
+    const fresh = names.filter((n) => n && !doneNames.has(n.toLowerCase()));
+    fresh.forEach((n) => doneNames.add(n.toLowerCase()));
+    if (!fresh.length) return [];
+    report("tracks", { detail, pendingArtists: fresh.length });
     const lists = await mapLimit(fresh, 5, async (nm) => {
       const isSeed = seedNameSet.has(nm.toLowerCase());
       let id = seedIdByName.get(nm.toLowerCase()) || null;
       if (!id) id = await spotifyResolveArtist(nm).catch(() => null);
-      return spotifyArtistTracks(nm, id, isSeed ? 50 : 35).catch(() => []);
+      return spotifyArtistTracks(nm, id, isSeed ? 70 : 45).catch(() => []);
     });
     const toBpm = [];
     for (const tl of lists) for (const t of tl) if (t && !seenRef.has(t.ref)) { seenRef.add(t.ref); toBpm.push(t); }
-    const enriched = await mapLimit(toBpm, 8, async (t) => { const b = await bpmFor(t.artist, t.title).catch(() => null); return b ? { ...t, bpm: b } : null; });
-    for (const t of enriched) if (t) candidates.push(t);
+    await enrichBpm(toBpm, detail);
+    return fresh;
   }
-  await fetchNames(seedNames);
+
+  report("start", { detail: "Gathering songs from seed artists" });
+  await fetchNames(seedNames, "seed artists");
+
   let frontier = [...seedNames];
-  for (let level = 1; level <= 6; level++) {
-    if (poolNeed(targetSec, targets, candidates).enough) break;
+  for (let level = 1; level <= MAX_LEVELS; level++) {
+    currentLevel = level;
+    const need = poolNeed(targetSec, targets, candidates);
+    if (need.enough) break;
+    if (hardStop()) break;
     if (doneNames.size >= ARTIST_CAP || candidates.length >= TRACK_CAP) break;
     if (!LASTFM_KEY || !frontier.length) break;
-    const lists = await mapLimit(frontier, 6, (n) => lastfmSimilar(n, level === 1 ? 40 : 20));
+
+    const shortNote = (need.byCadence || []).filter((c) => c.short > 30)
+      .map((c) => `${c.cadence}spm`).slice(0, 3).join(", ");
+    report("expand", {
+      detail: shortNote ? `Gathering songs · ring ${level} (still short on ${shortNote})` : `Gathering songs · related artists ring ${level}`,
+      level,
+    });
+    const lists = await mapLimit(frontier.slice(0, 40), 6, (n) => lastfmSimilar(n, level === 1 ? 35 : 20));
     const newNames = [];
-    for (const names of lists) for (const nm of names) { const k = nm.toLowerCase(); if (!knownNames.has(k)) { knownNames.set(k, nm); newNames.push(nm); } }
-    frontier = newNames;
-    await fetchNames(newNames);
+    for (const names of lists) for (const nm of names) {
+      const k = nm.toLowerCase();
+      if (!knownNames.has(k)) { knownNames.set(k, nm); newNames.push(nm); }
+    }
+    const room = Math.max(0, ARTIST_CAP - doneNames.size);
+    const slice = newNames.slice(0, Math.min(room, level === 1 ? 60 : 45));
+    if (!slice.length) break;
+    await fetchNames(slice, `related artists · ring ${level}`);
+    frontier = slice;
   }
+
   saveBpmCache();
+  const finalNeed = poolNeed(targetSec, targets, candidates);
+  report("done", {
+    detail: finalNeed.enough
+      ? "Song pool ready — building playlist"
+      : finalNeed.canFill
+        ? "Song pool can fill — building playlist"
+        : hardStop()
+          ? "Time ceiling reached — building playlist with what we have"
+          : "Expanded as far as caps allow — building playlist",
+  });
   return candidates;
 }
 async function spotifyCreatePlaylist(name, uris) {
@@ -566,7 +985,7 @@ async function spotifyPlaylistArtists(id) {
 
 /* ============ dispatch ============ */
 const searchArtists = (svc, q) => (svc === "spotify" ? spotifySearchArtists(q) : tidalSearchArtists(q));
-const buildPool = (svc, seeds, targetSec, targets) => (svc === "spotify" ? spotifyPool(seeds, targetSec, targets) : tidalPool(seeds, targetSec, targets));
+const buildPool = (svc, seeds, targetSec, targets, onProgress) => (svc === "spotify" ? spotifyPool(seeds, targetSec, targets, onProgress) : tidalPool(seeds, targetSec, targets, onProgress));
 const createPlaylist = (svc, name, refs) => (svc === "spotify" ? spotifyCreatePlaylist(name, refs) : tidalCreatePlaylist(name, refs));
 const myPlaylists = (svc) => (svc === "spotify" ? spotifyMyPlaylists() : tidalMyPlaylists());
 const playlistArtists = (svc, id) => (svc === "spotify" ? spotifyPlaylistArtists(id) : tidalPlaylistArtists(id));
@@ -622,7 +1041,21 @@ const server = http.createServer(async (req, res) => {
       const seeds = Array.isArray(body.seeds) ? body.seeds : [];
       if (!seeds.length) return sendJSON(res, 400, { error: "no seeds" });
       const targets = body.targets && typeof body.targets === "object" ? body.targets : null;
-      return sendJSON(res, 200, await buildPool(svc, seeds, +body.targetSec || 0, targets));
+      // Stream NDJSON progress so the UI can show live status during long builds.
+      res.writeHead(200, {
+        "Content-Type": "application/x-ndjson; charset=utf-8",
+        "Access-Control-Allow-Origin": "*",
+        "Cache-Control": "no-cache, no-transform",
+        "X-Accel-Buffering": "no",
+      });
+      const send = (obj) => { try { res.write(JSON.stringify(obj) + "\n"); } catch (_) {} };
+      try {
+        const candidates = await buildPool(svc, seeds, +body.targetSec || 0, targets, (p) => send({ type: "progress", ...p }));
+        send({ type: "done", candidates });
+      } catch (e) {
+        send({ type: "error", error: e.message || String(e) });
+      }
+      return res.end();
     }
     if (url.pathname === "/api/export" && req.method === "POST") {
       const body = await readBody(req);
@@ -675,3 +1108,7 @@ server.listen(PORT, () => {
   console.log(`jirun bridge on http://localhost:${PORT}/  (tidal ${have("tidal")}, spotify ${have("spotify")}, bpm ${GSB_KEY ? "✓" : "—"}, lastfm ${LASTFM_KEY ? "✓" : "—"})`);
   console.log(`Redirect URI to register in both dashboards: ${REDIRECT_URI}`);
 });
+// Pool builds can run longer than Node's default 5-minute request timeout.
+server.requestTimeout = 0;
+server.headersTimeout = 0;
+server.timeout = 0;

@@ -105,6 +105,17 @@
   .empty{color:var(--muted);font-size:13px;text-align:center;padding:24px 8px}
   .legend{display:flex;gap:14px;font-size:11px;color:var(--muted);margin-top:6px;flex-wrap:wrap}
   a{color:var(--pace)}
+  .pool-progress{padding:20px 8px 8px;text-align:center}
+  .pool-progress .status{font-size:13px;color:var(--text);margin:0 0 14px;line-height:1.4}
+  .pool-progress .bar{height:8px;border-radius:999px;background:var(--surface-2);border:1px solid var(--line);overflow:hidden;position:relative}
+  .pool-progress .bar > i{display:block;height:100%;width:0%;border-radius:inherit;background:var(--pace);transition:width .35s ease}
+  .pool-progress .bar.indeterminate > i{width:36%;position:absolute;left:0;animation:pool-indeterminate 1.4s ease-in-out infinite;transition:none}
+  .pool-progress .meta{font-family:var(--mono);font-size:11px;color:var(--muted);margin-top:10px}
+  @keyframes pool-indeterminate{0%{left:-40%}50%{left:50%}100%{left:105%}}
+  @media (prefers-reduced-motion:reduce){
+    .pool-progress .bar > i{transition:none}
+    .pool-progress .bar.indeterminate > i{animation:none;left:32%}
+  }
 </style>
 </head>
 <body>
@@ -127,11 +138,11 @@
       <div class="conn off" id="connStatus" style="margin-top:2px">Checking login…</div>
       <button class="btn" id="loginBtn" style="display:none">Log in</button>
       <button class="btn" id="logoutBtn" style="display:none">Log out</button>
-      <div class="hint" style="margin-top:8px">One-time login through the local bridge. Playlists land in whichever service you're logged into. If Tidal search stops working after an update, log out and back in.</div>
+      <div class="hint" style="margin-top:8px">One-time login through the local bridge. Playlists land in whichever service you're logged into. Tidal artist search uses catalog lookup (paste a tidal.com/artist/… link if typeahead misses).</div>
     </div>
     <p class="eyebrow" style="margin-top:14px">Backlog <span class="seedcount" id="seedCount">0</span></p>
     <div class="searchwrap">
-      <input id="search" placeholder="Refine the backlog — search an artist…" autocomplete="off" />
+      <input id="search" placeholder="Search an artist (or paste a Tidal artist link)…" autocomplete="off" />
       <div id="results" class="results" hidden></div>
     </div>
     <div class="seeds" id="seeds"></div>
@@ -198,10 +209,9 @@ function packTracks(pool,targetSec,overshootSec,usedG,allowRepeats){
   const avail=pool.filter(e=>e?.t&&(allowRepeats||!usedG.has(e.t.id)));
   if(!avail.length||targetSec<=0)return{picks:[],filled:0};
   const durOf=(e)=>Math.max(1,e.t.durationSec||210);
-  // Deep search when the remaining window is short enough to brute-force well.
   function searchPack(items,target,limit){
     const localMax=target+overshootSec;
-    const capped=items.slice(0,Math.min(items.length,22));
+    const capped=items.slice(0,Math.min(items.length,28));
     let best=[],bestFilled=0;
     const dfs=(i,filled,path)=>{
       if(filled>bestFilled&&filled<=localMax){bestFilled=filled;best=path.slice();}
@@ -222,31 +232,32 @@ function packTracks(pool,targetSec,overshootSec,usedG,allowRepeats){
     const rem=targetSec-filled;
     const open=avail.filter(e=>!usedS.has(e.t.id));
     if(!open.length)break;
-    // Near the end: recursively pick a subset that fills the hole.
-    if(rem<=420){
+    if(rem<=480){
       const fit=open.filter(e=>durOf(e)<=rem+overshootSec);
-      const packed=searchPack(fit.length?fit:open,rem,7);
+      const packed=searchPack(fit.length?fit:open,rem,8);
       if(packed.picks.length){for(const e of packed.picks)take(e);}
+      // Last gap: allow a slightly longer overshoot rather than leave minutes empty.
+      if(filled<targetSec){
+        const rem2=targetSec-filled;
+        const stretch=open.filter(e=>!usedS.has(e.t.id)&&durOf(e)<=rem2+Math.max(overshootSec,180));
+        if(stretch.length)take(stretch[0]);
+      }
       break;
     }
-    // Prefer best BPM match that still fits the remaining window.
     let chosen=open.find(e=>durOf(e)<=rem+overshootSec);
     if(!chosen){
-      // Nothing fits alone — try a recursive pack of shorter leftovers.
-      const packed=searchPack(open,rem,7);
+      const packed=searchPack(open,rem,8);
       if(packed.picks.length){for(const e of packed.picks)take(e);}
       break;
     }
     take(chosen);
   }
-  // Repeats: keep filling with best-matching tracks that fit.
   if(allowRepeats&&filled<targetSec&&avail.length){
     let guard=0;
     while(filled<targetSec&&guard++<800){
       const rem=targetSec-filled;
       const fit=avail.filter(e=>durOf(e)<=rem+overshootSec);
       if(fit.length){take(fit[0]);continue;}
-      // No single track fits — recursive pack from the pool, allowing re-use.
       const packed=searchPack(avail,rem,6);
       if(!packed.picks.length)break;
       for(const e of packed.picks){picks.push(e);filled+=durOf(e);}
@@ -276,7 +287,44 @@ let LOGGEDIN=false, HEALTH={};
 const api={
   async health(){try{const r=await fetch("/api/health");HEALTH=await r.json();LOGGEDIN=!!(HEALTH[state.service]?.loggedIn);return HEALTH;}catch(e){HEALTH={};LOGGEDIN=false;return{ok:false,error:e.message};}},
   async search(q){const r=await fetch(`/api/search?service=${state.service}&q=${encodeURIComponent(q)}`);const j=await r.json();if(!r.ok)throw new Error(j.error||r.status);return j;},
-  async pool(seeds,targetSec,targets){const r=await fetch(`/api/pool`,{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify({service:state.service,targetSec:targetSec||0,targets:targets||null,seeds:seeds.map(s=>({id:s.id,name:s.name||s.title||""}))})});const j=await r.json();if(!r.ok)throw new Error(j.error||r.status);return j;},
+  async pool(seeds,targetSec,targets,onProgress){
+    let r;
+    try{r=await fetch(`/api/pool`,{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify({service:state.service,targetSec:targetSec||0,targets:targets||null,seeds:seeds.map(s=>({id:s.id,name:s.name||s.title||""}))})});}
+    catch(e){throw new Error("Lost connection to the local bridge while building the pool. Keep node server.mjs running, then try again.");}
+    if(!r.ok){
+      const j=await r.json().catch(()=>({}));
+      throw new Error(j.error||r.status);
+    }
+    // Prefer streaming NDJSON progress; fall back to a plain JSON array if needed.
+    const ctype=(r.headers.get("content-type")||"");
+    if(!ctype.includes("ndjson")||!r.body||!r.body.getReader){
+      const j=await r.json().catch(()=>null);
+      if(Array.isArray(j))return j;
+      if(j&&Array.isArray(j.candidates))return j.candidates;
+      throw new Error((j&&j.error)||"bad pool response");
+    }
+    const reader=r.body.getReader();
+    const decoder=new TextDecoder();
+    let buf="", candidates=null, err=null;
+    while(true){
+      const {done,value}=await reader.read();
+      if(done)break;
+      buf+=decoder.decode(value,{stream:true});
+      let nl;
+      while((nl=buf.indexOf("\n"))>=0){
+        const line=buf.slice(0,nl).trim();
+        buf=buf.slice(nl+1);
+        if(!line)continue;
+        let msg; try{msg=JSON.parse(line);}catch(_){continue;}
+        if(msg.type==="progress"){if(typeof onProgress==="function")onProgress(msg);}
+        else if(msg.type==="done"){candidates=Array.isArray(msg.candidates)?msg.candidates:[];}
+        else if(msg.type==="error"){err=msg.error||"pool failed";}
+      }
+    }
+    if(err)throw new Error(err);
+    if(!Array.isArray(candidates))throw new Error("Pool ended without results — is the bridge still running?");
+    return candidates;
+  },
   async export(name,refs){const r=await fetch(`/api/export`,{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify({service:state.service,name,refs})});const j=await r.json();if(!r.ok)throw new Error(j.error||r.status);return j;},
   async playlists(){const r=await fetch(`/api/playlists?service=${state.service}`);const j=await r.json();if(!r.ok)throw new Error(j.error||r.status);return j;},
   async playlistArtists(id){const r=await fetch(`/api/playlist-artists?service=${state.service}&id=${encodeURIComponent(id)}`);const j=await r.json();if(!r.ok)throw new Error(j.error||r.status);return j;},
@@ -368,7 +416,7 @@ async function runSearch(q){
   try{hits=await api.search(q);}
   catch(err){currentHits=[];box.hidden=false;box.innerHTML=`<div class="empty">Search error: ${err.message}</div>`;return;}
   currentHits=hits;hlIndex=-1;
-  if(!hits.length){box.hidden=false;box.innerHTML=`<div class="empty">No matches for "${q}".</div>`;return;}
+  if(!hits.length){box.hidden=false;box.innerHTML=`<div class="empty">No matches for "${q}". Try the full name, or paste a Tidal artist URL.</div>`;return;}
   renderResultsList();
 }
 $("#search").addEventListener("keydown",(e)=>{
@@ -474,35 +522,104 @@ function plannedCadences(){
   }
   return[...new Set(out.filter((c)=>c>0))];
 }
+/** Seconds of music required per cadence band (segments sharing a cadence are summed). */
+function plannedCadenceNeeds(){
+  const cadenceModel=makeCadenceModel(state.cal);
+  const zoneAnchor=(name)=>zoneAnchorFor(name)||state.cal[0]||{pace:"9:00",cadence:165};
+  const byCad=new Map();
+  for(const seg of state.segs){
+    let cadence, paceSec;
+    if(state.planMode==="zone"){
+      const a=zoneAnchor(seg.zone);
+      paceSec=paceToSeconds(a.pace);
+      cadence=Math.round(+a.cadence);
+    }else{
+      paceSec=paceToSeconds(seg.pace||"9:00");
+      cadence=Math.round(+cadenceModel(seg.pace||"9:00"));
+    }
+    if(!(cadence>0))continue;
+    const sec=Math.max(0,(+seg.endMile-+seg.startMile))*paceSec;
+    byCad.set(cadence,(byCad.get(cadence)||0)+sec);
+  }
+  return[...byCad.entries()].map(([cadence,sec])=>({cadence,sec:Math.round(sec)}));
+}
 $("#build").onclick=async()=>{
   if(!state.seeds.length)return;
   const modes=Object.entries(state.modes).filter(([,v])=>v).map(([k])=>k);
   const area=$("#results-area");
   if(!modes.length){area.innerHTML=`<section><div class="empty">Turn on at least one sync mode (Automation).</div></section>`;return;}
   if(!LOGGEDIN){area.innerHTML=`<section><div class="empty">Log in first (button up top).</div></section>`;return;}
-  const stopLoading=startLoading(area);
+  const loading=startLoading(area);
   const cadenceModel=makeCadenceModel(state.cal);
-  const targets={cadences:plannedCadences(),tol:state.tol,modes};
+  const targets={cadences:plannedCadences(),cadenceNeeds:plannedCadenceNeeds(),tol:state.tol,modes};
   let candidates;
-  try{candidates=await api.pool(state.seeds,plannedSeconds(),targets);}
-  catch(e){stopLoading();area.innerHTML=`<section><div class="empty">Sprint blocked: ${e.message}</div></section>`;return;}
-  stopLoading();
-  if(!candidates.length){area.innerHTML=`<section><div class="empty">No candidates with BPM came back. Add more seeds, widen tolerance, or check /api/bpmtest.</div></section>`;return;}
+  try{candidates=await api.pool(state.seeds,plannedSeconds(),targets,loading.update);}
+  catch(e){loading.stop();area.innerHTML=`<section><div class="empty">Sprint blocked: ${e.message}</div></section>`;return;}
+  if(!candidates.length){loading.stop();area.innerHTML=`<section><div class="empty">No candidates with BPM came back. Add more seeds, widen tolerance, or check /api/bpmtest.</div></section>`;return;}
+  loading.update({stage:"pack",phase:"pack",pct:94,detail:"Building playlist from matched songs"});
   const zoneAnchor=(name)=>zoneAnchorFor(name)||state.cal[0]||{pace:"9:00",cadence:165};
   const resolveSegment=state.planMode==="zone"
     ? (seg)=>{const a=zoneAnchor(seg.zone);return{paceSec:paceToSeconds(a.pace),cadence:+a.cadence,label:seg.zone};}
     : undefined;
   const res=buildPlaylist(state.segs,candidates,{cadenceModel,tol:state.tol,modes,allowRepeats:state.repeat,resolveSegment});
+  loading.update({stage:"pack",phase:"pack",pct:100,detail:"Playlist ready"});
   lastPlaylist=res.plan.flatMap(p=>p.tracks);
+  loading.stop();
   renderResults(res);
 };
-const LOADING_MSGS=["reticulating splines","packing the sprint","removing impediments","planning the quarter","inspecting and adapting"];
+function fmtProgressClock(sec){
+  sec=Math.max(0,Math.round(+sec||0));
+  const m=Math.floor(sec/60), s=sec%60;
+  return m?`${m}m ${String(s).padStart(2,"0")}s`:`${s}s`;
+}
+function poolProgressView(p){
+  const stage=p?.stage||"gather";
+  const detail=(!p)?"Starting playlist build":(p.detail||({
+    start:"Gathering songs from seed artists",
+    tracks:"Fetching tracks",
+    bpm:"Looking up tempos",
+    similar:"Finding related artists",
+    expand:"Gathering songs from related artists",
+    resolve:"Resolving artists",
+    done:"Song pool ready",
+    pack:"Building playlist",
+  }[p.phase]||p.phase||"Working"));
+  // Prefer server/client job %, not match/search ratio — match stats stay in the meta line.
+  let pct=null;
+  if(typeof p?.pct==="number"&&!Number.isNaN(p.pct))pct=Math.max(0,Math.min(100,Math.round(p.pct)));
+  else if(stage==="pack")pct=95;
+  const bits=[];
+  if(p?.level&&p?.maxLevels)bits.push(`ring ${p.level}/${p.maxLevels}`);
+  if(p?.bpmTotal)bits.push(`BPM ${Math.min(p.bpmDone||0,p.bpmTotal)}/${p.bpmTotal}`);
+  if(p?.artists!=null)bits.push(`${p.artists} artist${p.artists===1?"":"s"}`);
+  if(p?.tracks!=null)bits.push(`${p.tracks} with BPM`);
+  if(p?.needSec>0)bits.push(`coverage ${fmtProgressClock(p.matchedSec)} / ${fmtProgressClock(p.needSec)}`);
+  if(Array.isArray(p?.shortCadences)&&p.shortCadences.length)bits.push(p.shortCadences.join(", "));
+  if(p?.elapsedSec!=null)bits.push(`${p.elapsedSec}s`);
+  return {detail, pct, meta:bits.join(" · ")};
+}
 function startLoading(area){
-  let mi=Math.floor(Math.random()*LOADING_MSGS.length),dots=0,tick=0;
-  const render=()=>{area.innerHTML=`<section><div class="empty">${LOADING_MSGS[mi]}${".".repeat(dots)}</div></section>`;};
+  let view=poolProgressView({stage:"gather",pct:2,detail:"Starting playlist build"});
+  const render=()=>{
+    const indeterminate=view.pct==null;
+    const width=indeterminate?"":`style="width:${view.pct}%"`;
+    area.innerHTML=`<section class="pool-progress" aria-live="polite">
+      <p class="status">${view.detail}</p>
+      <div class="bar${indeterminate?" indeterminate":""}" role="progressbar"${indeterminate?"":` aria-valuemin="0" aria-valuemax="100" aria-valuenow="${view.pct}"`}><i ${width}></i></div>
+      <div class="meta">${view.meta||"Building your cadence-matched playlist"}</div>
+    </section>`;
+  };
   render();
-  const iv=setInterval(()=>{tick++;dots=(dots+1)%4;if(tick%9===0){let n;do{n=Math.floor(Math.random()*LOADING_MSGS.length);}while(n===mi&&LOADING_MSGS.length>1);mi=n;}render();},380);
-  return ()=>clearInterval(iv);
+  return {
+    update(msg){
+      // Never let a gather update shrink the bar (avoids jumpy backwards progress).
+      const next=poolProgressView(msg);
+      if(view.pct!=null&&next.pct!=null&&next.pct<view.pct&&msg?.stage!=="pack")next.pct=view.pct;
+      view=next;
+      render();
+    },
+    stop(){},
+  };
 }
 let lastPlaylist=[];
 function planName(){const dist=Math.max(0,...state.segs.map(s=>+s.endMile||0)).toFixed(1).replace(/\.0$/,"");const d=new Date().toISOString().slice(0,10);return `run ${dist}mi ${d}`;}
