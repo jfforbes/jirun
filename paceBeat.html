@@ -555,14 +555,16 @@ $("#build").onclick=async()=>{
   let candidates;
   try{candidates=await api.pool(state.seeds,plannedSeconds(),targets,loading.update);}
   catch(e){loading.stop();area.innerHTML=`<section><div class="empty">Sprint blocked: ${e.message}</div></section>`;return;}
-  loading.stop();
-  if(!candidates.length){area.innerHTML=`<section><div class="empty">No candidates with BPM came back. Add more seeds, widen tolerance, or check /api/bpmtest.</div></section>`;return;}
+  if(!candidates.length){loading.stop();area.innerHTML=`<section><div class="empty">No candidates with BPM came back. Add more seeds, widen tolerance, or check /api/bpmtest.</div></section>`;return;}
+  loading.update({stage:"pack",phase:"pack",pct:94,detail:"Building playlist from matched songs"});
   const zoneAnchor=(name)=>zoneAnchorFor(name)||state.cal[0]||{pace:"9:00",cadence:165};
   const resolveSegment=state.planMode==="zone"
     ? (seg)=>{const a=zoneAnchor(seg.zone);return{paceSec:paceToSeconds(a.pace),cadence:+a.cadence,label:seg.zone};}
     : undefined;
   const res=buildPlaylist(state.segs,candidates,{cadenceModel,tol:state.tol,modes,allowRepeats:state.repeat,resolveSegment});
+  loading.update({stage:"pack",phase:"pack",pct:100,detail:"Playlist ready"});
   lastPlaylist=res.plan.flatMap(p=>p.tracks);
+  loading.stop();
   renderResults(res);
 };
 function fmtProgressClock(sec){
@@ -571,41 +573,51 @@ function fmtProgressClock(sec){
   return m?`${m}m ${String(s).padStart(2,"0")}s`:`${s}s`;
 }
 function poolProgressView(p){
-  const detail=(!p)?"Starting pool":(p.detail||({
-    start:"Starting",
+  const stage=p?.stage||"gather";
+  const detail=(!p)?"Starting playlist build":(p.detail||({
+    start:"Gathering songs from seed artists",
     tracks:"Fetching tracks",
-    bpm:"Looking up BPM",
-    similar:"Tidal similar artists",
-    expand:"Expanding related artists",
+    bpm:"Looking up tempos",
+    similar:"Finding related artists",
+    expand:"Gathering songs from related artists",
     resolve:"Resolving artists",
-    done:"Finishing",
+    done:"Song pool ready",
+    pack:"Building playlist",
   }[p.phase]||p.phase||"Working"));
-  const need=+p?.needSec||0;
-  const matched=Math.max(0,+p?.matchedSec||0);
-  const pct=need>0?Math.max(0,Math.min(100,Math.round((matched/need)*100))):null;
+  // Prefer server/client job %, not match/search ratio — match stats stay in the meta line.
+  let pct=null;
+  if(typeof p?.pct==="number"&&!Number.isNaN(p.pct))pct=Math.max(0,Math.min(100,Math.round(p.pct)));
+  else if(stage==="pack")pct=95;
   const bits=[];
+  if(p?.level&&p?.maxLevels)bits.push(`ring ${p.level}/${p.maxLevels}`);
   if(p?.bpmTotal)bits.push(`BPM ${Math.min(p.bpmDone||0,p.bpmTotal)}/${p.bpmTotal}`);
   if(p?.artists!=null)bits.push(`${p.artists} artist${p.artists===1?"":"s"}`);
   if(p?.tracks!=null)bits.push(`${p.tracks} with BPM`);
-  if(need>0)bits.push(`${fmtProgressClock(matched)} / ${fmtProgressClock(need)}`);
+  if(p?.needSec>0)bits.push(`coverage ${fmtProgressClock(p.matchedSec)} / ${fmtProgressClock(p.needSec)}`);
   if(Array.isArray(p?.shortCadences)&&p.shortCadences.length)bits.push(p.shortCadences.join(", "));
   if(p?.elapsedSec!=null)bits.push(`${p.elapsedSec}s`);
   return {detail, pct, meta:bits.join(" · ")};
 }
 function startLoading(area){
-  let view=poolProgressView(null);
+  let view=poolProgressView({stage:"gather",pct:2,detail:"Starting playlist build"});
   const render=()=>{
     const indeterminate=view.pct==null;
     const width=indeterminate?"":`style="width:${view.pct}%"`;
     area.innerHTML=`<section class="pool-progress" aria-live="polite">
       <p class="status">${view.detail}</p>
       <div class="bar${indeterminate?" indeterminate":""}" role="progressbar"${indeterminate?"":` aria-valuemin="0" aria-valuemax="100" aria-valuenow="${view.pct}"`}><i ${width}></i></div>
-      <div class="meta">${view.meta||"Expanding related artists until the run is covered"}</div>
+      <div class="meta">${view.meta||"Building your cadence-matched playlist"}</div>
     </section>`;
   };
   render();
   return {
-    update(msg){view=poolProgressView(msg);render();},
+    update(msg){
+      // Never let a gather update shrink the bar (avoids jumpy backwards progress).
+      const next=poolProgressView(msg);
+      if(view.pct!=null&&next.pct!=null&&next.pct<view.pct&&msg?.stage!=="pack")next.pct=view.pct;
+      view=next;
+      render();
+    },
     stop(){},
   };
 }

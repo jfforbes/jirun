@@ -187,6 +187,24 @@ function poolNeed(targetSec, targets, candidates) {
     })),
   };
 }
+/** Overall playlist-build % for the gather phase (never 100 — packing finishes on the client). */
+function playlistGatherPct(phase, { level = 0, maxLevels = 20, need = null, bpmDone = 0, bpmTotal = 0 } = {}) {
+  if (phase === "done") return 88;
+  const ring = Math.max(0, Math.min(1, level / Math.max(1, maxLevels)));
+  const fill = need?.fillNeed > 0 ? Math.max(0, Math.min(1, need.matched / need.fillNeed)) : 0;
+  const bpm = bpmTotal > 0 ? Math.max(0, Math.min(1, bpmDone / bpmTotal)) : 0;
+  const phaseBase = {
+    start: 4,
+    tracks: 10,
+    similar: 14,
+    expand: 18,
+    resolve: 20,
+    bpm: 22,
+  }[phase] ?? 12;
+  // Ring depth drives most of the bar so early “enough matches” can’t mark the job complete.
+  const pct = phaseBase + ring * 50 + fill * 12 + bpm * 4;
+  return Math.max(3, Math.min(86, Math.round(pct)));
+}
 
 /* ---- GetSongBPM (tempo) ---- */
 const BPM_CACHE_FILE = path.join(__dirname, "bpm-cache.json");
@@ -552,15 +570,27 @@ async function tidalPool(seeds, targetSec = 0, targets = null, onProgress = null
   const knownNames = new Map(); seedNames.forEach((n) => knownNames.set(n.toLowerCase(), n));
   const doneArtists = new Set(), allTrackIds = new Set(), candidates = [];
   const idToName = new Map();
+  let currentLevel = 0;
   for (const s of seedList) if (s.id && s.name) idToName.set(String(s.id), s.name);
   const report = (phase, extra = {}) => {
     if (!onProgress) return;
     const need = poolNeed(targetSec, targets, candidates);
+    const level = extra.level != null ? extra.level : currentLevel;
     const short = (need.byCadence || []).filter((c) => c.short > 30).slice(0, 4)
       .map((c) => `${c.cadence}spm needs ${Math.round(c.short / 60)}m more`);
     try {
       onProgress({
+        stage: "gather",
         phase,
+        pct: playlistGatherPct(phase, {
+          level,
+          maxLevels: MAX_LEVELS,
+          need,
+          bpmDone: extra.bpmDone || 0,
+          bpmTotal: extra.bpmTotal || 0,
+        }),
+        level,
+        maxLevels: MAX_LEVELS,
         artists: doneArtists.size,
         tracks: candidates.length,
         matchedSec: Math.round(need.matched || 0),
@@ -574,7 +604,7 @@ async function tidalPool(seeds, targetSec = 0, targets = null, onProgress = null
   async function enrichBpm(meta, detail) {
     let i = 0;
     while (i < meta.length) {
-      // Stop early only once every cadence band can be filled, or we hit the hard ceiling.
+      // Stop early only once every cadence band has spare coverage, or we hit the hard ceiling.
       if (poolNeed(targetSec, targets, candidates).enough || hardStop()) break;
       const batch = meta.slice(i, i + 24);
       i += batch.length;
@@ -636,13 +666,14 @@ async function tidalPool(seeds, targetSec = 0, targets = null, onProgress = null
     return out;
   }
 
-  report("start", { detail: "seed artists" });
+  report("start", { detail: "Gathering songs from seed artists" });
   await fetchArtists(seedIds, true, "seed artists");
 
   // BFS: related artists of related artists until every cadence band can be filled.
   let frontierIds = [...seedIds];
   let frontierNames = [...seedNames];
   for (let level = 1; level <= MAX_LEVELS; level++) {
+    currentLevel = level;
     const need = poolNeed(targetSec, targets, candidates);
     if (need.enough) break;
     if (hardStop()) break;
@@ -652,7 +683,7 @@ async function tidalPool(seeds, targetSec = 0, targets = null, onProgress = null
     const shortNote = (need.byCadence || []).filter((c) => c.short > 30)
       .map((c) => `${c.cadence}spm`).slice(0, 3).join(", ");
     report("expand", {
-      detail: shortNote ? `related artists ring ${level} (still short on ${shortNote})` : `related artists ring ${level}`,
+      detail: shortNote ? `Gathering songs · ring ${level} (still short on ${shortNote})` : `Gathering songs · related artists ring ${level}`,
       level,
     });
     const nextIds = [];
@@ -711,12 +742,12 @@ async function tidalPool(seeds, targetSec = 0, targets = null, onProgress = null
   const finalNeed = poolNeed(targetSec, targets, candidates);
   report("done", {
     detail: finalNeed.enough
-      ? "pool ready"
+      ? "Song pool ready — building playlist"
       : finalNeed.canFill
-        ? "pool can fill — packing"
+        ? "Song pool can fill — building playlist"
         : hardStop()
-          ? "time ceiling reached — packing what we have"
-          : "expanded as far as caps allow — packing what we have",
+          ? "Time ceiling reached — building playlist with what we have"
+          : "Expanded as far as caps allow — building playlist",
   });
   return candidates;
 }
@@ -781,14 +812,26 @@ async function spotifyPool(seeds, targetSec = 0, targets = null, onProgress = nu
   const seedNameSet = new Set(seedNames.map((n) => n.toLowerCase()));
   const seedIdByName = new Map(); for (const s of seedList) if (s.name && s.id) seedIdByName.set(String(s.name).toLowerCase(), String(s.id));
   const doneNames = new Set(), seenRef = new Set(), candidates = [];
+  let currentLevel = 0;
   const report = (phase, extra = {}) => {
     if (!onProgress) return;
     const need = poolNeed(targetSec, targets, candidates);
+    const level = extra.level != null ? extra.level : currentLevel;
     const short = (need.byCadence || []).filter((c) => c.short > 30).slice(0, 4)
       .map((c) => `${c.cadence}spm needs ${Math.round(c.short / 60)}m more`);
     try {
       onProgress({
+        stage: "gather",
         phase,
+        pct: playlistGatherPct(phase, {
+          level,
+          maxLevels: MAX_LEVELS,
+          need,
+          bpmDone: extra.bpmDone || 0,
+          bpmTotal: extra.bpmTotal || 0,
+        }),
+        level,
+        maxLevels: MAX_LEVELS,
         artists: doneNames.size,
         tracks: candidates.length,
         matchedSec: Math.round(need.matched || 0),
@@ -831,11 +874,12 @@ async function spotifyPool(seeds, targetSec = 0, targets = null, onProgress = nu
     return fresh;
   }
 
-  report("start", { detail: "seed artists" });
+  report("start", { detail: "Gathering songs from seed artists" });
   await fetchNames(seedNames, "seed artists");
 
   let frontier = [...seedNames];
   for (let level = 1; level <= MAX_LEVELS; level++) {
+    currentLevel = level;
     const need = poolNeed(targetSec, targets, candidates);
     if (need.enough) break;
     if (hardStop()) break;
@@ -845,7 +889,7 @@ async function spotifyPool(seeds, targetSec = 0, targets = null, onProgress = nu
     const shortNote = (need.byCadence || []).filter((c) => c.short > 30)
       .map((c) => `${c.cadence}spm`).slice(0, 3).join(", ");
     report("expand", {
-      detail: shortNote ? `related artists ring ${level} (still short on ${shortNote})` : `related artists ring ${level}`,
+      detail: shortNote ? `Gathering songs · ring ${level} (still short on ${shortNote})` : `Gathering songs · related artists ring ${level}`,
       level,
     });
     const lists = await mapLimit(frontier.slice(0, 40), 6, (n) => lastfmSimilar(n, level === 1 ? 35 : 20));
@@ -865,12 +909,12 @@ async function spotifyPool(seeds, targetSec = 0, targets = null, onProgress = nu
   const finalNeed = poolNeed(targetSec, targets, candidates);
   report("done", {
     detail: finalNeed.enough
-      ? "pool ready"
+      ? "Song pool ready — building playlist"
       : finalNeed.canFill
-        ? "pool can fill — packing"
+        ? "Song pool can fill — building playlist"
         : hardStop()
-          ? "time ceiling reached — packing what we have"
-          : "expanded as far as caps allow — packing what we have",
+          ? "Time ceiling reached — building playlist with what we have"
+          : "Expanded as far as caps allow — building playlist",
   });
   return candidates;
 }
