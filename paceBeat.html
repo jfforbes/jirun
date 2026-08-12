@@ -127,11 +127,11 @@
       <div class="conn off" id="connStatus" style="margin-top:2px">Checking login…</div>
       <button class="btn" id="loginBtn" style="display:none">Log in</button>
       <button class="btn" id="logoutBtn" style="display:none">Log out</button>
-      <div class="hint" style="margin-top:8px">One-time login through the local bridge. Playlists land in whichever service you're logged into. If Tidal search stops working after an update, log out and back in.</div>
+      <div class="hint" style="margin-top:8px">One-time login through the local bridge. Playlists land in whichever service you're logged into. Tidal artist search uses catalog lookup (paste a tidal.com/artist/… link if typeahead misses).</div>
     </div>
     <p class="eyebrow" style="margin-top:14px">Backlog <span class="seedcount" id="seedCount">0</span></p>
     <div class="searchwrap">
-      <input id="search" placeholder="Refine the backlog — search an artist…" autocomplete="off" />
+      <input id="search" placeholder="Search an artist (or paste a Tidal artist link)…" autocomplete="off" />
       <div id="results" class="results" hidden></div>
     </div>
     <div class="seeds" id="seeds"></div>
@@ -368,7 +368,7 @@ async function runSearch(q){
   try{hits=await api.search(q);}
   catch(err){currentHits=[];box.hidden=false;box.innerHTML=`<div class="empty">Search error: ${err.message}</div>`;return;}
   currentHits=hits;hlIndex=-1;
-  if(!hits.length){box.hidden=false;box.innerHTML=`<div class="empty">No matches for "${q}".</div>`;return;}
+  if(!hits.length){box.hidden=false;box.innerHTML=`<div class="empty">No matches for "${q}". Try the full name, or paste a Tidal artist URL.</div>`;return;}
   renderResultsList();
 }
 $("#search").addEventListener("keydown",(e)=>{

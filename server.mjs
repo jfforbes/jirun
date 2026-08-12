@@ -287,11 +287,90 @@ function tidalRelPath(link) {
   if (!p.startsWith("/")) p = `/${p}`;
   return p;
 }
+/** Normalize an artist name into a Tidal profile handle (e.g. "Taylor Swift" → "taylorswift"). */
+function tidalNameToHandle(name) {
+  return String(name || "").toLowerCase().normalize("NFKD").replace(/[\u0300-\u036f]/g, "").replace(/[^a-z0-9]+/g, "");
+}
+/** Accept pasted Tidal artist URLs or bare numeric ids. */
+function tidalParseArtistRef(q) {
+  const s = String(q || "").trim();
+  if (!s) return null;
+  const url = s.match(/(?:tidal\.com|listen\.tidal\.com)\/(?:browse\/)?artist\/(\d+)/i);
+  if (url) return url[1];
+  if (/^\d{3,}$/.test(s)) return s;
+  return null;
+}
+async function tidalArtistById(id) {
+  if (!id) return null;
+  const path = `/artists/${encodeURIComponent(id)}?countryCode=${COUNTRY}`;
+  for (const getter of [tapiCatalog, tapi]) {
+    try {
+      const j = await getter(path);
+      const a = j?.data;
+      if (a?.type === "artists" && a.id) return { id: String(a.id), name: a.attributes?.name || String(a.id) };
+    } catch (_) { /* try next auth */ }
+  }
+  // Bulk filter works on some tokens when singular GET does not
+  try {
+    const j = await tapiCatalog(`/artists?filter[id]=${encodeURIComponent(id)}&countryCode=${COUNTRY}`);
+    const a = (j.data || []).find((x) => x?.type === "artists" && String(x.id) === String(id));
+    if (a) return { id: String(a.id), name: a.attributes?.name || String(a.id) };
+  } catch (_) {}
+  return null;
+}
+async function tidalArtistsByHandle(handle) {
+  const h = tidalNameToHandle(handle);
+  if (!h || h.length < 2) return [];
+  const path = `/artists?filter[handle]=${encodeURIComponent(h)}&countryCode=${COUNTRY}`;
+  for (const getter of [tapiCatalog, tapi]) {
+    try {
+      const j = await getter(path);
+      return (j.data || [])
+        .filter((a) => a?.type === "artists" && a.id)
+        .map((a) => ({ id: String(a.id), name: a.attributes?.name || h }));
+    } catch (_) { /* try next auth */ }
+  }
+  return [];
+}
+/** Fuzzy artist names via Last.fm (preferred) or MusicBrainz (no key). */
+async function externalArtistNames(query, limit = 8) {
+  const q = (query || "").trim();
+  if (q.length < 1) return [];
+  if (LASTFM_KEY) {
+    try {
+      const u = `${LASTFM_BASE}?method=artist.search&artist=${encodeURIComponent(q)}&api_key=${LASTFM_KEY}&format=json&limit=${limit}`;
+      const r = await fetch(u, { headers: { Accept: "application/json" } });
+      if (r.ok) {
+        const j = await r.json();
+        const raw = j.results?.artistmatches?.artist;
+        const list = Array.isArray(raw) ? raw : raw ? [raw] : [];
+        const names = list.map((a) => a?.name).filter(Boolean);
+        if (names.length) return [...new Set(names)].slice(0, limit);
+      }
+    } catch (_) {}
+  }
+  try {
+    const u = `https://musicbrainz.org/ws/2/artist?query=${encodeURIComponent(q)}&fmt=json&limit=${limit}`;
+    const r = await fetch(u, { headers: { Accept: "application/json", "User-Agent": "jirun/1.0 (https://github.com/jfforbes/jirun)" } });
+    if (r.ok) {
+      const j = await r.json();
+      const names = (j.artists || []).map((a) => a.name).filter(Boolean);
+      if (names.length) return [...new Set(names)].slice(0, limit);
+    }
+  } catch (_) {}
+  return [];
+}
+/**
+ * Tidal OpenAPI /v2/searchResults/{id} currently 400s with INVALID_RESOURCE_ID for many
+ * third-party apps (see tidal-music/discussions/366). Classic v1 wants legacy r_usr.
+ * Work around by resolving artists via handle/id and external name search.
+ */
 async function tidalSearchArtists(q, { debug = false } = {}) {
   const query = (q || "").trim();
-  if (query.length < 1) return debug ? { artists: [], debug: [] } : [];
+  if (query.length < 1) return debug ? { artists: [], debug: [], build: "search-ext-72cc" } : [];
   const enc = encodeURIComponent(query);
   const debugLog = [];
+  const done = (artists) => (debug ? { artists, debug: debugLog, build: "search-ext-72cc" } : artists);
   const finish = async (payload, via) => {
     const extracted = tidalExtractArtists(payload || {});
     const out = (await tidalHydrateArtistNames(extracted)).filter((a) => a.name && a.name !== "?");
@@ -304,53 +383,85 @@ async function tidalSearchArtists(q, { debug = false } = {}) {
     return `${path}${path.includes("?") ? "&" : "?"}include=${inc}`;
   };
 
-  // 1) Main search document with artists + topHits embedded
-  try {
-    const s = await tapiCatalog(`/searchResults/${enc}?countryCode=${COUNTRY}&explicitFilter=INCLUDE&include=artists,topHits`);
-    const out = await finish(s, "searchResults+include");
-    if (out.length) return debug ? { artists: out, debug: debugLog } : out;
-    // Follow the artists relationship link (catalog token; user tokens often redact search)
-    const relUrl = withInclude(
-      tidalRelPath(s?.data?.relationships?.artists?.links?.self) ||
-        `/searchResults/${enc}/relationships/artists?countryCode=${COUNTRY}&explicitFilter=INCLUDE`,
-      "artists"
-    );
+  // 0) Pasted Tidal artist URL / numeric id
+  const directId = tidalParseArtistRef(query);
+  if (directId) {
     try {
-      const rel = await tapiCatalog(relUrl);
-      const out2 = await finish(rel, "relationships/artists");
-      if (out2.length) return debug ? { artists: out2, debug: debugLog } : out2;
+      const a = await tidalArtistById(directId);
+      if (debug) debugLog.push({ via: "direct-id", id: directId, named: a ? 1 : 0, sample: a ? [a] : [] });
+      if (a) return done([a]);
     } catch (e) {
-      if (debug) debugLog.push({ via: "relationships/artists", error: String(e.message || e) });
+      if (debug) debugLog.push({ via: "direct-id", error: String(e.message || e) });
     }
-  } catch (e) {
-    if (debug) debugLog.push({ via: "searchResults+include", error: String(e.message || e) });
   }
 
-  // 2) Suggestions / direct hits (typeahead-friendly)
+  // 1) Direct handle for the typed query (fast path for names like "underoath")
   try {
-    const s = await tapiCatalog(`/searchSuggestions/${enc}?countryCode=${COUNTRY}&explicitFilter=INCLUDE&include=directHits`);
-    const out = await finish(s, "searchSuggestions");
-    if (out.length) return debug ? { artists: out, debug: debugLog } : out;
-    const relUrl = withInclude(tidalRelPath(s?.data?.relationships?.directHits?.links?.self), "directHits");
-    if (relUrl) {
-      const rel = await tapiCatalog(relUrl);
-      const out2 = await finish(rel, "directHits");
-      if (out2.length) return debug ? { artists: out2, debug: debugLog } : out2;
+    const byHandle = await tidalArtistsByHandle(query);
+    if (debug) debugLog.push({ via: "handle/query", handle: tidalNameToHandle(query), named: byHandle.length, sample: byHandle.slice(0, 3) });
+    if (byHandle.length) return done(byHandle);
+  } catch (e) {
+    if (debug) debugLog.push({ via: "handle/query", error: String(e.message || e) });
+  }
+
+  // 2) External fuzzy name search → resolve each candidate on Tidal by handle
+  //    (bypasses broken searchResults; see github.com/orgs/tidal-music/discussions/366)
+  if (query.length >= 2) {
+    try {
+      const names = await externalArtistNames(query, 10);
+      if (debug) debugLog.push({ via: "external/names", count: names.length, sample: names.slice(0, 5) });
+      const handleList = [];
+      const seenHandle = new Set();
+      for (const name of names) {
+        const handle = tidalNameToHandle(name);
+        if (!handle || handle.length < 2 || seenHandle.has(handle)) continue;
+        seenHandle.add(handle);
+        handleList.push(handle);
+      }
+      const batches = await mapLimit(handleList.slice(0, 12), 4, (h) => tidalArtistsByHandle(h));
+      const resolved = [];
+      for (const hits of batches) {
+        for (const a of hits || []) {
+          if (!resolved.some((x) => x.id === a.id)) resolved.push(a);
+        }
+      }
+      if (debug) debugLog.push({ via: "external/resolve", tried: handleList.length, named: resolved.length, sample: resolved.slice(0, 3) });
+      if (resolved.length) return done(resolved.slice(0, 10));
+    } catch (e) {
+      if (debug) debugLog.push({ via: "external", error: String(e.message || e) });
     }
-  } catch (e) {
-    if (debug) debugLog.push({ via: "searchSuggestions", error: String(e.message || e) });
   }
 
-  // 3) Last resort relationships path
-  try {
-    const rel = await tapiCatalog(`/searchResults/${enc}/relationships/artists?countryCode=${COUNTRY}&explicitFilter=INCLUDE&include=artists`);
-    const out = await finish(rel, "relationships/direct");
-    if (out.length) return debug ? { artists: out, debug: debugLog } : out;
-  } catch (e) {
-    if (debug) debugLog.push({ via: "relationships/direct", error: String(e.message || e) });
+  // 3) Native OpenAPI search last — currently broken for many third-party apps, but
+  //    keep it so we pick it up automatically if Tidal fixes access.
+  const getters = [];
+  try { await accessToken("tidal"); getters.push({ kind: "user", get: tapi }); } catch (e) {
+    if (debug) debugLog.push({ via: "openapi/auth-user", error: String(e.message || e) });
+  }
+  getters.push({ kind: "catalog", get: tapiCatalog });
+  for (const { kind, get } of getters) {
+    try {
+      const s = await get(`/searchResults/${enc}?countryCode=${COUNTRY}&include=artists,topHits`);
+      const out = await finish(s, `openapi/${kind}`);
+      if (out.length) return done(out);
+      const relUrl = withInclude(
+        tidalRelPath(s?.data?.relationships?.artists?.links?.self) ||
+          `/searchResults/${enc}/relationships/artists?countryCode=${COUNTRY}`,
+        "artists"
+      );
+      try {
+        const rel = await get(relUrl);
+        const out2 = await finish(rel, `openapi/${kind}/relationships`);
+        if (out2.length) return done(out2);
+      } catch (e) {
+        if (debug) debugLog.push({ via: `openapi/${kind}/relationships`, error: String(e.message || e) });
+      }
+    } catch (e) {
+      if (debug) debugLog.push({ via: `openapi/${kind}`, error: String(e.message || e) });
+    }
   }
 
-  return debug ? { artists: [], debug: debugLog } : [];
+  return done([]);
 }
 const tidalArtistIdCache = {};
 async function tidalResolveArtist(name) {
