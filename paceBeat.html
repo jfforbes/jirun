@@ -276,13 +276,43 @@ let LOGGEDIN=false, HEALTH={};
 const api={
   async health(){try{const r=await fetch("/api/health");HEALTH=await r.json();LOGGEDIN=!!(HEALTH[state.service]?.loggedIn);return HEALTH;}catch(e){HEALTH={};LOGGEDIN=false;return{ok:false,error:e.message};}},
   async search(q){const r=await fetch(`/api/search?service=${state.service}&q=${encodeURIComponent(q)}`);const j=await r.json();if(!r.ok)throw new Error(j.error||r.status);return j;},
-  async pool(seeds,targetSec,targets){
+  async pool(seeds,targetSec,targets,onProgress){
     let r;
     try{r=await fetch(`/api/pool`,{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify({service:state.service,targetSec:targetSec||0,targets:targets||null,seeds:seeds.map(s=>({id:s.id,name:s.name||s.title||""}))})});}
     catch(e){throw new Error("Lost connection to the local bridge while building the pool. Keep node server.mjs running, then try again.");}
-    const j=await r.json().catch(()=>({}));
-    if(!r.ok)throw new Error(j.error||r.status);
-    return j;
+    if(!r.ok){
+      const j=await r.json().catch(()=>({}));
+      throw new Error(j.error||r.status);
+    }
+    // Prefer streaming NDJSON progress; fall back to a plain JSON array if needed.
+    const ctype=(r.headers.get("content-type")||"");
+    if(!ctype.includes("ndjson")||!r.body||!r.body.getReader){
+      const j=await r.json().catch(()=>null);
+      if(Array.isArray(j))return j;
+      if(j&&Array.isArray(j.candidates))return j.candidates;
+      throw new Error((j&&j.error)||"bad pool response");
+    }
+    const reader=r.body.getReader();
+    const decoder=new TextDecoder();
+    let buf="", candidates=null, err=null;
+    while(true){
+      const {done,value}=await reader.read();
+      if(done)break;
+      buf+=decoder.decode(value,{stream:true});
+      let nl;
+      while((nl=buf.indexOf("\n"))>=0){
+        const line=buf.slice(0,nl).trim();
+        buf=buf.slice(nl+1);
+        if(!line)continue;
+        let msg; try{msg=JSON.parse(line);}catch(_){continue;}
+        if(msg.type==="progress"){if(typeof onProgress==="function")onProgress(msg);}
+        else if(msg.type==="done"){candidates=Array.isArray(msg.candidates)?msg.candidates:[];}
+        else if(msg.type==="error"){err=msg.error||"pool failed";}
+      }
+    }
+    if(err)throw new Error(err);
+    if(!Array.isArray(candidates))throw new Error("Pool ended without results — is the bridge still running?");
+    return candidates;
   },
   async export(name,refs){const r=await fetch(`/api/export`,{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify({service:state.service,name,refs})});const j=await r.json();if(!r.ok)throw new Error(j.error||r.status);return j;},
   async playlists(){const r=await fetch(`/api/playlists?service=${state.service}`);const j=await r.json();if(!r.ok)throw new Error(j.error||r.status);return j;},
@@ -487,13 +517,13 @@ $("#build").onclick=async()=>{
   const area=$("#results-area");
   if(!modes.length){area.innerHTML=`<section><div class="empty">Turn on at least one sync mode (Automation).</div></section>`;return;}
   if(!LOGGEDIN){area.innerHTML=`<section><div class="empty">Log in first (button up top).</div></section>`;return;}
-  const stopLoading=startLoading(area);
+  const loading=startLoading(area);
   const cadenceModel=makeCadenceModel(state.cal);
   const targets={cadences:plannedCadences(),tol:state.tol,modes};
   let candidates;
-  try{candidates=await api.pool(state.seeds,plannedSeconds(),targets);}
-  catch(e){stopLoading();area.innerHTML=`<section><div class="empty">Sprint blocked: ${e.message}</div></section>`;return;}
-  stopLoading();
+  try{candidates=await api.pool(state.seeds,plannedSeconds(),targets,loading.update);}
+  catch(e){loading.stop();area.innerHTML=`<section><div class="empty">Sprint blocked: ${e.message}</div></section>`;return;}
+  loading.stop();
   if(!candidates.length){area.innerHTML=`<section><div class="empty">No candidates with BPM came back. Add more seeds, widen tolerance, or check /api/bpmtest.</div></section>`;return;}
   const zoneAnchor=(name)=>zoneAnchorFor(name)||state.cal[0]||{pace:"9:00",cadence:165};
   const resolveSegment=state.planMode==="zone"
@@ -503,13 +533,39 @@ $("#build").onclick=async()=>{
   lastPlaylist=res.plan.flatMap(p=>p.tracks);
   renderResults(res);
 };
-const LOADING_MSGS=["reticulating splines","packing the sprint","removing impediments","planning the quarter","inspecting and adapting"];
+function fmtProgressClock(sec){
+  sec=Math.max(0,Math.round(+sec||0));
+  const m=Math.floor(sec/60), s=sec%60;
+  return m?`${m}m ${String(s).padStart(2,"0")}s`:`${s}s`;
+}
+function formatPoolProgress(p){
+  if(!p)return "Starting pool…";
+  const detail=p.detail||({
+    start:"starting",
+    tracks:"fetching tracks",
+    bpm:"looking up BPM",
+    similar:"Tidal similar artists",
+    expand:"expanding via Last.fm",
+    resolve:"resolving artists",
+    done:"finishing",
+  }[p.phase]||p.phase||"working");
+  const bits=[detail];
+  if(p.bpmTotal)bits.push(`BPM ${Math.min(p.bpmDone||0,p.bpmTotal)}/${p.bpmTotal}`);
+  if(p.artists!=null)bits.push(`${p.artists} artist${p.artists===1?"":"s"}`);
+  if(p.tracks!=null)bits.push(`${p.tracks} with BPM`);
+  if(p.needSec>0)bits.push(`${fmtProgressClock(p.matchedSec)} matched of ${fmtProgressClock(p.needSec)}`);
+  if(p.elapsedSec!=null)bits.push(`${p.elapsedSec}s`);
+  return bits.join(" · ");
+}
 function startLoading(area){
-  let mi=Math.floor(Math.random()*LOADING_MSGS.length),dots=0,tick=0;
-  const render=()=>{area.innerHTML=`<section><div class="empty">${LOADING_MSGS[mi]}${".".repeat(dots)}</div></section>`;};
+  let status="Starting pool…", dots=0;
+  const render=()=>{area.innerHTML=`<section><div class="empty" id="poolStatus">${status}${".".repeat(dots)}</div><div class="hint" style="text-align:center;margin-top:8px">Building a cadence-matched song pool. This can take a minute or two.</div></section>`;};
   render();
-  const iv=setInterval(()=>{tick++;dots=(dots+1)%4;if(tick%9===0){let n;do{n=Math.floor(Math.random()*LOADING_MSGS.length);}while(n===mi&&LOADING_MSGS.length>1);mi=n;}render();},380);
-  return ()=>clearInterval(iv);
+  const iv=setInterval(()=>{dots=(dots+1)%4;render();},400);
+  return {
+    update(msg){status=formatPoolProgress(msg);render();},
+    stop(){clearInterval(iv);},
+  };
 }
 let lastPlaylist=[];
 function planName(){const dist=Math.max(0,...state.segs.map(s=>+s.endMile||0)).toFixed(1).replace(/\.0$/,"");const d=new Date().toISOString().slice(0,10);return `run ${dist}mi ${d}`;}
