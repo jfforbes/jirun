@@ -105,6 +105,17 @@
   .empty{color:var(--muted);font-size:13px;text-align:center;padding:24px 8px}
   .legend{display:flex;gap:14px;font-size:11px;color:var(--muted);margin-top:6px;flex-wrap:wrap}
   a{color:var(--pace)}
+  .pool-progress{padding:20px 8px 8px;text-align:center}
+  .pool-progress .status{font-size:13px;color:var(--text);margin:0 0 14px;line-height:1.4}
+  .pool-progress .bar{height:8px;border-radius:999px;background:var(--surface-2);border:1px solid var(--line);overflow:hidden;position:relative}
+  .pool-progress .bar > i{display:block;height:100%;width:0%;border-radius:inherit;background:var(--pace);transition:width .35s ease}
+  .pool-progress .bar.indeterminate > i{width:36%;position:absolute;left:0;animation:pool-indeterminate 1.4s ease-in-out infinite;transition:none}
+  .pool-progress .meta{font-family:var(--mono);font-size:11px;color:var(--muted);margin-top:10px}
+  @keyframes pool-indeterminate{0%{left:-40%}50%{left:50%}100%{left:105%}}
+  @media (prefers-reduced-motion:reduce){
+    .pool-progress .bar > i{transition:none}
+    .pool-progress .bar.indeterminate > i{animation:none;left:32%}
+  }
 </style>
 </head>
 <body>
@@ -538,33 +549,42 @@ function fmtProgressClock(sec){
   const m=Math.floor(sec/60), s=sec%60;
   return m?`${m}m ${String(s).padStart(2,"0")}s`:`${s}s`;
 }
-function formatPoolProgress(p){
-  if(!p)return "Starting pool…";
-  const detail=p.detail||({
-    start:"starting",
-    tracks:"fetching tracks",
-    bpm:"looking up BPM",
+function poolProgressView(p){
+  const detail=(!p)?"Starting pool":(p.detail||({
+    start:"Starting",
+    tracks:"Fetching tracks",
+    bpm:"Looking up BPM",
     similar:"Tidal similar artists",
-    expand:"expanding via Last.fm",
-    resolve:"resolving artists",
-    done:"finishing",
-  }[p.phase]||p.phase||"working");
-  const bits=[detail];
-  if(p.bpmTotal)bits.push(`BPM ${Math.min(p.bpmDone||0,p.bpmTotal)}/${p.bpmTotal}`);
-  if(p.artists!=null)bits.push(`${p.artists} artist${p.artists===1?"":"s"}`);
-  if(p.tracks!=null)bits.push(`${p.tracks} with BPM`);
-  if(p.needSec>0)bits.push(`${fmtProgressClock(p.matchedSec)} matched of ${fmtProgressClock(p.needSec)}`);
-  if(p.elapsedSec!=null)bits.push(`${p.elapsedSec}s`);
-  return bits.join(" · ");
+    expand:"Expanding related artists",
+    resolve:"Resolving artists",
+    done:"Finishing",
+  }[p.phase]||p.phase||"Working"));
+  const need=+p?.needSec||0;
+  const matched=Math.max(0,+p?.matchedSec||0);
+  const pct=need>0?Math.max(0,Math.min(100,Math.round((matched/need)*100))):null;
+  const bits=[];
+  if(p?.bpmTotal)bits.push(`BPM ${Math.min(p.bpmDone||0,p.bpmTotal)}/${p.bpmTotal}`);
+  if(p?.artists!=null)bits.push(`${p.artists} artist${p.artists===1?"":"s"}`);
+  if(p?.tracks!=null)bits.push(`${p.tracks} with BPM`);
+  if(need>0)bits.push(`${fmtProgressClock(matched)} / ${fmtProgressClock(need)}`);
+  if(p?.elapsedSec!=null)bits.push(`${p.elapsedSec}s`);
+  return {detail, pct, meta:bits.join(" · ")};
 }
 function startLoading(area){
-  let status="Starting pool…", dots=0;
-  const render=()=>{area.innerHTML=`<section><div class="empty" id="poolStatus">${status}${".".repeat(dots)}</div><div class="hint" style="text-align:center;margin-top:8px">Expanding related artists until the run is fully covered. Long plans can take several minutes — progress updates live.</div></section>`;};
+  let view=poolProgressView(null);
+  const render=()=>{
+    const indeterminate=view.pct==null;
+    const width=indeterminate?"":`style="width:${view.pct}%"`;
+    area.innerHTML=`<section class="pool-progress" aria-live="polite">
+      <p class="status">${view.detail}</p>
+      <div class="bar${indeterminate?" indeterminate":""}" role="progressbar"${indeterminate?"":` aria-valuemin="0" aria-valuemax="100" aria-valuenow="${view.pct}"`}><i ${width}></i></div>
+      <div class="meta">${view.meta||"Expanding related artists until the run is covered"}</div>
+    </section>`;
+  };
   render();
-  const iv=setInterval(()=>{dots=(dots+1)%4;render();},400);
   return {
-    update(msg){status=formatPoolProgress(msg);render();},
-    stop(){clearInterval(iv);},
+    update(msg){view=poolProgressView(msg);render();},
+    stop(){},
   };
 }
 let lastPlaylist=[];
