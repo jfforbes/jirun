@@ -559,7 +559,7 @@ function formatPoolProgress(p){
 }
 function startLoading(area){
   let status="Starting pool…", dots=0;
-  const render=()=>{area.innerHTML=`<section><div class="empty" id="poolStatus">${status}${".".repeat(dots)}</div><div class="hint" style="text-align:center;margin-top:8px">Building a cadence-matched song pool. This can take a minute or two.</div></section>`;};
+  const render=()=>{area.innerHTML=`<section><div class="empty" id="poolStatus">${status}${".".repeat(dots)}</div><div class="hint" style="text-align:center;margin-top:8px">Expanding related artists until the run is fully covered. Long plans can take several minutes — progress updates live.</div></section>`;};
   render();
   const iv=setInterval(()=>{dots=(dots+1)%4;render();},400);
   return {
