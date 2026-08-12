@@ -464,11 +464,17 @@ async function tidalSearchArtists(q, { debug = false } = {}) {
   return done([]);
 }
 const tidalArtistIdCache = {};
+/** Pool expansion only needs a Tidal id for a known name — skip fuzzy/OpenAPI search. */
 async function tidalResolveArtist(name) {
   const k = (name || "").toLowerCase();
   if (k in tidalArtistIdCache) return tidalArtistIdCache[k];
-  let id = null; try { const a = await tidalSearchArtists(name); id = a[0]?.id || null; } catch (_) {}
-  tidalArtistIdCache[k] = id; return id;
+  let id = null;
+  try {
+    const hits = await tidalArtistsByHandle(name);
+    id = hits[0]?.id || null;
+  } catch (_) {}
+  tidalArtistIdCache[k] = id;
+  return id;
 }
 async function tidalArtistTrackIds(aid, limit) {
   const ids = [];
@@ -786,3 +792,7 @@ server.listen(PORT, () => {
   console.log(`jirun bridge on http://localhost:${PORT}/  (tidal ${have("tidal")}, spotify ${have("spotify")}, bpm ${GSB_KEY ? "✓" : "—"}, lastfm ${LASTFM_KEY ? "✓" : "—"})`);
   console.log(`Redirect URI to register in both dashboards: ${REDIRECT_URI}`);
 });
+// Pool builds can run longer than Node's default 5-minute request timeout.
+server.requestTimeout = 0;
+server.headersTimeout = 0;
+server.timeout = 0;

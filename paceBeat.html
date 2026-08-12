@@ -276,7 +276,14 @@ let LOGGEDIN=false, HEALTH={};
 const api={
   async health(){try{const r=await fetch("/api/health");HEALTH=await r.json();LOGGEDIN=!!(HEALTH[state.service]?.loggedIn);return HEALTH;}catch(e){HEALTH={};LOGGEDIN=false;return{ok:false,error:e.message};}},
   async search(q){const r=await fetch(`/api/search?service=${state.service}&q=${encodeURIComponent(q)}`);const j=await r.json();if(!r.ok)throw new Error(j.error||r.status);return j;},
-  async pool(seeds,targetSec,targets){const r=await fetch(`/api/pool`,{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify({service:state.service,targetSec:targetSec||0,targets:targets||null,seeds:seeds.map(s=>({id:s.id,name:s.name||s.title||""}))})});const j=await r.json();if(!r.ok)throw new Error(j.error||r.status);return j;},
+  async pool(seeds,targetSec,targets){
+    let r;
+    try{r=await fetch(`/api/pool`,{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify({service:state.service,targetSec:targetSec||0,targets:targets||null,seeds:seeds.map(s=>({id:s.id,name:s.name||s.title||""}))})});}
+    catch(e){throw new Error("Lost connection to the local bridge while building the pool. Keep node server.mjs running, then try again.");}
+    const j=await r.json().catch(()=>({}));
+    if(!r.ok)throw new Error(j.error||r.status);
+    return j;
+  },
   async export(name,refs){const r=await fetch(`/api/export`,{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify({service:state.service,name,refs})});const j=await r.json();if(!r.ok)throw new Error(j.error||r.status);return j;},
   async playlists(){const r=await fetch(`/api/playlists?service=${state.service}`);const j=await r.json();if(!r.ok)throw new Error(j.error||r.status);return j;},
   async playlistArtists(id){const r=await fetch(`/api/playlist-artists?service=${state.service}&id=${encodeURIComponent(id)}`);const j=await r.json();if(!r.ok)throw new Error(j.error||r.status);return j;},
