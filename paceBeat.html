@@ -305,7 +305,7 @@ const api={
     }
     const reader=r.body.getReader();
     const decoder=new TextDecoder();
-    let buf="", candidates=null, err=null;
+    let buf="", candidates=null, err=null, poolMeta=null;
     while(true){
       const {done,value}=await reader.read();
       if(done)break;
@@ -317,12 +317,13 @@ const api={
         if(!line)continue;
         let msg; try{msg=JSON.parse(line);}catch(_){continue;}
         if(msg.type==="progress"){if(typeof onProgress==="function")onProgress(msg);}
-        else if(msg.type==="done"){candidates=Array.isArray(msg.candidates)?msg.candidates:[];}
+        else if(msg.type==="done"){candidates=Array.isArray(msg.candidates)?msg.candidates:[];poolMeta=msg.meta||null;}
         else if(msg.type==="error"){err=msg.error||"pool failed";}
       }
     }
     if(err)throw new Error(err);
     if(!Array.isArray(candidates))throw new Error("Pool ended without results — is the bridge still running?");
+    candidates.meta=poolMeta;
     return candidates;
   },
   async export(name,refs){const r=await fetch(`/api/export`,{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify({service:state.service,name,refs})});const j=await r.json();if(!r.ok)throw new Error(j.error||r.status);return j;},
@@ -562,6 +563,7 @@ $("#build").onclick=async()=>{
     ? (seg)=>{const a=zoneAnchor(seg.zone);return{paceSec:paceToSeconds(a.pace),cadence:+a.cadence,label:seg.zone};}
     : undefined;
   const res=buildPlaylist(state.segs,candidates,{cadenceModel,tol:state.tol,modes,allowRepeats:state.repeat,resolveSegment});
+  res.poolMeta=candidates.meta||null;
   loading.update({stage:"pack",phase:"pack",pct:100,detail:"Playlist ready"});
   lastPlaylist=res.plan.flatMap(p=>p.tracks);
   loading.stop();
@@ -640,15 +642,21 @@ async function shipPlaylist(btn){
 }
 function renderResults(res){
   const strip=res.plan.map(p=>{const w=res.totalPlannedSec?Math.max(6,(p.segDuration/res.totalPlannedSec)*100):33;return`<div class="band" style="flex:${w} 1 0;background:${cadColor(p.cadence)}">${Math.round(p.cadence)}</div>`;}).join("");
+  const bpmRate=res.poolMeta?.bpmHitRate;
+  const bpmHint=typeof bpmRate==="number"&&bpmRate<0.65
+    ?` BPM coverage was only ${Math.round(bpmRate*100)}% — many seed tracks lack tempo data, so the pool had to import other songs near your cadence.`
+    :"";
   const segs=res.plan.map(p=>{
     const tracks=p.tracks.length?p.tracks.map(t=>`<div class="track"><div><div class="title">${t.title}</div><div class="art">${t.artist||""}</div></div><div style="text-align:right"><span class="bpm">${t.bpm}</span> <span class="tag ${t.matchMode}">${t.matchMode==="half"?"½× "+t.matchTarget:"→ "+t.matchTarget}</span></div><div class="dur">${fmtClock(t.durationSec)}</div></div>`).join("")
       :`<div class="empty">No songs in band. Widen tolerance, add sync modes, or allow repeats.</div>`;
-    const note=p.shortfallSec>30?`<div class="note">▲ short by ${fmtClock(p.shortfallSec)} — only ${fmtClock(p.filledSec)} of ${fmtClock(p.segDuration)} matched ~${Math.round(p.cadence)}spm. Widen tolerance, turn on repeats, or add seeds with that tempo.</div>`:"";
+    const note=p.shortfallSec>30?`<div class="note">▲ short by ${fmtClock(p.shortfallSec)} — only ${fmtClock(p.filledSec)} of ${fmtClock(p.segDuration)} matched ~${Math.round(p.cadence)}spm. Widen tolerance, turn on repeats, or add seeds with that tempo.${bpmHint}</div>`:"";
     return`<section><div class="seg-head"><span class="miles">Miles ${p.segment.startMile}–${p.segment.endMile} <span style="color:var(--muted);font-weight:400">@ ${p.label}</span></span><span class="cad">${Math.round(p.cadence)} spm · need ${fmtClock(p.segDuration)}</span></div>${tracks}${note}</section>`;
   }).join("");
   const canExport=LOGGEDIN&&lastPlaylist.some(t=>t.ref||t.id);
   const exportBtn=canExport?`<button class="btn" id="exportBtn" style="margin-top:6px">Ship to ${SVC_NAME[state.service]} · "${planName()}"</button>`:"";
-  $("#results-area").innerHTML=`<div class="readout"><div><div class="k">Tracks</div><div class="v">${res.trackCount}</div></div><div><div class="k">Planned</div><div class="v">${fmtClock(res.totalPlannedSec)}</div></div><div><div class="k">Music</div><div class="v">${fmtClock(res.totalFilledSec)}</div></div></div><div class="strip">${strip}</div>${segs}${exportBtn}`;
+  const bpmMeta=res.poolMeta&&res.poolMeta.poolSize!=null
+    ?`<div><div class="k">BPM hit</div><div class="v">${res.poolMeta.bpmHit||0}/${res.poolMeta.poolSize}</div></div>`:"";
+  $("#results-area").innerHTML=`<div class="readout"><div><div class="k">Tracks</div><div class="v">${res.trackCount}</div></div><div><div class="k">Planned</div><div class="v">${fmtClock(res.totalPlannedSec)}</div></div><div><div class="k">Music</div><div class="v">${fmtClock(res.totalFilledSec)}</div></div>${bpmMeta}</div><div class="strip">${strip}</div>${segs}${exportBtn}`;
   const eb=$("#exportBtn");if(eb)eb.onclick=()=>shipPlaylist(eb);
   $("#results-area").scrollIntoView({behavior:matchMedia("(prefers-reduced-motion:reduce)").matches?"auto":"smooth",block:"start"});
 }
