@@ -590,7 +590,8 @@ function poolProgressView(p){
   else if(stage==="pack")pct=95;
   const bits=[];
   if(p?.level&&p?.maxLevels)bits.push(`ring ${p.level}/${p.maxLevels}`);
-  if(p?.bpmTotal)bits.push(`BPM ${Math.min(p.bpmDone||0,p.bpmTotal)}/${p.bpmTotal}`);
+  if(p?.bpmTried)bits.push(`BPM hits ${p.bpmHit||0}/${p.bpmTried}`);
+  else if(p?.bpmTotal)bits.push(`BPM ${Math.min(p.bpmDone||0,p.bpmTotal)}/${p.bpmTotal}`);
   if(p?.artists!=null)bits.push(`${p.artists} artist${p.artists===1?"":"s"}`);
   if(p?.tracks!=null)bits.push(`${p.tracks} with BPM`);
   if(p?.needSec>0)bits.push(`coverage ${fmtProgressClock(p.matchedSec)} / ${fmtProgressClock(p.needSec)}`);
@@ -642,7 +643,7 @@ function renderResults(res){
   const segs=res.plan.map(p=>{
     const tracks=p.tracks.length?p.tracks.map(t=>`<div class="track"><div><div class="title">${t.title}</div><div class="art">${t.artist||""}</div></div><div style="text-align:right"><span class="bpm">${t.bpm}</span> <span class="tag ${t.matchMode}">${t.matchMode==="half"?"½× "+t.matchTarget:"→ "+t.matchTarget}</span></div><div class="dur">${fmtClock(t.durationSec)}</div></div>`).join("")
       :`<div class="empty">No songs in band. Widen tolerance, add sync modes, or allow repeats.</div>`;
-    const note=p.shortfallSec>30?`<div class="note">▲ short by ${fmtClock(p.shortfallSec)} — allow repeats or add seeds</div>`:"";
+    const note=p.shortfallSec>30?`<div class="note">▲ short by ${fmtClock(p.shortfallSec)} — only ${fmtClock(p.filledSec)} of ${fmtClock(p.segDuration)} matched ~${Math.round(p.cadence)}spm. Widen tolerance, turn on repeats, or add seeds with that tempo.</div>`:"";
     return`<section><div class="seg-head"><span class="miles">Miles ${p.segment.startMile}–${p.segment.endMile} <span style="color:var(--muted);font-weight:400">@ ${p.label}</span></span><span class="cad">${Math.round(p.cadence)} spm · need ${fmtClock(p.segDuration)}</span></div>${tracks}${note}</section>`;
   }).join("");
   const canExport=LOGGEDIN&&lastPlaylist.some(t=>t.ref||t.id);

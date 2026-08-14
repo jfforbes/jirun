@@ -216,12 +216,21 @@ async function bpmFor(artist, title) {
   const k = `${(artist || "").toLowerCase()}|${(title || "").toLowerCase()}`;
   if (k in bpmCache) return bpmCache[k];
   let bpm = null;
+  let ok = false;
   try {
     const lookup = encodeURIComponent(`song:${title} artist:${artist}`);
     const r = await fetch(`${GSB_BASE}/search/?api_key=${GSB_KEY}&type=both&limit=5&lookup=${lookup}`, { headers: { Accept: "application/json" } });
-    if (r.ok) { const j = await r.json(); for (const hit of (Array.isArray(j.search) ? j.search : [])) { const t = parseInt(hit && hit.tempo, 10); if (t > 0) { bpm = t; break; } } }
+    if (r.ok) {
+      ok = true;
+      const j = await r.json();
+      for (const hit of (Array.isArray(j.search) ? j.search : [])) {
+        const t = parseInt(hit && hit.tempo, 10);
+        if (t > 0) { bpm = t; break; }
+      }
+    }
   } catch (_) {}
-  bpmCache[k] = bpm; cacheDirty = true;
+  // Only cache real API answers — don't permanently cache network/rate-limit failures as "no BPM".
+  if (ok) { bpmCache[k] = bpm; cacheDirty = true; }
   return bpm;
 }
 
@@ -571,7 +580,10 @@ async function tidalPool(seeds, targetSec = 0, targets = null, onProgress = null
   const doneArtists = new Set(), allTrackIds = new Set(), candidates = [];
   const idToName = new Map();
   let currentLevel = 0;
+  const bpmStats = { tried: 0, hit: 0 };
   for (const s of seedList) if (s.id && s.name) idToName.set(String(s.id), s.name);
+  // With many seeds, pull fewer tracks each so every seed gets BPM coverage before the time ceiling.
+  const seedTrackCap = Math.max(20, Math.min(80, Math.floor(1200 / Math.max(1, seedIds.length))));
   const report = (phase, extra = {}) => {
     if (!onProgress) return;
     const need = poolNeed(targetSec, targets, candidates);
@@ -597,20 +609,39 @@ async function tidalPool(seeds, targetSec = 0, targets = null, onProgress = null
         needSec: Math.round(need.fillNeed || need.matchNeed || 0),
         elapsedSec: Math.round((Date.now() - started) / 1000),
         shortCadences: short,
+        bpmHit: bpmStats.hit,
+        bpmTried: bpmStats.tried,
         ...extra,
       });
     } catch (_) {}
   };
-  async function enrichBpm(meta, detail) {
+  /** Round-robin BPM lookups by artist so 38 seeds aren't starved by the first few. */
+  async function enrichBpm(meta, detail, { finishAll = false } = {}) {
+    const byArtist = new Map();
+    for (const t of meta) {
+      const k = (t.artist || "?").toLowerCase();
+      if (!byArtist.has(k)) byArtist.set(k, []);
+      byArtist.get(k).push(t);
+    }
+    const queues = [...byArtist.values()];
+    const order = [];
+    let guard = 0;
+    while (queues.some((q) => q.length) && guard++ < meta.length + 5) {
+      for (const q of queues) if (q.length) order.push(q.shift());
+    }
     let i = 0;
-    while (i < meta.length) {
-      // Stop early only once every cadence band has spare coverage, or we hit the hard ceiling.
-      if (poolNeed(targetSec, targets, candidates).enough || hardStop()) break;
-      const batch = meta.slice(i, i + 24);
+    while (i < order.length) {
+      if (!finishAll && poolNeed(targetSec, targets, candidates).enough) break;
+      if (!finishAll && hardStop()) break;
+      // Seed phase: keep going past the soft ceiling only briefly; still stop on absolute overrun.
+      if (finishAll && Date.now() - started > POOL_BUDGET_MS * 1.5) break;
+      const batch = order.slice(i, i + 24);
       i += batch.length;
-      report("bpm", { detail, bpmDone: i, bpmTotal: meta.length });
-      const enriched = await mapLimit(batch, 8, async (t) => {
+      report("bpm", { detail, bpmDone: i, bpmTotal: order.length });
+      const enriched = await mapLimit(batch, 10, async (t) => {
+        bpmStats.tried++;
         const b = await bpmFor(t.artist, t.title).catch(() => null);
+        if (b) bpmStats.hit++;
         return b ? { ...t, bpm: b } : null;
       });
       for (const t of enriched) if (t) {
@@ -628,7 +659,7 @@ async function tidalPool(seeds, targetSec = 0, targets = null, onProgress = null
     fresh.forEach((a) => doneArtists.add(a));
     if (!fresh.length) return [];
     report("tracks", { detail, pendingArtists: fresh.length });
-    const perArtist = seedWeight ? 80 : 45;
+    const perArtist = seedWeight ? seedTrackCap : 35;
     const trackLists = await mapLimit(fresh, 6, async (aid) => {
       try { return await tidalArtistTrackIds(aid, perArtist); } catch (_) { return []; }
     });
@@ -636,7 +667,7 @@ async function tidalPool(seeds, targetSec = 0, targets = null, onProgress = null
     for (const tl of trackLists) for (const id of tl) if (!allTrackIds.has(id)) { allTrackIds.add(id); newIds.push(id); }
     const meta = [];
     for (let i = 0; i < newIds.length; i += 20) {
-      if (hardStop()) break;
+      if (!seedWeight && hardStop()) break;
       const chunk = newIds.slice(i, i + 20);
       try {
         const t = await tapi(`/tracks?filter[id]=${chunk.join(",")}&countryCode=${COUNTRY}&include=artists,genres`);
@@ -649,7 +680,7 @@ async function tidalPool(seeds, targetSec = 0, targets = null, onProgress = null
       } catch (_) {}
       report("tracks", { detail, trackMeta: meta.length, trackIds: newIds.length });
     }
-    await enrichBpm(meta, detail);
+    await enrichBpm(meta, detail, { finishAll: !!seedWeight });
     return fresh;
   }
   async function tidalSimilarIds(ids, detail) {
@@ -813,6 +844,8 @@ async function spotifyPool(seeds, targetSec = 0, targets = null, onProgress = nu
   const seedIdByName = new Map(); for (const s of seedList) if (s.name && s.id) seedIdByName.set(String(s.name).toLowerCase(), String(s.id));
   const doneNames = new Set(), seenRef = new Set(), candidates = [];
   let currentLevel = 0;
+  const bpmStats = { tried: 0, hit: 0 };
+  const seedTrackCap = Math.max(20, Math.min(70, Math.floor(1000 / Math.max(1, seedNames.length))));
   const report = (phase, extra = {}) => {
     if (!onProgress) return;
     const need = poolNeed(targetSec, targets, candidates);
@@ -838,26 +871,44 @@ async function spotifyPool(seeds, targetSec = 0, targets = null, onProgress = nu
         needSec: Math.round(need.fillNeed || need.matchNeed || 0),
         elapsedSec: Math.round((Date.now() - started) / 1000),
         shortCadences: short,
+        bpmHit: bpmStats.hit,
+        bpmTried: bpmStats.tried,
         ...extra,
       });
     } catch (_) {}
   };
-  async function enrichBpm(toBpm, detail) {
+  async function enrichBpm(toBpm, detail, { finishAll = false } = {}) {
+    const byArtist = new Map();
+    for (const t of toBpm) {
+      const k = (t.artist || "?").toLowerCase();
+      if (!byArtist.has(k)) byArtist.set(k, []);
+      byArtist.get(k).push(t);
+    }
+    const queues = [...byArtist.values()];
+    const order = [];
+    let guard = 0;
+    while (queues.some((q) => q.length) && guard++ < toBpm.length + 5) {
+      for (const q of queues) if (q.length) order.push(q.shift());
+    }
     let i = 0;
-    while (i < toBpm.length) {
-      if (poolNeed(targetSec, targets, candidates).enough || hardStop()) break;
-      const batch = toBpm.slice(i, i + 24);
+    while (i < order.length) {
+      if (!finishAll && poolNeed(targetSec, targets, candidates).enough) break;
+      if (!finishAll && hardStop()) break;
+      if (finishAll && Date.now() - started > POOL_BUDGET_MS * 1.5) break;
+      const batch = order.slice(i, i + 24);
       i += batch.length;
-      report("bpm", { detail, bpmDone: i, bpmTotal: toBpm.length });
-      const enriched = await mapLimit(batch, 8, async (t) => {
+      report("bpm", { detail, bpmDone: i, bpmTotal: order.length });
+      const enriched = await mapLimit(batch, 10, async (t) => {
+        bpmStats.tried++;
         const b = await bpmFor(t.artist, t.title).catch(() => null);
+        if (b) bpmStats.hit++;
         return b ? { ...t, bpm: b } : null;
       });
       for (const t of enriched) if (t) candidates.push(t);
       if (cacheDirty) saveBpmCache();
     }
   }
-  async function fetchNames(names, detail) {
+  async function fetchNames(names, detail, { seedWeight = false } = {}) {
     const fresh = names.filter((n) => n && !doneNames.has(n.toLowerCase()));
     fresh.forEach((n) => doneNames.add(n.toLowerCase()));
     if (!fresh.length) return [];
@@ -866,16 +917,16 @@ async function spotifyPool(seeds, targetSec = 0, targets = null, onProgress = nu
       const isSeed = seedNameSet.has(nm.toLowerCase());
       let id = seedIdByName.get(nm.toLowerCase()) || null;
       if (!id) id = await spotifyResolveArtist(nm).catch(() => null);
-      return spotifyArtistTracks(nm, id, isSeed ? 70 : 45).catch(() => []);
+      return spotifyArtistTracks(nm, id, isSeed ? seedTrackCap : 35).catch(() => []);
     });
     const toBpm = [];
     for (const tl of lists) for (const t of tl) if (t && !seenRef.has(t.ref)) { seenRef.add(t.ref); toBpm.push(t); }
-    await enrichBpm(toBpm, detail);
+    await enrichBpm(toBpm, detail, { finishAll: seedWeight });
     return fresh;
   }
 
   report("start", { detail: "Gathering songs from seed artists" });
-  await fetchNames(seedNames, "seed artists");
+  await fetchNames(seedNames, "seed artists", { seedWeight: true });
 
   let frontier = [...seedNames];
   for (let level = 1; level <= MAX_LEVELS; level++) {
