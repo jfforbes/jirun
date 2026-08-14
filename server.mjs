@@ -558,7 +558,7 @@ function tidalMapTrack(res, included = []) {
   const artist = included.find((x) => x.type === "artists" && x.id === artistId)?.attributes?.name || "";
   const gids = (res.relationships?.genres?.data || []).map((g) => g.id);
   const genres = included.filter((x) => x.type === "genres" && gids.includes(x.id)).map((x) => x.attributes?.name).filter(Boolean);
-  return { id: res.id, ref: res.id, title: a.title || "?", artist, bpm: null, durationSec: isoToSec(a.duration), genres };
+  return { id: res.id, ref: res.id, title: a.title || "?", artist, artistId: artistId ? String(artistId) : null, bpm: null, durationSec: isoToSec(a.duration), genres };
 }
 function tidalExtractArtists(payload) {
   const byId = {};
@@ -1170,7 +1170,15 @@ async function spotifyResolveArtist(name) {
   spotifyArtistIdCache[k] = id; return id;
 }
 function spotifyMapTrack(t, fallbackArtist) {
-  return { id: t.id, ref: t.uri, title: t.name, artist: t.artists?.[0]?.name || fallbackArtist || "?", durationSec: Math.round((t.duration_ms || 210000) / 1000), genres: [] };
+  return {
+    id: t.id,
+    ref: t.uri,
+    title: t.name,
+    artist: t.artists?.[0]?.name || fallbackArtist || "?",
+    artistId: t.artists?.[0]?.id || null,
+    durationSec: Math.round((t.duration_ms || 210000) / 1000),
+    genres: [],
+  };
 }
 async function spotifyArtistTracks(name, id = null, limit = 40) {
   const byRef = new Map();
