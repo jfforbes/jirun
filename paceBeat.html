@@ -592,6 +592,7 @@ function poolProgressView(p){
   else if(stage==="pack")pct=95;
   const bits=[];
   if(p?.level&&p?.maxLevels)bits.push(`ring ${p.level}/${p.maxLevels}`);
+  if(p?.pendingQueue)bits.push(`queue ${p.pendingQueue}`);
   if(p?.bpmTried)bits.push(`BPM hits ${p.bpmHit||0}/${p.bpmTried}`);
   else if(p?.bpmTotal)bits.push(`BPM ${Math.min(p.bpmDone||0,p.bpmTotal)}/${p.bpmTotal}`);
   if(p?.artists!=null)bits.push(`${p.artists} artist${p.artists===1?"":"s"}`);

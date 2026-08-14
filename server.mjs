@@ -171,10 +171,11 @@ function poolNeed(targetSec, targets, candidates) {
   const matched = needs.reduce((s, n) => s + Math.min(n.filled, n.need), 0);
   const raw = candidates.reduce((s, t) => s + (t.durationSec || 210), 0);
   const canFill = needs.every((n) => n.filled >= n.need * 0.98);
-  const enough = needs.every((n) => n.filled >= n.need * 1.35);
+  // Modest headroom past a full pack — deep rings stop once the playlist can fill.
+  const enough = needs.every((n) => n.filled >= n.need * 1.15);
   return {
     rawNeed: fillNeed * 8,
-    matchNeed: fillNeed * 1.35,
+    matchNeed: fillNeed * 1.15,
     fillNeed,
     matched,
     raw,
@@ -813,7 +814,12 @@ async function tidalArtistTrackIds(aid, limit) {
   }
   return ids.slice(0, limit);
 }
-const POOL_BUDGET_MS = 15 * 60 * 1000; // absolute ceiling; keep expanding until each cadence can be filled
+const POOL_BUDGET_MS = 25 * 60 * 1000; // keep expanding related artists until cadences can fill
+/** Shared expansion caps — deep BFS until the playlist can be packed. */
+const POOL_ARTIST_CAP = 2000;
+const POOL_TRACK_CAP = 10000;
+const POOL_MAX_LEVELS = 80;
+const POOL_RING_BATCH = 90; // artists fetched per ring from the pending queue
 async function tidalPool(seeds, targetSec = 0, targets = null, onProgress = null) {
   if (!GSB_KEY && !FREQBLOG_KEY) throw new Error("GETSONGBPM_API_KEY not set — add it to credentials.txt");
   const started = Date.now();
@@ -821,7 +827,7 @@ async function tidalPool(seeds, targetSec = 0, targets = null, onProgress = null
   const seedList = seeds.map((s) => (typeof s === "string" ? { id: s, name: "" } : s));
   const seedIds = seedList.map((s) => String(s.id));
   const seedNames = seedList.map((s) => s.name).filter(Boolean);
-  const ARTIST_CAP = 600, TRACK_CAP = 3000, MAX_LEVELS = 20;
+  const ARTIST_CAP = POOL_ARTIST_CAP, TRACK_CAP = POOL_TRACK_CAP, MAX_LEVELS = POOL_MAX_LEVELS;
   const knownNames = new Map(); seedNames.forEach((n) => knownNames.set(n.toLowerCase(), n));
   const doneArtists = new Set(), allTrackIds = new Set(), candidates = [];
   const idToName = new Map();
@@ -1000,79 +1006,124 @@ async function tidalPool(seeds, targetSec = 0, targets = null, onProgress = null
   await fetchArtists(seedIds, true, "seed artists");
   await fillFromTempoCatalog("Stamping tempos from BPM catalog");
 
-  // BFS: related artists of related artists until every cadence band can be filled.
-  let frontierIds = [...seedIds];
-  let frontierNames = [...seedNames];
+  // Persistent BFS queue — previously each ring discarded undiscovered artists.
+  const pendingIds = [];
+  const pendingIdSet = new Set();
+  const pendingNames = [];
+  const pendingNameSet = new Set();
+  const enqueueId = (id) => {
+    const s = String(id || "");
+    if (!s || doneArtists.has(s) || pendingIdSet.has(s)) return;
+    pendingIdSet.add(s);
+    pendingIds.push(s);
+  };
+  const enqueueName = (nm) => {
+    const name = String(nm || "").trim();
+    if (!name) return;
+    const k = name.toLowerCase();
+    if (pendingNameSet.has(k)) return;
+    knownNames.set(k, name);
+    pendingNameSet.add(k);
+    pendingNames.push(name);
+  };
+  let expandFromIds = [...seedIds];
+  let expandFromNames = [...seedNames];
+
   for (let level = 1; level <= MAX_LEVELS; level++) {
     currentLevel = level;
     const need = poolNeed(targetSec, targets, candidates);
+    // Keep going until we have packing headroom (enough), not just a thin canFill.
     if (need.enough) break;
     if (hardStop()) break;
     if (doneArtists.size >= ARTIST_CAP || allTrackIds.size >= TRACK_CAP) break;
-    if (!frontierIds.length && !frontierNames.length) break;
 
     const shortNote = (need.byCadence || []).filter((c) => c.short > 30)
       .map((c) => `${c.cadence}spm`).slice(0, 3).join(", ");
     report("expand", {
-      detail: shortNote ? `Gathering songs · ring ${level} (still short on ${shortNote})` : `Gathering songs · related artists ring ${level}`,
+      detail: shortNote
+        ? `Ring ${level} · still short on ${shortNote} · queue ${pendingIds.length + pendingNames.length}`
+        : `Gathering songs · related artists ring ${level} · queue ${pendingIds.length + pendingNames.length}`,
       level,
+      pendingQueue: pendingIds.length + pendingNames.length,
     });
-    const nextIds = [];
-    const nextNames = [];
 
-    if (frontierIds.length && doneArtists.size < ARTIST_CAP) {
-      const sim = await tidalSimilarIds(frontierIds.slice(0, 50), `Tidal similar · ring ${level}`);
-      for (const id of sim) if (!doneArtists.has(id)) nextIds.push(id);
+    // Discover related artists from the artists we just fetched (or seeds on ring 1).
+    if (expandFromIds.length && doneArtists.size < ARTIST_CAP) {
+      const sim = await tidalSimilarIds(expandFromIds.slice(0, 100), `Tidal similar · ring ${level}`);
+      for (const id of sim) enqueueId(id);
+    }
+    if (LASTFM_KEY && expandFromNames.length && doneArtists.size < ARTIST_CAP) {
+      const lists = await mapLimit(
+        expandFromNames.slice(0, 80),
+        8,
+        (n) => lastfmSimilar(n, level <= 2 ? 50 : 35),
+      );
+      for (const names of lists) for (const nm of names) enqueueName(nm);
     }
 
-    if (LASTFM_KEY && frontierNames.length && doneArtists.size < ARTIST_CAP) {
-      const lists = await mapLimit(frontierNames.slice(0, 40), 6, (n) => lastfmSimilar(n, level === 1 ? 35 : 20));
-      const newNames = [];
-      for (const names of lists) for (const nm of names) {
-        const k = nm.toLowerCase();
-        if (!knownNames.has(k)) { knownNames.set(k, nm); newNames.push(nm); }
+    // Resolve a chunk of pending Last.fm names → Tidal ids (into the id queue).
+    if (pendingNames.length && doneArtists.size < ARTIST_CAP) {
+      const nameChunk = [];
+      while (nameChunk.length < 50 && pendingNames.length) {
+        const nm = pendingNames.shift();
+        pendingNameSet.delete(nm.toLowerCase());
+        nameChunk.push(nm);
       }
-      const room = Math.max(0, ARTIST_CAP - doneArtists.size - nextIds.length);
-      const slice = newNames.slice(0, Math.min(room, level === 1 ? 60 : 45));
-      report("resolve", { detail: `resolving ${slice.length} Last.fm artists · ring ${level}`, level });
-      const resolved = await mapLimit(slice, 6, async (n) => {
+      report("resolve", { detail: `resolving ${nameChunk.length} artists · ring ${level}`, level });
+      const resolved = await mapLimit(nameChunk, 8, async (n) => {
         const id = await tidalResolveArtist(n);
         if (id) idToName.set(String(id), n);
         return id;
       });
-      for (const id of resolved) if (id && !doneArtists.has(id)) nextIds.push(id);
-      for (const n of slice) nextNames.push(n);
+      for (const id of resolved) enqueueId(id);
     }
 
-    const uniq = [];
-    const seen = new Set();
-    for (const id of nextIds) {
-      if (!id || seen.has(id) || doneArtists.has(id)) continue;
-      seen.add(id);
-      uniq.push(id);
+    // Fetch the next batch from the persistent queue (do not drop the rest).
+    const batch = [];
+    while (batch.length < POOL_RING_BATCH && pendingIds.length && doneArtists.size + batch.length < ARTIST_CAP) {
+      const id = pendingIds.shift();
+      pendingIdSet.delete(id);
+      if (id && !doneArtists.has(id)) batch.push(id);
     }
-    if (!uniq.length) {
-      frontierIds = [];
-      frontierNames = nextNames;
-      if (!frontierNames.length) break;
+
+    if (!batch.length) {
+      if (!pendingNames.length && !pendingIds.length) break;
+      // Names still pending resolution — continue without a fetch this ring.
+      expandFromIds = [];
+      expandFromNames = [];
       continue;
     }
 
-    const room = Math.max(0, ARTIST_CAP - doneArtists.size);
-    const batch = uniq.slice(0, room);
     await fetchArtists(batch, false, `related artists · ring ${level}`);
     if (level === 1 || level % 2 === 0) await fillFromTempoCatalog(`Tempo catalog after ring ${level}`);
+    // If still badly short after a few rings, pull tempo-catalog artists mid-run.
+    if (level >= 3 && level % 3 === 0 && !poolNeed(targetSec, targets, candidates).canFill) {
+      await ingestTempoFill(`Importing target-tempo songs · ring ${level}`);
+    }
 
-    frontierIds = batch;
-    frontierNames = batch.map((id) => idToName.get(id)).filter(Boolean);
-    if (!frontierNames.length) frontierNames = nextNames;
+    expandFromIds = batch;
+    expandFromNames = batch.map((id) => idToName.get(id)).filter(Boolean);
 
     if (poolNeed(targetSec, targets, candidates).enough) break;
   }
 
   await fillFromTempoCatalog("Final tempo catalog pass");
-  if (!poolNeed(targetSec, targets, candidates).enough) {
+  if (!poolNeed(targetSec, targets, candidates).canFill) {
     await ingestTempoFill("Importing songs at your target tempos");
+  }
+  // One more related-artist push if still short and we have queue/budget left.
+  if (!poolNeed(targetSec, targets, candidates).canFill && !hardStop() && pendingIds.length && doneArtists.size < ARTIST_CAP) {
+    const extra = [];
+    while (extra.length < POOL_RING_BATCH && pendingIds.length && doneArtists.size + extra.length < ARTIST_CAP) {
+      const id = pendingIds.shift();
+      pendingIdSet.delete(id);
+      if (id && !doneArtists.has(id)) extra.push(id);
+    }
+    if (extra.length) {
+      report("expand", { detail: `Final expansion · ${extra.length} more related artists`, level: currentLevel + 1 });
+      await fetchArtists(extra, false, "final related artists");
+      await fillFromTempoCatalog("Tempo catalog after final expansion");
+    }
   }
   saveBpmCache();
   const finalNeed = poolNeed(targetSec, targets, candidates);
@@ -1145,7 +1196,7 @@ async function spotifyPool(seeds, targetSec = 0, targets = null, onProgress = nu
   const hardStop = () => Date.now() - started > POOL_BUDGET_MS;
   const seedList = seeds.map((s) => (typeof s === "string" ? { name: s } : s));
   const seedNames = seedList.map((s) => s.name).filter(Boolean);
-  const ARTIST_CAP = 600, TRACK_CAP = 3000, MAX_LEVELS = 20;
+  const ARTIST_CAP = POOL_ARTIST_CAP, TRACK_CAP = POOL_TRACK_CAP, MAX_LEVELS = POOL_MAX_LEVELS;
   const knownNames = new Map(); seedNames.forEach((n) => knownNames.set(n.toLowerCase(), n));
   const seedNameSet = new Set(seedNames.map((n) => n.toLowerCase()));
   const seedIdByName = new Map(); for (const s of seedList) if (s.name && s.id) seedIdByName.set(String(s.name).toLowerCase(), String(s.id));
@@ -1279,38 +1330,79 @@ async function spotifyPool(seeds, targetSec = 0, targets = null, onProgress = nu
   await fetchNames(seedNames, "seed artists", { seedWeight: true });
   await fillFromTempoCatalog("Stamping tempos from BPM catalog");
 
-  let frontier = [...seedNames];
+  const pending = [];
+  const pendingSet = new Set();
+  const enqueueName = (nm) => {
+    const name = String(nm || "").trim();
+    if (!name) return;
+    const k = name.toLowerCase();
+    if (doneNames.has(k) || pendingSet.has(k)) return;
+    knownNames.set(k, name);
+    pendingSet.add(k);
+    pending.push(name);
+  };
+  let expandFrom = [...seedNames];
+
   for (let level = 1; level <= MAX_LEVELS; level++) {
     currentLevel = level;
     const need = poolNeed(targetSec, targets, candidates);
     if (need.enough) break;
     if (hardStop()) break;
     if (doneNames.size >= ARTIST_CAP || candidates.length >= TRACK_CAP) break;
-    if (!LASTFM_KEY || !frontier.length) break;
+    if (!LASTFM_KEY) break;
 
     const shortNote = (need.byCadence || []).filter((c) => c.short > 30)
       .map((c) => `${c.cadence}spm`).slice(0, 3).join(", ");
     report("expand", {
-      detail: shortNote ? `Gathering songs · ring ${level} (still short on ${shortNote})` : `Gathering songs · related artists ring ${level}`,
+      detail: shortNote
+        ? `Ring ${level} · still short on ${shortNote} · queue ${pending.length}`
+        : `Gathering songs · related artists ring ${level} · queue ${pending.length}`,
       level,
+      pendingQueue: pending.length,
     });
-    const lists = await mapLimit(frontier.slice(0, 40), 6, (n) => lastfmSimilar(n, level === 1 ? 35 : 20));
-    const newNames = [];
-    for (const names of lists) for (const nm of names) {
-      const k = nm.toLowerCase();
-      if (!knownNames.has(k)) { knownNames.set(k, nm); newNames.push(nm); }
+
+    if (expandFrom.length) {
+      const lists = await mapLimit(
+        expandFrom.slice(0, 80),
+        8,
+        (n) => lastfmSimilar(n, level <= 2 ? 50 : 35),
+      );
+      for (const names of lists) for (const nm of names) enqueueName(nm);
     }
-    const room = Math.max(0, ARTIST_CAP - doneNames.size);
-    const slice = newNames.slice(0, Math.min(room, level === 1 ? 60 : 45));
-    if (!slice.length) break;
-    await fetchNames(slice, `related artists · ring ${level}`);
+
+    const batch = [];
+    while (batch.length < POOL_RING_BATCH && pending.length && doneNames.size + batch.length < ARTIST_CAP) {
+      const nm = pending.shift();
+      pendingSet.delete(nm.toLowerCase());
+      if (nm && !doneNames.has(nm.toLowerCase())) batch.push(nm);
+    }
+    if (!batch.length) break;
+
+    await fetchNames(batch, `related artists · ring ${level}`);
     if (level === 1 || level % 2 === 0) await fillFromTempoCatalog(`Tempo catalog after ring ${level}`);
-    frontier = slice;
+    if (level >= 3 && level % 3 === 0 && !poolNeed(targetSec, targets, candidates).canFill) {
+      await ingestTempoFill(`Importing target-tempo songs · ring ${level}`);
+    }
+    expandFrom = batch;
+    if (poolNeed(targetSec, targets, candidates).enough) break;
   }
 
   await fillFromTempoCatalog("Final tempo catalog pass");
-  if (!poolNeed(targetSec, targets, candidates).enough) {
+  if (!poolNeed(targetSec, targets, candidates).canFill) {
     await ingestTempoFill("Importing songs at your target tempos");
+  }
+  if (!poolNeed(targetSec, targets, candidates).canFill && !hardStop() && pending.length && doneNames.size < ARTIST_CAP) {
+    const extra = [];
+    while (extra.length < POOL_RING_BATCH && pending.length && doneNames.size + extra.length < ARTIST_CAP) {
+      const nm = pending.shift();
+      pendingSet.delete(nm.toLowerCase());
+      if (nm && !doneNames.has(nm.toLowerCase())) extra.push(nm);
+    }
+    if (extra.length) {
+      report("expand", { detail: `Final expansion · ${extra.length} more related artists`, level: currentLevel + 1 });
+      await fetchNames(extra, "final related artists");
+      await fillFromTempoCatalog("Tempo catalog after final expansion");
+    }
   }
   saveBpmCache();
   const finalNeed = poolNeed(targetSec, targets, candidates);
