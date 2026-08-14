@@ -190,7 +190,7 @@ function poolNeed(targetSec, targets, candidates) {
   };
 }
 /** Overall playlist-build % for the gather phase (never 100 — packing finishes on the client). */
-function playlistGatherPct(phase, { level = 0, maxLevels = 20, need = null, bpmDone = 0, bpmTotal = 0 } = {}) {
+function playlistGatherPct(phase, { level = 0, maxLevels = 80, need = null, bpmDone = 0, bpmTotal = 0 } = {}) {
   if (phase === "done") return 88;
   const ring = Math.max(0, Math.min(1, level / Math.max(1, maxLevels)));
   const fill = need?.fillNeed > 0 ? Math.max(0, Math.min(1, need.matched / need.fillNeed)) : 0;
@@ -203,8 +203,8 @@ function playlistGatherPct(phase, { level = 0, maxLevels = 20, need = null, bpmD
     resolve: 20,
     bpm: 22,
   }[phase] ?? 12;
-  // Ring depth drives most of the bar so early “enough matches” can’t mark the job complete.
-  const pct = phaseBase + ring * 50 + fill * 12 + bpm * 4;
+  // Coverage drives the bar; ring depth is secondary so deep searches still look active.
+  const pct = phaseBase + fill * 45 + ring * 18 + bpm * 4;
   return Math.max(3, Math.min(86, Math.round(pct)));
 }
 
