@@ -726,7 +726,10 @@ function poolProgressView(p){
   else if(p?.bpmTotal)bits.push(`BPM ${Math.min(p.bpmDone||0,p.bpmTotal)}/${p.bpmTotal}`);
   if(p?.artists!=null)bits.push(`${p.artists} artist${p.artists===1?"":"s"}`);
   if(p?.tracks!=null)bits.push(`${p.tracks} with BPM`);
-  if(p?.needSec>0)bits.push(`coverage ${fmtProgressClock(p.matchedSec)} / ${fmtProgressClock(p.needSec)}`);
+  if(p?.needSec>0){
+    const cov=`coverage ${fmtProgressClock(p.matchedSec)} / ${fmtProgressClock(p.needSec)}`;
+    bits.push(p.canFill?`${cov} · ready`:cov);
+  }
   if(Array.isArray(p?.shortCadences)&&p.shortCadences.length)bits.push(p.shortCadences.join(", "));
   if(p?.elapsedSec!=null)bits.push(`${p.elapsedSec}s`);
   return {detail, pct, meta:bits.join(" · ")};
@@ -802,7 +805,7 @@ function renderResults(res){
       <button type="button" class="rm" data-seg="${si}" data-track="${ti}" title="Remove from playlist" aria-label="Remove ${t.title}">×</button>
     </div>`).join("")
       :`<div class="empty">No songs in band. Search again, widen tolerance, or allow repeats.</div>`;
-    const note=p.shortfallSec>30?`<div class="note">▲ short by ${fmtClock(p.shortfallSec)} — only ${fmtClock(p.filledSec)} of ${fmtClock(p.segDuration)} matched ~${Math.round(p.cadence)}spm. Remove songs you don't want, then Search again to fill the gap.${bpmHint}</div>`:"";
+    const note=p.shortfallSec>30?`<div class="note">▲ short by ${fmtClock(p.shortfallSec)} — only ${fmtClock(p.filledSec)} of ${fmtClock(p.segDuration)} matched ~${Math.round(p.cadence)}spm. Remove songs you don't want, then Search again (seeds from playlist artists) to fill the gap.${bpmHint}</div>`:"";
     return`<section><div class="seg-head"><span class="miles">Miles ${p.segment.startMile}–${p.segment.endMile} <span style="color:var(--muted);font-weight:400">@ ${p.label}</span></span><span class="cad">${Math.round(p.cadence)} spm · need ${fmtClock(p.segDuration)}</span></div>${tracks}${note}</section>`;
   }).join("");
   const canExport=LOGGEDIN&&lastPlaylist.some(t=>t.ref||t.id);

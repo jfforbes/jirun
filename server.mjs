@@ -171,13 +171,15 @@ function poolNeed(targetSec, targets, candidates) {
   const matched = needs.reduce((s, n) => s + Math.min(n.filled, n.need), 0);
   const raw = candidates.reduce((s, t) => s + (t.durationSec || 210), 0);
   const canFill = needs.every((n) => n.filled >= n.need * 0.98);
-  // Modest headroom past a full pack — deep rings stop once the playlist can fill.
-  const enough = needs.every((n) => n.filled >= n.need * 1.15);
+  // Small packing headroom — stop expanding once the run can be filled.
+  const enough = needs.every((n) => n.filled >= n.need * 1.05);
   return {
     rawNeed: fillNeed * 8,
-    matchNeed: fillNeed * 1.15,
+    matchNeed: fillNeed * 1.05,
     fillNeed,
     matched,
+    // Uncapped fill (can exceed need) — used for honest progress past 100%.
+    matchedRaw: needs.reduce((s, n) => s + n.filled, 0),
     raw,
     canFill,
     enough,
@@ -192,6 +194,7 @@ function poolNeed(targetSec, targets, candidates) {
 /** Overall playlist-build % for the gather phase (never 100 — packing finishes on the client). */
 function playlistGatherPct(phase, { level = 0, maxLevels = 80, need = null, bpmDone = 0, bpmTotal = 0 } = {}) {
   if (phase === "done") return 88;
+  if (need?.canFill) return 86;
   const ring = Math.max(0, Math.min(1, level / Math.max(1, maxLevels)));
   const fill = need?.fillNeed > 0 ? Math.max(0, Math.min(1, need.matched / need.fillNeed)) : 0;
   const bpm = bpmTotal > 0 ? Math.max(0, Math.min(1, bpmDone / bpmTotal)) : 0;
@@ -861,6 +864,7 @@ async function tidalPool(seeds, targetSec = 0, targets = null, onProgress = null
         pendingBpm: pendingByKey.size,
         matchedSec: Math.round(need.matched || 0),
         needSec: Math.round(need.fillNeed || need.matchNeed || 0),
+        canFill: !!need.canFill,
         elapsedSec: Math.round((Date.now() - started) / 1000),
         shortCadences: short,
         bpmHit: bpmStats.hit,
@@ -887,7 +891,7 @@ async function tidalPool(seeds, targetSec = 0, targets = null, onProgress = null
     }
     let i = 0;
     while (i < order.length) {
-      if (!finishAll && poolNeed(targetSec, targets, candidates).enough) break;
+      if (!finishAll && poolNeed(targetSec, targets, candidates).canFill) break;
       if (!finishAll && hardStop()) break;
       // Seed phase: keep going past the soft ceiling only briefly; still stop on absolute overrun.
       if (finishAll && Date.now() - started > POOL_BUDGET_MS * 1.5) break;
@@ -919,7 +923,7 @@ async function tidalPool(seeds, targetSec = 0, targets = null, onProgress = null
     }
   }
   async function fillFromTempoCatalog(detail) {
-    if (!pendingByKey.size || poolNeed(targetSec, targets, candidates).enough) return 0;
+    if (!pendingByKey.size || poolNeed(targetSec, targets, candidates).canFill) return 0;
     report("bpm", { detail });
     const n = await stampBpmFromTempoCatalog(
       targets,
@@ -932,7 +936,7 @@ async function tidalPool(seeds, targetSec = 0, targets = null, onProgress = null
     return n;
   }
   async function ingestTempoFill(detail) {
-    if (poolNeed(targetSec, targets, candidates).enough) return 0;
+    if (poolNeed(targetSec, targets, candidates).canFill) return 0;
     report("bpm", { detail });
     const n = await ingestTempoCatalogTracks({
       targets,
@@ -1032,8 +1036,8 @@ async function tidalPool(seeds, targetSec = 0, targets = null, onProgress = null
   for (let level = 1; level <= MAX_LEVELS; level++) {
     currentLevel = level;
     const need = poolNeed(targetSec, targets, candidates);
-    // Keep going until we have packing headroom (enough), not just a thin canFill.
-    if (need.enough) break;
+    // Stop as soon as every cadence band can pack the run — don't grind for extra buffer.
+    if (need.canFill) break;
     if (hardStop()) break;
     if (doneArtists.size >= ARTIST_CAP || allTrackIds.size >= TRACK_CAP) break;
 
@@ -1104,7 +1108,7 @@ async function tidalPool(seeds, targetSec = 0, targets = null, onProgress = null
     expandFromIds = batch;
     expandFromNames = batch.map((id) => idToName.get(id)).filter(Boolean);
 
-    if (poolNeed(targetSec, targets, candidates).enough) break;
+    if (poolNeed(targetSec, targets, candidates).canFill) break;
   }
 
   await fillFromTempoCatalog("Final tempo catalog pass");
@@ -1128,13 +1132,11 @@ async function tidalPool(seeds, targetSec = 0, targets = null, onProgress = null
   saveBpmCache();
   const finalNeed = poolNeed(targetSec, targets, candidates);
   report("done", {
-    detail: finalNeed.enough
+    detail: finalNeed.canFill
       ? "Song pool ready — building playlist"
-      : finalNeed.canFill
-        ? "Song pool can fill — building playlist"
-        : hardStop()
-          ? "Time ceiling reached — building playlist with what we have"
-          : "Expanded as far as caps allow — building playlist",
+      : hardStop()
+        ? "Time ceiling reached — building playlist with what we have"
+        : "Expanded as far as caps allow — building playlist",
     bpmHit: bpmStats.hit,
     bpmTried: bpmStats.tried,
   });
@@ -1237,6 +1239,7 @@ async function spotifyPool(seeds, targetSec = 0, targets = null, onProgress = nu
         pendingBpm: pendingByKey.size,
         matchedSec: Math.round(need.matched || 0),
         needSec: Math.round(need.fillNeed || need.matchNeed || 0),
+        canFill: !!need.canFill,
         elapsedSec: Math.round((Date.now() - started) / 1000),
         shortCadences: short,
         bpmHit: bpmStats.hit,
@@ -1261,7 +1264,7 @@ async function spotifyPool(seeds, targetSec = 0, targets = null, onProgress = nu
     }
     let i = 0;
     while (i < order.length) {
-      if (!finishAll && poolNeed(targetSec, targets, candidates).enough) break;
+      if (!finishAll && poolNeed(targetSec, targets, candidates).canFill) break;
       if (!finishAll && hardStop()) break;
       if (finishAll && Date.now() - started > POOL_BUDGET_MS * 1.5) break;
       const batch = order.slice(i, i + 24);
@@ -1288,7 +1291,7 @@ async function spotifyPool(seeds, targetSec = 0, targets = null, onProgress = nu
     }
   }
   async function fillFromTempoCatalog(detail) {
-    if (!pendingByKey.size || poolNeed(targetSec, targets, candidates).enough) return 0;
+    if (!pendingByKey.size || poolNeed(targetSec, targets, candidates).canFill) return 0;
     report("bpm", { detail });
     const n = await stampBpmFromTempoCatalog(
       targets,
@@ -1301,7 +1304,7 @@ async function spotifyPool(seeds, targetSec = 0, targets = null, onProgress = nu
     return n;
   }
   async function ingestTempoFill(detail) {
-    if (poolNeed(targetSec, targets, candidates).enough) return 0;
+    if (poolNeed(targetSec, targets, candidates).canFill) return 0;
     report("bpm", { detail });
     const n = await ingestTempoCatalogTracks({
       targets,
@@ -1354,7 +1357,7 @@ async function spotifyPool(seeds, targetSec = 0, targets = null, onProgress = nu
   for (let level = 1; level <= MAX_LEVELS; level++) {
     currentLevel = level;
     const need = poolNeed(targetSec, targets, candidates);
-    if (need.enough) break;
+    if (need.canFill) break;
     if (hardStop()) break;
     if (doneNames.size >= ARTIST_CAP || candidates.length >= TRACK_CAP) break;
     if (!LASTFM_KEY) break;
@@ -1392,7 +1395,7 @@ async function spotifyPool(seeds, targetSec = 0, targets = null, onProgress = nu
       await ingestTempoFill(`Importing target-tempo songs · ring ${level}`);
     }
     expandFrom = batch;
-    if (poolNeed(targetSec, targets, candidates).enough) break;
+    if (poolNeed(targetSec, targets, candidates).canFill) break;
   }
 
   await fillFromTempoCatalog("Final tempo catalog pass");
@@ -1415,13 +1418,11 @@ async function spotifyPool(seeds, targetSec = 0, targets = null, onProgress = nu
   saveBpmCache();
   const finalNeed = poolNeed(targetSec, targets, candidates);
   report("done", {
-    detail: finalNeed.enough
+    detail: finalNeed.canFill
       ? "Song pool ready — building playlist"
-      : finalNeed.canFill
-        ? "Song pool can fill — building playlist"
-        : hardStop()
-          ? "Time ceiling reached — building playlist with what we have"
-          : "Expanded as far as caps allow — building playlist",
+      : hardStop()
+        ? "Time ceiling reached — building playlist with what we have"
+        : "Expanded as far as caps allow — building playlist",
     bpmHit: bpmStats.hit,
     bpmTried: bpmStats.tried,
   });
