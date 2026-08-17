@@ -384,6 +384,10 @@ const state={service:"tidal",seeds:[],maxHR:195,
 function saveCal(){try{localStorage.setItem("pb_cal",JSON.stringify({zones:state.zones,cal:state.cal,maxHR:state.maxHR}));}catch(_){}}
 function loadCal(){try{const s=JSON.parse(localStorage.getItem("pb_cal"));if(s){if(Array.isArray(s.zones))state.zones=s.zones;if(Array.isArray(s.cal))state.cal=s.cal;if(s.maxHR)state.maxHR=s.maxHR;}}catch(_){}}
 const $=(s)=>document.querySelector(s);
+let lastPlaylist=[];
+let lastResult=null;
+let lastCandidates=[];
+let excludedIds=new Set();
 
 /* ---- Theme: light / dark / system ---- */
 function resolveTheme(pref){return pref==="system"?(matchMedia("(prefers-color-scheme: dark)").matches?"dark":"light"):pref;}
@@ -411,7 +415,7 @@ async function checkLogin(){await api.health();const btn=$("#loginBtn");const sv
   if(h.loggedIn){setConn("on",HEALTH.bpmKey?`Logged in — playlists will land in ${SVC_NAME[svc]}.`:"Logged in, but no BPM key. Add GETSONGBPM_API_KEY to credentials.txt.");btn.style.display="none";showImport(true);}
   else if(h.hasCreds){setConn("off",`Not logged in to ${SVC_NAME[svc]} — tap below.`);btn.style.display="block";showImport(false);}
   else{setConn("err",`No ${SVC_NAME[svc]} credentials. Add ${svc.toUpperCase()}_CLIENT_ID / _SECRET to credentials.txt.`);btn.style.display="none";showImport(false);}}
-function setService(svc){state.service=svc;document.querySelectorAll("#serviceTabs button").forEach(b=>b.setAttribute("aria-pressed",b.dataset.svc===svc));state.seeds=[];renderSeeds();$("#results").hidden=true;checkLogin();}
+function setService(svc){state.service=svc;document.querySelectorAll("#serviceTabs button").forEach(b=>b.setAttribute("aria-pressed",b.dataset.svc===svc));state.seeds=[];lastPlaylist=[];lastResult=null;lastCandidates=[];excludedIds=new Set();$("#results-area").innerHTML="";renderSeeds();$("#results").hidden=true;checkLogin();}
 document.querySelectorAll("#serviceTabs button").forEach(b=>b.onclick=()=>setService(b.dataset.svc));
 $("#loginBtn").onclick=()=>{location.href=`/login?service=${state.service}`;};
 $("#logoutBtn").onclick=async()=>{await api.logout();state.seeds=[];renderSeeds();$("#results-area").innerHTML="";await checkLogin();};
@@ -462,7 +466,9 @@ function renderSeeds(){
   const wrap=$("#seeds");wrap.innerHTML=state.seeds.map((s,i)=>`<span class="seedchip"><span class="t">${s.name||s.title||"?"}</span><button data-seed="${i}" aria-label="remove">×</button></span>`).join("");
   wrap.querySelectorAll("button").forEach(b=>b.onclick=()=>{state.seeds.splice(+b.dataset.seed,1);renderSeeds();});
   $("#seedCount").textContent=`${state.seeds.length}`;
-  const has=state.seeds.length>0;const btn=$("#build");btn.disabled=!has;btn.textContent=has?"Ship it 🚀":"Refine the backlog first";
+  const has=state.seeds.length>0;const btn=$("#build");btn.disabled=!has;
+  const fromPl=lastPlaylist.length?artistsFromPlaylist(lastPlaylist).length:0;
+  btn.textContent=!has?"Refine the backlog first":fromPl?`Ship it again 🚀`:"Ship it 🚀";
 }
 
 function renderZones(){const tb=$("#zoneTable tbody");tb.innerHTML="";state.zones.forEach((z,i)=>{const tr=document.createElement("tr");tr.innerHTML=`<td style="font-family:var(--mono);color:var(--muted);padding-left:4px">${z.name}</td><td><input data-z="from" data-i="${i}" value="${z.from}" inputmode="numeric"/></td><td><input data-z="to" data-i="${i}" value="${z.to}" inputmode="numeric"/></td>`;tb.appendChild(tr);});}
@@ -648,55 +654,87 @@ async function resolveArtistSeeds(artists){
     seen.add(a.id);return true;
   });
 }
-async function runPoolSearch({keepCurrent=false,seedFromPlaylist=false}={}){
+function mergeArtistSeeds(...lists){
+  const by=new Map();
+  for(const list of lists){
+    for(const a of list||[]){
+      const id=a?.id!=null&&a.id!==""?String(a.id):null;
+      const name=String(a.name||a.title||"").trim();
+      if(!id&&!name)continue;
+      const nameK=name.toLowerCase();
+      const prev=(id&&by.get(`id:${id}`))||(nameK&&by.get(`name:${nameK}`))||null;
+      if(prev){
+        if(!prev.id&&id){prev.id=id;by.set(`id:${id}`,prev);}
+        if(!prev.name&&name)prev.name=name;
+        continue;
+      }
+      const row={id,name};
+      if(id)by.set(`id:${id}`,row);
+      if(nameK)by.set(`name:${nameK}`,row);
+    }
+  }
+  const seen=new Set();
+  return[...by.values()].filter((a)=>{
+    const k=a.id?`id:${a.id}`:`name:${a.name.toLowerCase()}`;
+    if(seen.has(k))return false;
+    seen.add(k);return true;
+  });
+}
+async function runPoolSearch({keepCurrent=false,includePlaylistArtists=false,includeSeeds=true}={}){
   const modes=Object.entries(state.modes).filter(([,v])=>v).map(([k])=>k);
   const area=$("#results-area");
   if(!modes.length){area.innerHTML=`<section><div class="empty">Turn on at least one sync mode (Automation).</div></section>`;return;}
   if(!LOGGEDIN){area.innerHTML=`<section><div class="empty">Log in first (button up top).</div></section>`;return;}
 
-  let seeds=state.seeds;
-  if(seedFromPlaylist){
-    const fromPl=artistsFromPlaylist(lastPlaylist);
-    if(!fromPl.length){
-      area.innerHTML=`<section><div class="empty">No artists left on the playlist to search from. Keep some tracks, or Ship it from the backlog.</div></section>`;
-      if(lastResult)renderResults(lastResult);
-      return;
-    }
-    const loadingResolve=startLoading(area);
-    loadingResolve.update({stage:"gather",phase:"resolve",pct:3,detail:`Resolving ${fromPl.length} playlist artist${fromPl.length===1?"":"s"} for a new search…`});
-    seeds=await resolveArtistSeeds(fromPl);
-    if(!seeds.length){
-      loadingResolve.stop();
-      area.innerHTML=`<section><div class="empty">Couldn't resolve playlist artists on ${SVC_NAME[state.service]}. Try adding them to the backlog.</div></section>`;
-      if(lastResult)setTimeout(()=>renderResults(lastResult),1200);
-      return;
-    }
-    loadingResolve.update({stage:"gather",phase:"start",pct:5,detail:`Searching from ${seeds.length} playlist artist${seeds.length===1?"":"s"}…`});
-  }else if(!seeds.length){
-    return;
-  }
+  const fromBacklog=includeSeeds?state.seeds.map((s)=>({id:s.id?String(s.id):null,name:s.name||s.title||""})): [];
+  const fromPlaylist=includePlaylistArtists?artistsFromPlaylist(lastPlaylist):[];
+  const combined=mergeArtistSeeds(fromBacklog,fromPlaylist);
+  if(!combined.length)return;
 
   const loading=startLoading(area);
-  if(seedFromPlaylist){
-    loading.update({stage:"gather",phase:"start",pct:6,detail:`Searching from ${seeds.length} playlist artist${seeds.length===1?"":"s"}…`});
+  const nPl=fromPlaylist.length,nSeed=fromBacklog.length;
+  if(includePlaylistArtists&&nPl){
+    loading.update({stage:"gather",phase:"resolve",pct:3,detail:`Resolving ${combined.length} artists (${nSeed} backlog + ${nPl} from playlist)…`});
   }
+  const seeds=await resolveArtistSeeds(combined);
+  if(!seeds.length){
+    loading.stop();
+    area.innerHTML=`<section><div class="empty">Couldn't resolve artists on ${SVC_NAME[state.service]}. Add them to the backlog and try again.</div></section>`;
+    if(lastResult)setTimeout(()=>renderResults(lastResult),1200);
+    return;
+  }
+  loading.update({
+    stage:"gather",
+    phase:"start",
+    pct:6,
+    detail:includePlaylistArtists&&nPl
+      ?`Searching from ${seeds.length} artists (${nSeed} backlog + ${nPl} from playlist)…`
+      :`Searching from ${seeds.length} seed artist${seeds.length===1?"":"s"}…`,
+  });
   const targets={cadences:plannedCadences(),cadenceNeeds:plannedCadenceNeeds(),tol:state.tol,modes};
   let candidates;
   try{candidates=await api.pool(seeds,plannedSeconds(),targets,loading.update);}
   catch(e){loading.stop();area.innerHTML=`<section><div class="empty">Sprint blocked: ${e.message}</div></section>`;return;}
   if(!candidates.length){loading.stop();area.innerHTML=`<section><div class="empty">No candidates with BPM came back. Add more seeds, widen tolerance, or check /api/bpmtest.</div></section>`;return;}
-  loading.update({stage:"pack",phase:"pack",pct:94,detail:keepCurrent?"Filling gaps from playlist artists…":"Building playlist from matched songs"});
+  loading.update({stage:"pack",phase:"pack",pct:94,detail:keepCurrent?"Filling gaps from backlog + playlist artists…":"Building playlist from matched songs"});
   const keepBySeg=keepCurrent&&lastResult?lastResult.plan.map((p)=>p.tracks.slice()):null;
   const res=buildPlaylist(state.segs,mergeCandidates(lastCandidates,candidates),packOpts({keepBySeg}));
   loading.update({stage:"pack",phase:"pack",pct:100,detail:"Playlist ready"});
   loading.stop();
   applyPlaylistResult(res,candidates);
+  renderSeeds();
 }
 $("#build").onclick=()=>{
-  excludedIds=new Set();
-  lastCandidates=[];
-  lastResult=null;
-  runPoolSearch({keepCurrent:false,seedFromPlaylist:false});
+  const hasPlaylist=lastPlaylist.length>0;
+  if(!hasPlaylist){
+    excludedIds=new Set();
+    lastCandidates=[];
+    lastResult=null;
+    runPoolSearch({keepCurrent:false,includePlaylistArtists:false,includeSeeds:true});
+    return;
+  }
+  // Next playlist: union of backlog seeds and artists already on the generated playlist.
+  runPoolSearch({keepCurrent:false,includePlaylistArtists:true,includeSeeds:true});
 };
 function fmtProgressClock(sec){
   sec=Math.max(0,Math.round(+sec||0));
@@ -757,10 +795,6 @@ function startLoading(area){
     stop(){},
   };
 }
-let lastPlaylist=[];
-let lastResult=null;
-let lastCandidates=[];
-let excludedIds=new Set();
 function planName(){const dist=Math.max(0,...state.segs.map(s=>+s.endMile||0)).toFixed(1).replace(/\.0$/,"");const d=new Date().toISOString().slice(0,10);return `run ${dist}mi ${d}`;}
 function plannedSeconds(){let s=0;for(const seg of state.segs){let paceSec;if(state.planMode==="zone"){const a=zoneAnchorFor(seg.zone)||state.cal[0]||{pace:"9:00"};paceSec=paceToSeconds(a.pace);}else paceSec=paceToSeconds(seg.pace||"9:00");s+=Math.max(0,(+seg.endMile-+seg.startMile))*paceSec;}return Math.round(s);}
 async function shipPlaylist(btn){
@@ -805,17 +839,17 @@ function renderResults(res){
       <button type="button" class="rm" data-seg="${si}" data-track="${ti}" title="Remove from playlist" aria-label="Remove ${t.title}">×</button>
     </div>`).join("")
       :`<div class="empty">No songs in band. Search again, widen tolerance, or allow repeats.</div>`;
-    const note=p.shortfallSec>30?`<div class="note">▲ short by ${fmtClock(p.shortfallSec)} — only ${fmtClock(p.filledSec)} of ${fmtClock(p.segDuration)} matched ~${Math.round(p.cadence)}spm. Remove songs you don't want, then Search again (seeds from playlist artists) to fill the gap.${bpmHint}</div>`:"";
+    const note=p.shortfallSec>30?`<div class="note">▲ short by ${fmtClock(p.shortfallSec)} — only ${fmtClock(p.filledSec)} of ${fmtClock(p.segDuration)} matched ~${Math.round(p.cadence)}spm. Remove songs you don't want, then Search again or Ship it again (backlog + playlist artists).${bpmHint}</div>`:"";
     return`<section><div class="seg-head"><span class="miles">Miles ${p.segment.startMile}–${p.segment.endMile} <span style="color:var(--muted);font-weight:400">@ ${p.label}</span></span><span class="cad">${Math.round(p.cadence)} spm · need ${fmtClock(p.segDuration)}</span></div>${tracks}${note}</section>`;
   }).join("");
   const canExport=LOGGEDIN&&lastPlaylist.some(t=>t.ref||t.id);
   const plArtists=artistsFromPlaylist(lastPlaylist);
   const excludedNote=excludedIds.size?`<div class="hint" style="text-align:center;margin-top:8px">${excludedIds.size} removed · won’t come back on Search again</div>`:"";
   const againLabel=plArtists.length
-    ?`Search again · ${plArtists.length} playlist artist${plArtists.length===1?"":"s"}`
+    ?`Search again · ${plArtists.length} playlist + ${state.seeds.length} seed`
     :"Search again";
   const actions=`<div class="actions">
-      <button type="button" class="btn secondary" id="searchAgainBtn"${plArtists.length?"":" disabled"} title="Run another pool build seeded from artists still on this playlist">${againLabel}</button>
+      <button type="button" class="btn secondary" id="searchAgainBtn"${plArtists.length||state.seeds.length?"":" disabled"} title="Fill gaps using backlog seeds plus artists still on this playlist">${againLabel}</button>
       <button type="button" class="btn" id="exportBtn"${canExport?"":" disabled"}>Ship to ${SVC_NAME[state.service]}</button>
     </div>${excludedNote}`;
   const bpmMeta=res.poolMeta&&res.poolMeta.poolSize!=null
@@ -825,7 +859,7 @@ function renderResults(res){
     btn.onclick=()=>removeTrack(+btn.dataset.seg,+btn.dataset.track);
   });
   const again=$("#searchAgainBtn");
-  if(again&&plArtists.length)again.onclick=()=>runPoolSearch({keepCurrent:true,seedFromPlaylist:true});
+  if(again)again.onclick=()=>runPoolSearch({keepCurrent:true,includePlaylistArtists:true,includeSeeds:true});
   const eb=$("#exportBtn");if(eb&&canExport)eb.onclick=()=>shipPlaylist(eb);
   $("#results-area").scrollIntoView({behavior:matchMedia("(prefers-reduced-motion:reduce)").matches?"auto":"smooth",block:"start"});
 }
