@@ -216,6 +216,15 @@ const secondsToPace=(x)=>`${Math.floor(x/60)}:${String(Math.round(x%60)).padStar
 const fmtClock=(t)=>{const h=Math.floor(t/3600),m=Math.floor((t%3600)/60),s=Math.round(t%60);const mm=String(m).padStart(h?2:1,"0"),ss=String(s).padStart(2,"0");return h?`${h}:${mm}:${ss}`:`${mm}:${ss}`;};
 function makeCadenceModel(a){const p=a.map(x=>({x:paceToSeconds(x.pace),y:+x.cadence})).filter(q=>q.x>0&&q.y>0).sort((m,n)=>m.x-n.x);if(!p.length)return()=>170;return(pace)=>{const x=paceToSeconds(pace);if(x<=p[0].x)return p[0].y;if(x>=p.at(-1).x)return p.at(-1).y;for(let i=0;i<p.length-1;i++){const A=p[i],B=p[i+1];if(x>=A.x&&x<=B.x){const t=(x-A.x)/(B.x-A.x);return A.y+t*(B.y-A.y);}}return p.at(-1).y;};}
 function bpmMatch(bpm,cad,tol,modes){const c=[];if(modes.includes("direct"))c.push({mode:"direct",target:cad});if(modes.includes("half"))c.push({mode:"half",target:cad/2});let b=null;for(const x of c){const d=Math.abs(bpm-x.target);if(d<=tol&&(!b||d<b.diff))b={...x,diff:d};}return b;}
+function keepMatchedTracksBySeg(plan,opts){
+  const{tol=2,modes=["direct","half"],excludedIds}=opts;
+  const excluded=excludedIds instanceof Set?excludedIds:new Set(excludedIds||[]);
+  return plan.map((p)=>p.tracks.filter((t)=>{
+    const k=trackKey(t);
+    if(!k||excluded.has(k)||t.bpm==null)return false;
+    return !!bpmMatch(t.bpm,p.cadence,tol,modes);
+  }));
+}
 /** Recursive pack: maximize filled time ≤ target+overshoot among candidates (BPM-sorted). */
 function packTracks(pool,targetSec,overshootSec,usedG,allowRepeats){
   const avail=pool.filter(e=>e?.t&&(allowRepeats||!usedG.has(e.t.id)));
@@ -704,7 +713,7 @@ function mergeArtistSeeds(...lists){
     seen.add(k);return true;
   });
 }
-async function runPoolSearch({keepCurrent=false,includePlaylistArtists=false,includeSeeds=true}={}){
+async function runPoolSearch({keepMatchedOnly=false,includePlaylistArtists=false,includeSeeds=true}={}){
   const modes=Object.entries(state.modes).filter(([,v])=>v).map(([k])=>k);
   const area=$("#results-area");
   if(!modes.length){area.innerHTML=`<section><div class="empty">Turn on at least one sync mode (Automation).</div></section>`;return;}
@@ -740,8 +749,8 @@ async function runPoolSearch({keepCurrent=false,includePlaylistArtists=false,inc
   try{candidates=await api.pool(seeds,plannedSeconds(),targets,loading.update);}
   catch(e){loading.stop();area.innerHTML=`<section><div class="empty">Sprint blocked: ${e.message}</div></section>`;return;}
   if(!candidates.length){loading.stop();area.innerHTML=`<section><div class="empty">No candidates with BPM came back. Add more seeds, widen tolerance, or check /api/bpmtest.</div></section>`;return;}
-  loading.update({stage:"pack",phase:"pack",pct:94,detail:keepCurrent?"Filling gaps from backlog + playlist artists…":"Building playlist from matched songs"});
-  const keepBySeg=keepCurrent&&lastResult?lastResult.plan.map((p)=>p.tracks.slice()):null;
+  loading.update({stage:"pack",phase:"pack",pct:94,detail:keepMatchedOnly?"Keeping BPM-matched songs, then expanding…":"Building playlist from matched songs"});
+  const keepBySeg=keepMatchedOnly&&lastResult?keepMatchedTracksBySeg(lastResult.plan,packOpts()):null;
   const res=buildPlaylist(state.segs,mergeCandidates(lastCandidates,candidates),packOpts({keepBySeg}));
   loading.update({stage:"pack",phase:"pack",pct:100,detail:"Playlist ready"});
   loading.stop();
@@ -755,11 +764,11 @@ $("#build").onclick=()=>{
     lastCandidates=[];
     lastResult=null;
     playlistExportName=null;
-    runPoolSearch({keepCurrent:false,includePlaylistArtists:false,includeSeeds:true});
+    runPoolSearch({keepMatchedOnly:false,includePlaylistArtists:false,includeSeeds:true});
     return;
   }
-  // Next playlist: keep current songs, then fill from backlog + playlist artists.
-  runPoolSearch({keepCurrent:true,includePlaylistArtists:true,includeSeeds:true});
+  // Next playlist: keep BPM-matched songs only, then expand from backlog + playlist artists.
+  runPoolSearch({keepMatchedOnly:true,includePlaylistArtists:true,includeSeeds:true});
 };
 function fmtProgressClock(sec){
   sec=Math.max(0,Math.round(+sec||0));
@@ -924,7 +933,7 @@ function renderResults(res){
     btn.onclick=()=>correctTrackBpm(+btn.dataset.seg,+btn.dataset.track);
   });
   const again=$("#searchAgainBtn");
-  if(again)again.onclick=()=>runPoolSearch({keepCurrent:true,includePlaylistArtists:true,includeSeeds:true});
+  if(again)again.onclick=()=>runPoolSearch({keepMatchedOnly:true,includePlaylistArtists:true,includeSeeds:true});
   const exportNameInput=$("#exportName");
   if(exportNameInput){
     exportNameInput.oninput=()=>{playlistExportName=exportNameInput.value;};
