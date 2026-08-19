@@ -758,8 +758,8 @@ $("#build").onclick=()=>{
     runPoolSearch({keepCurrent:false,includePlaylistArtists:false,includeSeeds:true});
     return;
   }
-  // Next playlist: union of backlog seeds and artists already on the generated playlist.
-  runPoolSearch({keepCurrent:false,includePlaylistArtists:true,includeSeeds:true});
+  // Next playlist: keep current songs, then fill from backlog + playlist artists.
+  runPoolSearch({keepCurrent:true,includePlaylistArtists:true,includeSeeds:true});
 };
 function fmtProgressClock(sec){
   sec=Math.max(0,Math.round(+sec||0));
