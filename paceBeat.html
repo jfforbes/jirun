@@ -109,6 +109,10 @@
   .empty{color:var(--muted);font-size:13px;text-align:center;padding:24px 8px}
   .actions{display:grid;grid-template-columns:1fr 1fr;gap:8px;margin-top:10px}
   .actions .btn{margin-top:0}
+  .export-name{margin-top:10px;display:flex;flex-direction:column;gap:6px}
+  .export-name label{font-size:11px;color:var(--muted);letter-spacing:.02em;text-transform:uppercase;font-weight:600}
+  .export-name input{width:100%;padding:9px 10px;border:1px solid var(--line);border-radius:3px;background:var(--surface);color:var(--text);font-size:14px}
+  .export-name input:focus{outline:none;border-color:var(--pace);box-shadow:0 0 0 1px var(--pace)}
   .btn.secondary{background:var(--surface);border:1px solid var(--line)}
   .btn.secondary:hover{border-color:var(--pace);color:var(--pace)}
   .legend{display:flex;gap:14px;font-size:11px;color:var(--muted);margin-top:6px;flex-wrap:wrap}
@@ -407,6 +411,7 @@ let lastPlaylist=[];
 let lastResult=null;
 let lastCandidates=[];
 let excludedIds=new Set();
+let playlistExportName=null;
 
 /* ---- Theme: light / dark / system ---- */
 function resolveTheme(pref){return pref==="system"?(matchMedia("(prefers-color-scheme: dark)").matches?"dark":"light"):pref;}
@@ -434,10 +439,10 @@ async function checkLogin(){await api.health();const btn=$("#loginBtn");const sv
   if(h.loggedIn){setConn("on",HEALTH.bpmKey?`Logged in — playlists will land in ${SVC_NAME[svc]}.`:"Logged in, but no BPM key. Add GETSONGBPM_API_KEY to credentials.txt.");btn.style.display="none";showImport(true);}
   else if(h.hasCreds){setConn("off",`Not logged in to ${SVC_NAME[svc]} — tap below.`);btn.style.display="block";showImport(false);}
   else{setConn("err",`No ${SVC_NAME[svc]} credentials. Add ${svc.toUpperCase()}_CLIENT_ID / _SECRET to credentials.txt.`);btn.style.display="none";showImport(false);}}
-function setService(svc){state.service=svc;document.querySelectorAll("#serviceTabs button").forEach(b=>b.setAttribute("aria-pressed",b.dataset.svc===svc));state.seeds=[];lastPlaylist=[];lastResult=null;lastCandidates=[];excludedIds=new Set();$("#results-area").innerHTML="";renderSeeds();$("#results").hidden=true;checkLogin();}
+function setService(svc){state.service=svc;document.querySelectorAll("#serviceTabs button").forEach(b=>b.setAttribute("aria-pressed",b.dataset.svc===svc));state.seeds=[];lastPlaylist=[];lastResult=null;lastCandidates=[];excludedIds=new Set();playlistExportName=null;$("#results-area").innerHTML="";renderSeeds();$("#results").hidden=true;checkLogin();}
 document.querySelectorAll("#serviceTabs button").forEach(b=>b.onclick=()=>setService(b.dataset.svc));
 $("#loginBtn").onclick=()=>{location.href=`/login?service=${state.service}`;};
-$("#logoutBtn").onclick=async()=>{await api.logout();state.seeds=[];renderSeeds();$("#results-area").innerHTML="";await checkLogin();};
+$("#logoutBtn").onclick=async()=>{await api.logout();state.seeds=[];lastPlaylist=[];lastResult=null;lastCandidates=[];excludedIds=new Set();playlistExportName=null;renderSeeds();$("#results-area").innerHTML="";await checkLogin();};
 $("#loadPlaylists").onclick=async()=>{
   const sel=$("#playlistPick");sel.style.display="block";sel.innerHTML=`<option value="">Loading playlists…</option>`;
   try{const pls=await api.playlists();sel.innerHTML=`<option value="">Import from a playlist…</option>`+pls.map(p=>`<option value="${p.id}">${(p.name||"Untitled").replace(/</g,"&lt;")}</option>`).join("");}
@@ -749,6 +754,7 @@ $("#build").onclick=()=>{
     excludedIds=new Set();
     lastCandidates=[];
     lastResult=null;
+    playlistExportName=null;
     runPoolSearch({keepCurrent:false,includePlaylistArtists:false,includeSeeds:true});
     return;
   }
@@ -815,14 +821,24 @@ function startLoading(area){
   };
 }
 function planName(){const dist=Math.max(0,...state.segs.map(s=>+s.endMile||0)).toFixed(1).replace(/\.0$/,"");const d=new Date().toISOString().slice(0,10);return `run ${dist}mi ${d}`;}
+function defaultExportName(){return planName();}
+function getExportPlaylistName(){
+  const input=$("#exportName");
+  const fromInput=input?.value?.trim();
+  if(fromInput)return fromInput.slice(0,100);
+  return (playlistExportName||defaultExportName()).slice(0,100);
+}
 function plannedSeconds(){let s=0;for(const seg of state.segs){let paceSec;if(state.planMode==="zone"){const a=zoneAnchorFor(seg.zone)||state.cal[0]||{pace:"9:00"};paceSec=paceToSeconds(a.pace);}else paceSec=paceToSeconds(seg.pace||"9:00");s+=Math.max(0,(+seg.endMile-+seg.startMile))*paceSec;}return Math.round(s);}
 async function shipPlaylist(btn){
   const refs=lastPlaylist.map(t=>t.ref||t.id).filter(Boolean);
   if(!refs.length)return;
+  const name=getExportPlaylistName();
+  if(!name){alert("Give the playlist a name before shipping.");return;}
+  playlistExportName=name;
   const svc=SVC_NAME[state.service];
   btn.disabled=true;const old=btn.textContent;btn.textContent=`Shipping to ${svc}…`;
   try{
-    const j=await api.export(planName(),refs);
+    const j=await api.export(name,refs);
     btn.textContent=`✓ Shipped to ${svc}`;btn.style.background="var(--good)";btn.style.color="#fff";
     const link=document.createElement("a");link.href=j.url;link.target="_blank";link.textContent=`Open "${j.name}" in ${svc} (${j.count} tracks)`;
     link.style.cssText="display:block;text-align:center;color:var(--pace);font-size:12.5px;margin-top:8px";
@@ -884,10 +900,20 @@ function renderResults(res){
   const againLabel=plArtists.length
     ?`Search again · ${plArtists.length} playlist + ${state.seeds.length} seed`
     :"Search again";
+  const exportNameVal=(()=>{
+    const prev=$("#exportName")?.value?.trim();
+    if(prev){playlistExportName=prev;return prev;}
+    if(playlistExportName==null)playlistExportName=defaultExportName();
+    return playlistExportName;
+  })();
+  const exportNameField=canExport?`<div class="export-name">
+      <label for="exportName">Playlist name</label>
+      <input id="exportName" type="text" maxlength="100" value="${exportNameVal.replace(/"/g,"&quot;")}" placeholder="${defaultExportName().replace(/"/g,"&quot;")}" />
+    </div>`:"";
   const actions=`<div class="actions">
       <button type="button" class="btn secondary" id="searchAgainBtn"${plArtists.length||state.seeds.length?"":" disabled"} title="Fill gaps using backlog seeds plus artists still on this playlist">${againLabel}</button>
       <button type="button" class="btn" id="exportBtn"${canExport?"":" disabled"}>Ship to ${SVC_NAME[state.service]}</button>
-    </div>${excludedNote}`;
+    </div>${exportNameField}${excludedNote}`;
   const bpmMeta=res.poolMeta&&res.poolMeta.poolSize!=null
     ?`<div><div class="k">BPM hit</div><div class="v">${res.poolMeta.bpmHit||0}/${res.poolMeta.poolSize}</div></div>`:"";
   $("#results-area").innerHTML=`<div class="readout"><div><div class="k">Tracks</div><div class="v">${res.trackCount}</div></div><div><div class="k">Planned</div><div class="v">${fmtClock(res.totalPlannedSec)}</div></div><div><div class="k">Music</div><div class="v">${fmtClock(res.totalFilledSec)}</div></div>${bpmMeta}</div><div class="strip">${strip}</div>${segs}${actions}`;
@@ -899,6 +925,10 @@ function renderResults(res){
   });
   const again=$("#searchAgainBtn");
   if(again)again.onclick=()=>runPoolSearch({keepCurrent:true,includePlaylistArtists:true,includeSeeds:true});
+  const exportNameInput=$("#exportName");
+  if(exportNameInput){
+    exportNameInput.oninput=()=>{playlistExportName=exportNameInput.value;};
+  }
   const eb=$("#exportBtn");if(eb&&canExport)eb.onclick=()=>shipPlaylist(eb);
   $("#results-area").scrollIntoView({behavior:matchMedia("(prefers-reduced-motion:reduce)").matches?"auto":"smooth",block:"start"});
 }
