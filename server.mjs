@@ -231,12 +231,48 @@ function cleanMusicToken(s) {
 function normTrackKey(artist, title) {
   return `${cleanMusicToken(artist)}|${cleanMusicToken(title)}`;
 }
-function cacheBpm(artist, title, bpm) {
-  const k = `${(artist || "").toLowerCase()}|${(title || "").toLowerCase()}`;
-  bpmCache[k] = bpm;
-  cacheDirty = true;
+function makeCacheEntry(bpm, meta = {}) {
+  if (!(Number(bpm) > 0)) return null;
+  return {
+    bpm: Math.round(Number(bpm)),
+    source: meta.source || "unknown",
+    confidence: Number(meta.confidence) || 0.5,
+    updatedAt: Date.now(),
+    ...meta,
+  };
+}
+function cacheEntryBpm(entry) {
+  if (entry == null) return null;
+  if (typeof entry === "number") return entry > 0 ? entry : null;
+  if (typeof entry === "object" && Number(entry.bpm) > 0) return Math.round(Number(entry.bpm));
+  return null;
+}
+function cacheStoreKeys(artist, title, { isrc = null, trackId = null, service = null } = {}) {
+  const keys = [];
+  const raw = `${(artist || "").toLowerCase()}|${(title || "").toLowerCase()}`;
+  if (raw !== "|") keys.push(raw);
   const nk = normTrackKey(artist, title);
-  if (nk !== "|") { bpmCache[`norm:${nk}`] = bpm; cacheDirty = true; }
+  if (nk !== "|") keys.push(`norm:${nk}`);
+  if (isrc) keys.push(`isrc:${String(isrc).toUpperCase()}`);
+  if (service && trackId) keys.push(`track:${service}:${trackId}`);
+  return keys;
+}
+function cacheBpm(artist, title, bpm, meta = {}) {
+  const entry = makeCacheEntry(bpm, meta);
+  const val = entry || null;
+  for (const k of cacheStoreKeys(artist, title, meta)) {
+    bpmCache[k] = val;
+    cacheDirty = true;
+  }
+}
+function readCachedBpm(artist, title, { isrc = null, trackId = null, service = null } = {}) {
+  const keys = cacheStoreKeys(artist, title, { isrc, trackId, service });
+  for (const k of keys) {
+    if (!(k in bpmCache)) continue;
+    const bpm = cacheEntryBpm(bpmCache[k]);
+    return { bpm, key: k, entry: bpmCache[k] };
+  }
+  return { bpm: null, key: null, entry: null };
 }
 async function bpmFromGetSong(artist, title) {
   if (!GSB_KEY) return { bpm: null, ok: false };
@@ -294,6 +330,58 @@ async function bpmFromFreqBlog(artist, title) {
     return { bpm: null, ok: false };
   }
 }
+async function bpmFromDeezer(artist, title, isrc = null) {
+  try {
+    if (isrc) {
+      const byIsrc = await fetch(`https://api.deezer.com/track/isrc:${encodeURIComponent(String(isrc).toUpperCase())}`);
+      if (byIsrc.ok) {
+        const j = await byIsrc.json();
+        const b = parseInt(j?.bpm, 10);
+        if (b > 0) return { bpm: b, ok: true, source: "deezer:isrc", confidence: 0.96 };
+      }
+    }
+    const q = encodeURIComponent(`track:"${title || ""}" artist:"${artist || ""}"`);
+    const r = await fetch(`https://api.deezer.com/search?q=${q}&limit=8`);
+    if (!r.ok) return { bpm: null, ok: false };
+    const j = await r.json();
+    const hits = Array.isArray(j?.data) ? j.data : [];
+    const wantArt = cleanMusicToken(artist);
+    const wantTitle = cleanMusicToken(title);
+    const scored = hits.map((h) => {
+      const b = parseInt(h?.bpm, 10);
+      if (!(b > 0)) return null;
+      const hArt = cleanMusicToken(h?.artist?.name || "");
+      const hTitle = cleanMusicToken(h?.title || "");
+      let score = 0;
+      if (hArt && wantArt && (hArt === wantArt || hArt.includes(wantArt) || wantArt.includes(hArt))) score += 2;
+      if (hTitle && wantTitle && (hTitle === wantTitle || hTitle.includes(wantTitle) || wantTitle.includes(hTitle))) score += 2;
+      return { bpm: b, score };
+    }).filter(Boolean).sort((a, b) => b.score - a.score);
+    if (scored.length) {
+      const conf = scored[0].score >= 4 ? 0.93 : scored[0].score >= 2 ? 0.82 : 0.68;
+      return { bpm: scored[0].bpm, ok: true, source: "deezer:search", confidence: conf };
+    }
+    return { bpm: null, ok: true };
+  } catch (_) {
+    return { bpm: null, ok: false };
+  }
+}
+function pickConsensus(candidates) {
+  const good = (candidates || []).filter((c) => Number(c?.bpm) > 0);
+  if (!good.length) return null;
+  if (good.length === 1) return good[0];
+  // Prefer agreement cluster within ±3 BPM; otherwise highest-confidence source.
+  let best = null;
+  for (const c of good) {
+    const cluster = good.filter((x) => Math.abs(x.bpm - c.bpm) <= 3);
+    const score = cluster.reduce((s, x) => s + (Number(x.confidence) || 0.5), 0);
+    if (!best || score > best.score) {
+      const weighted = Math.round(cluster.reduce((s, x) => s + x.bpm * (Number(x.confidence) || 0.5), 0) / score);
+      best = { bpm: weighted, source: "consensus", confidence: Math.min(0.99, score / Math.max(1, cluster.length)), score };
+    }
+  }
+  return best || good.sort((a, b) => (b.confidence || 0) - (a.confidence || 0))[0];
+}
 /** Per-artist GetSongBPM song→tempo map (far denser than per-track search for seed catalogs). */
 const gsbArtistMaps = new Map(); // lowerName → Map<titleKey, tempo> | null (miss)
 async function gsbArtistTempoMap(artistName) {
@@ -329,29 +417,44 @@ async function gsbArtistTempoMap(artistName) {
   gsbArtistMaps.set(k, map);
   return map;
 }
-async function bpmFor(artist, title) {
-  if (!GSB_KEY && !FREQBLOG_KEY) throw new Error("GETSONGBPM_API_KEY not set");
-  const k = `${(artist || "").toLowerCase()}|${(title || "").toLowerCase()}`;
-  if (k in bpmCache) return bpmCache[k];
-  const nk = `norm:${normTrackKey(artist, title)}`;
-  if (nk in bpmCache) return bpmCache[nk];
+async function bpmForTrack(track) {
+  const artist = track?.artist || "";
+  const title = track?.title || "";
+  const isrc = track?.isrc || null;
+  const trackId = track?.id || track?.ref || null;
+  const service = track?.service || null;
+  const cached = readCachedBpm(artist, title, { isrc, trackId, service });
+  if (cached.key) return cached.bpm;
 
   // Artist catalog first — one request covers many tracks for that artist.
   const artMap = await gsbArtistTempoMap(artist);
   const tk = cleanMusicToken(title);
   if (artMap && tk && artMap.has(tk)) {
     const bpm = artMap.get(tk);
-    cacheBpm(artist, title, bpm);
+    cacheBpm(artist, title, bpm, { source: "getsong:artist", confidence: 0.92, isrc, trackId, service });
     return bpm;
   }
 
-  let res = await bpmFromGetSong(artist, title);
-  if (res.bpm == null) {
-    const fb = await bpmFromFreqBlog(artist, title);
-    if (fb.ok || fb.bpm != null) res = fb;
+  const gsb = await bpmFromGetSong(artist, title);
+  const fb = gsb.bpm == null ? await bpmFromFreqBlog(artist, title) : { bpm: null, ok: false };
+  const dz = await bpmFromDeezer(artist, title, isrc);
+  const winner = pickConsensus([
+    gsb.bpm != null ? { bpm: gsb.bpm, source: "getsong:search", confidence: 0.8 } : null,
+    fb.bpm != null ? { bpm: fb.bpm, source: "freqblog", confidence: 0.84 } : null,
+    dz.bpm != null ? { bpm: dz.bpm, source: dz.source || "deezer", confidence: dz.confidence || 0.78 } : null,
+  ].filter(Boolean));
+  if (winner?.bpm) {
+    cacheBpm(artist, title, winner.bpm, { ...winner, isrc, trackId, service });
+    return winner.bpm;
   }
-  if (res.ok) cacheBpm(artist, title, res.bpm);
-  return res.bpm;
+  // Only cache definitive misses; leave network failures retriable.
+  if (gsb.ok || fb.ok || dz.ok) {
+    cacheBpm(artist, title, null, { source: "miss", confidence: 0, isrc, trackId, service });
+  }
+  return null;
+}
+async function bpmFor(artist, title) {
+  return bpmForTrack({ artist, title });
 }
 /** Target BPM centers (direct ± tol and optional half-time) we still care about. */
 function cadenceBpmCenters(targets) {
@@ -418,7 +521,13 @@ async function stampBpmFromTempoCatalog(targets, pendingMap, candidates, stats, 
       if (!pending) continue;
       pendingMap.delete(key);
       candidates.push({ ...pending, bpm: song.tempo });
-      cacheBpm(pending.artist, pending.title, song.tempo);
+      cacheBpm(pending.artist, pending.title, song.tempo, {
+        source: "getsong:tempo-stamp",
+        confidence: 0.9,
+        isrc: pending.isrc || null,
+        trackId: pending.id || pending.ref || null,
+        service: pending.service || null,
+      });
       stamped++;
       if (stats) { stats.hit++; stats.tried++; }
     }
@@ -475,7 +584,13 @@ async function ingestTempoCatalogTracks({
       seenIds.add(tid);
       if (t.id && t.id !== tid) seenIds.add(String(t.id));
       candidates.push({ ...t, bpm: tempo, bpmSource: "tempo-ingest" });
-      cacheBpm(t.artist || name, t.title, tempo);
+      cacheBpm(t.artist || name, t.title, tempo, {
+        source: "getsong:tempo-ingest",
+        confidence: 0.86,
+        isrc: t.isrc || null,
+        trackId: t.id || t.ref || null,
+        service: t.service || null,
+      });
       added++;
       if (stats) { stats.hit++; stats.tried++; }
     }
@@ -561,7 +676,18 @@ function tidalMapTrack(res, included = []) {
   const artist = included.find((x) => x.type === "artists" && x.id === artistId)?.attributes?.name || "";
   const gids = (res.relationships?.genres?.data || []).map((g) => g.id);
   const genres = included.filter((x) => x.type === "genres" && gids.includes(x.id)).map((x) => x.attributes?.name).filter(Boolean);
-  return { id: res.id, ref: res.id, title: a.title || "?", artist, artistId: artistId ? String(artistId) : null, bpm: null, durationSec: isoToSec(a.duration), genres };
+  return {
+    id: res.id,
+    ref: res.id,
+    service: "tidal",
+    title: a.title || "?",
+    artist,
+    artistId: artistId ? String(artistId) : null,
+    isrc: a.isrc || null,
+    bpm: null,
+    durationSec: isoToSec(a.duration),
+    genres,
+  };
 }
 function tidalExtractArtists(payload) {
   const byId = {};
@@ -900,7 +1026,7 @@ async function tidalPool(seeds, targetSec = 0, targets = null, onProgress = null
       report("bpm", { detail, bpmDone: i, bpmTotal: order.length });
       const enriched = await mapLimit(batch, 10, async (t) => {
         bpmStats.tried++;
-        const b = await bpmFor(t.artist, t.title).catch(() => null);
+        const b = await bpmForTrack(t).catch(() => null);
         if (b) bpmStats.hit++;
         return { track: t, bpm: b };
       });
@@ -1175,9 +1301,11 @@ function spotifyMapTrack(t, fallbackArtist) {
   return {
     id: t.id,
     ref: t.uri,
+    service: "spotify",
     title: t.name,
     artist: t.artists?.[0]?.name || fallbackArtist || "?",
     artistId: t.artists?.[0]?.id || null,
+    isrc: t.external_ids?.isrc || null,
     durationSec: Math.round((t.duration_ms || 210000) / 1000),
     genres: [],
   };
@@ -1272,7 +1400,7 @@ async function spotifyPool(seeds, targetSec = 0, targets = null, onProgress = nu
       report("bpm", { detail, bpmDone: i, bpmTotal: order.length });
       const enriched = await mapLimit(batch, 10, async (t) => {
         bpmStats.tried++;
-        const b = await bpmFor(t.artist, t.title).catch(() => null);
+        const b = await bpmForTrack(t).catch(() => null);
         if (b) bpmStats.hit++;
         return { track: t, bpm: b };
       });
@@ -1596,6 +1724,20 @@ const server = http.createServer(async (req, res) => {
       const id = url.searchParams.get("id");
       if (!id) return sendJSON(res, 400, { error: "no playlist id" });
       return sendJSON(res, 200, await playlistArtists(svc, id));
+    }
+    if (url.pathname === "/api/bpm-correct" && req.method === "POST") {
+      const body = await readBody(req);
+      const bpm = Math.round(Number(body?.bpm));
+      if (!(bpm > 0 && bpm <= 260)) return sendJSON(res, 400, { error: "bpm must be 1..260" });
+      const artist = String(body?.artist || "").trim();
+      const title = String(body?.title || "").trim();
+      if (!artist || !title) return sendJSON(res, 400, { error: "artist and title are required" });
+      const isrc = body?.isrc ? String(body.isrc).trim().toUpperCase() : null;
+      const trackId = body?.trackId ? String(body.trackId).trim() : null;
+      const service = body?.service ? String(body.service).trim().toLowerCase() : null;
+      cacheBpm(artist, title, bpm, { source: "user-corrected", confidence: 1, isrc, trackId, service, user: true });
+      saveBpmCache();
+      return sendJSON(res, 200, { ok: true, bpm, artist, title, isrc, trackId, service });
     }
     if (url.pathname === "/api/bpmtest") {
       if (!GSB_KEY) return sendJSON(res, 200, { error: "GETSONGBPM_API_KEY not set" });

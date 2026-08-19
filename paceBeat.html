@@ -94,10 +94,12 @@
   .strip .band{border-radius:3px;display:flex;align-items:center;justify-content:center;font-family:var(--mono);font-size:11px;color:#fff;font-weight:700;overflow:hidden}
   .seg-head{display:flex;justify-content:space-between;align-items:baseline;margin:0 0 10px}
   .seg-head .miles{font-weight:600;font-size:15px}.seg-head .cad{font-family:var(--mono);font-size:12.5px;color:var(--muted)}
-  .track{display:grid;grid-template-columns:1fr auto auto auto;gap:8px;align-items:center;padding:8px 0;border-top:1px solid var(--line)}
+  .track{display:grid;grid-template-columns:1fr auto auto auto auto;gap:8px;align-items:center;padding:8px 0;border-top:1px solid var(--line)}
   .track .title{font-size:13.5px;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
   .track .art{font-size:11px;color:var(--muted);white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
   .track .bpm{font-family:var(--mono);font-size:13px;color:var(--muted)}
+  .track .edit{background:none;border:none;color:var(--muted);font-size:14px;line-height:1;cursor:pointer;padding:2px 4px;border-radius:3px}
+  .track .edit:hover{color:var(--pace);background:var(--surface-2)}
   .track .rm{background:none;border:none;color:var(--muted);font-size:18px;line-height:1;cursor:pointer;padding:2px 4px;border-radius:3px}
   .track .rm:hover{color:var(--warn);background:var(--surface-2)}
   .tag{font-family:var(--mono);font-size:10.5px;padding:2px 7px;border-radius:3px;white-space:nowrap;font-weight:700}
@@ -355,6 +357,23 @@ const api={
     if(!Array.isArray(candidates))throw new Error("Pool ended without results — is the bridge still running?");
     candidates.meta=poolMeta;
     return candidates;
+  },
+  async bpmCorrect(track,bpm){
+    const r=await fetch(`/api/bpm-correct`,{
+      method:"POST",
+      headers:{"Content-Type":"application/json"},
+      body:JSON.stringify({
+        service:state.service,
+        bpm,
+        artist:track?.artist||"",
+        title:track?.title||"",
+        isrc:track?.isrc||null,
+        trackId:track?.id||track?.ref||null,
+      }),
+    });
+    const j=await r.json().catch(()=>({}));
+    if(!r.ok)throw new Error(j.error||r.status);
+    return j;
   },
   async export(name,refs){const r=await fetch(`/api/export`,{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify({service:state.service,name,refs})});const j=await r.json();if(!r.ok)throw new Error(j.error||r.status);return j;},
   async playlists(){const r=await fetch(`/api/playlists?service=${state.service}`);const j=await r.json();if(!r.ok)throw new Error(j.error||r.status);return j;},
@@ -825,6 +844,22 @@ function removeTrack(segIdx,trackIdx){
   lastPlaylist=lastResult.plan.flatMap((p)=>p.tracks);
   renderResults(lastResult);
 }
+async function correctTrackBpm(segIdx,trackIdx){
+  const t=lastResult?.plan?.[segIdx]?.tracks?.[trackIdx];
+  if(!t)return;
+  const raw=prompt(`Set BPM for "${t.title}" by ${t.artist}`, String(Math.round(Number(t.bpm)||0)||""));
+  if(raw==null)return;
+  const bpm=Math.round(Number(raw));
+  if(!(bpm>0&&bpm<=260)){alert("Please enter a BPM between 1 and 260.");return;}
+  try{await api.bpmCorrect(t,bpm);}catch(e){alert(`Couldn't save BPM correction: ${e.message}`);return;}
+  t.bpm=bpm;
+  t.bpmSource="user-corrected";
+  // Re-pack using corrected BPMs while keeping current picks.
+  const keepBySeg=lastResult.plan.map((p)=>p.tracks.slice());
+  const repacked=buildPlaylist(state.segs,lastCandidates,packOpts({keepBySeg}));
+  repacked.poolMeta=lastResult.poolMeta||lastCandidates.meta||null;
+  applyPlaylistResult(repacked,null);
+}
 function renderResults(res){
   const strip=res.plan.map(p=>{const w=res.totalPlannedSec?Math.max(6,(p.segDuration/res.totalPlannedSec)*100):33;return`<div class="band" style="flex:${w} 1 0;background:${cadColor(p.cadence)}">${Math.round(p.cadence)}</div>`;}).join("");
   const bpmRate=res.poolMeta?.bpmHitRate;
@@ -836,6 +871,7 @@ function renderResults(res){
       <div><div class="title">${t.title}</div><div class="art">${t.artist||""}</div></div>
       <div style="text-align:right"><span class="bpm">${t.bpm}</span> <span class="tag ${t.matchMode}">${t.matchMode==="half"?"½× "+t.matchTarget:"→ "+t.matchTarget}</span></div>
       <div class="dur">${fmtClock(t.durationSec)}</div>
+      <button type="button" class="edit" data-seg="${si}" data-track="${ti}" title="Correct BPM" aria-label="Correct BPM for ${t.title}">✎</button>
       <button type="button" class="rm" data-seg="${si}" data-track="${ti}" title="Remove from playlist" aria-label="Remove ${t.title}">×</button>
     </div>`).join("")
       :`<div class="empty">No songs in band. Search again, widen tolerance, or allow repeats.</div>`;
@@ -857,6 +893,9 @@ function renderResults(res){
   $("#results-area").innerHTML=`<div class="readout"><div><div class="k">Tracks</div><div class="v">${res.trackCount}</div></div><div><div class="k">Planned</div><div class="v">${fmtClock(res.totalPlannedSec)}</div></div><div><div class="k">Music</div><div class="v">${fmtClock(res.totalFilledSec)}</div></div>${bpmMeta}</div><div class="strip">${strip}</div>${segs}${actions}`;
   $("#results-area").querySelectorAll(".rm").forEach((btn)=>{
     btn.onclick=()=>removeTrack(+btn.dataset.seg,+btn.dataset.track);
+  });
+  $("#results-area").querySelectorAll(".edit").forEach((btn)=>{
+    btn.onclick=()=>correctTrackBpm(+btn.dataset.seg,+btn.dataset.track);
   });
   const again=$("#searchAgainBtn");
   if(again)again.onclick=()=>runPoolSearch({keepCurrent:true,includePlaylistArtists:true,includeSeeds:true});
