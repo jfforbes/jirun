@@ -956,7 +956,9 @@ async function tidalTracksFromSuggestions(payload) {
     if (t) ordered.push(t);
   }
   if (!ordered.length) return [...byId.values()].slice(0, 10);
-  return ordered.slice(0, 10);
+  const out = ordered.slice(0, 10);
+  await tidalHydrateGenres(out);
+  return out;
 }
 /** Accept pasted Tidal track URLs or bare numeric ids when query looks like an id. */
 function tidalParseTrackRef(q) {
