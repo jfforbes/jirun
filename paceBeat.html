@@ -97,6 +97,8 @@
   .track{display:grid;grid-template-columns:1fr auto auto auto auto;gap:8px;align-items:center;padding:8px 0;border-top:1px solid var(--line)}
   .track .title{font-size:13.5px;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
   .track .art{font-size:11px;color:var(--muted);white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
+  .track .genres{display:flex;flex-wrap:wrap;gap:4px;margin-top:4px}
+  .track .genre{font-size:10px;line-height:1.2;color:var(--muted);background:var(--surface-2);border:1px solid var(--line);border-radius:3px;padding:2px 6px;font-weight:600;max-width:100%;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
   .track .bpm{font-family:var(--mono);font-size:13px;color:var(--muted)}
   .track .edit{background:none;border:none;color:var(--muted);font-size:14px;line-height:1;cursor:pointer;padding:2px 4px;border-radius:3px}
   .track .edit:hover{color:var(--pace);background:var(--surface-2)}
@@ -884,6 +886,20 @@ function matchTagHtml(t){
   if(t.matchMode==="half")return`<span class="tag half">½× ${t.matchTarget}</span>`;
   return`<span class="tag direct">→ ${t.matchTarget}</span>`;
 }
+function genreTagsHtml(t){
+  const gs=(Array.isArray(t?.genres)?t.genres:[]).map((g)=>String(g||"").trim()).filter(Boolean);
+  if(!gs.length)return"";
+  const seen=new Set();
+  const uniq=[];
+  for(const g of gs){
+    const k=g.toLowerCase();
+    if(seen.has(k))continue;
+    seen.add(k);
+    uniq.push(g);
+    if(uniq.length>=4)break;
+  }
+  return`<div class="genres">${uniq.map((g)=>`<span class="genre">${g.replace(/</g,"&lt;")}</span>`).join("")}</div>`;
+}
 let addTrackSeg=null, addTrackHits=[], addTrackHl=-1, addTrackTimer=null;
 function closeAddTrackPanel(){
   addTrackSeg=null;addTrackHits=[];addTrackHl=-1;
@@ -989,7 +1005,7 @@ function renderResults(res){
     :"";
   const segs=res.plan.map((p,si)=>{
     const tracks=p.tracks.length?p.tracks.map((t,ti)=>`<div class="track">
-      <div><div class="title">${t.title}</div><div class="art">${t.artist||""}</div></div>
+      <div><div class="title">${t.title}</div><div class="art">${t.artist||""}</div>${genreTagsHtml(t)}</div>
       <div style="text-align:right"><span class="bpm">${t.bpm??"—"}</span> ${matchTagHtml(t)}</div>
       <div class="dur">${fmtClock(t.durationSec)}</div>
       <button type="button" class="edit" data-seg="${si}" data-track="${ti}" title="Correct BPM" aria-label="Correct BPM for ${t.title}">✎</button>

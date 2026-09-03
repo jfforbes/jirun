@@ -675,7 +675,13 @@ function tidalMapTrack(res, included = []) {
   const artistId = res.relationships?.artists?.data?.[0]?.id;
   const artist = included.find((x) => x.type === "artists" && x.id === artistId)?.attributes?.name || "";
   const gids = (res.relationships?.genres?.data || []).map((g) => g.id);
-  const genres = included.filter((x) => x.type === "genres" && gids.includes(x.id)).map((x) => x.attributes?.name).filter(Boolean);
+  let genres = included.filter((x) => x.type === "genres" && gids.includes(x.id)).map((x) => x.attributes?.name).filter(Boolean);
+  // Fall back to any genres attached to the primary artist in this payload.
+  if (!genres.length && artistId) {
+    const art = included.find((x) => x.type === "artists" && String(x.id) === String(artistId));
+    const ag = (art?.relationships?.genres?.data || []).map((g) => g.id);
+    genres = included.filter((x) => x.type === "genres" && ag.includes(x.id)).map((x) => x.attributes?.name).filter(Boolean);
+  }
   return {
     id: res.id,
     ref: res.id,
@@ -686,8 +692,39 @@ function tidalMapTrack(res, included = []) {
     isrc: a.isrc || null,
     bpm: null,
     durationSec: isoToSec(a.duration),
-    genres,
+    genres: [...new Set(genres)].slice(0, 4),
   };
+}
+const tidalArtistGenreCache = {};
+async function tidalArtistGenres(id) {
+  const aid = id != null ? String(id) : "";
+  if (!aid) return [];
+  if (aid in tidalArtistGenreCache) return tidalArtistGenreCache[aid];
+  for (const getter of [tapiCatalog, tapi]) {
+    try {
+      const j = await getter(`/artists/${encodeURIComponent(aid)}?countryCode=${COUNTRY}&include=genres`);
+      const gids = (j?.data?.relationships?.genres?.data || []).map((g) => g.id);
+      const named = (j.included || [])
+        .filter((x) => x?.type === "genres" && (gids.length ? gids.includes(x.id) : true))
+        .map((x) => x.attributes?.name)
+        .filter(Boolean);
+      const out = [...new Set(named)].slice(0, 4);
+      tidalArtistGenreCache[aid] = out;
+      return out;
+    } catch (_) { /* try next auth */ }
+  }
+  tidalArtistGenreCache[aid] = [];
+  return [];
+}
+async function tidalHydrateGenres(tracks) {
+  const list = Array.isArray(tracks) ? tracks : [];
+  const need = list.filter((t) => t && t.artistId && !(Array.isArray(t.genres) && t.genres.length));
+  if (!need.length) return list;
+  await mapLimit(need, 6, async (t) => {
+    const g = await tidalArtistGenres(t.artistId);
+    if (g.length) t.genres = g.slice(0, 4);
+  });
+  return list;
 }
 function tidalExtractArtists(payload) {
   const byId = {};
@@ -1261,6 +1298,7 @@ async function tidalPool(seeds, targetSec = 0, targets = null, onProgress = null
             for (const tr of t.data || []) out.push(tidalMapTrack(tr, t.included));
           } catch (_) {}
         }
+        await tidalHydrateGenres(out);
         return out;
       },
       maxArtists: 50,
@@ -1298,6 +1336,7 @@ async function tidalPool(seeds, targetSec = 0, targets = null, onProgress = null
       } catch (_) {}
       report("tracks", { detail, trackMeta: meta.length, trackIds: newIds.length });
     }
+    await tidalHydrateGenres(meta);
     await enrichBpm(meta, detail, { finishAll: !!seedWeight });
     snap();
     return fresh;
@@ -1501,7 +1540,7 @@ async function spotifyResolveArtist(name) {
   let id = null; try { const a = await spotifySearchArtists(name); id = a[0]?.id || null; } catch (_) {}
   spotifyArtistIdCache[k] = id; return id;
 }
-function spotifyMapTrack(t, fallbackArtist) {
+function spotifyMapTrack(t, fallbackArtist, genres = null) {
   return {
     id: t.id,
     ref: t.uri,
@@ -1511,8 +1550,33 @@ function spotifyMapTrack(t, fallbackArtist) {
     artistId: t.artists?.[0]?.id || null,
     isrc: t.external_ids?.isrc || null,
     durationSec: Math.round((t.duration_ms || 210000) / 1000),
-    genres: [],
+    genres: Array.isArray(genres) ? genres.slice(0, 4) : [],
   };
+}
+const spotifyGenreCache = {};
+async function spotifyHydrateArtistGenres(tracks) {
+  const list = Array.isArray(tracks) ? tracks : [];
+  const ids = [...new Set(list.map((t) => t?.artistId).filter(Boolean))];
+  const missing = ids.filter((id) => !(id in spotifyGenreCache));
+  for (let i = 0; i < missing.length; i += 50) {
+    const chunk = missing.slice(i, i + 50);
+    try {
+      const j = await sapi(`/artists?ids=${chunk.join(",")}`);
+      for (const a of j.artists || []) {
+        if (a?.id) spotifyGenreCache[a.id] = Array.isArray(a.genres) ? a.genres.slice(0, 6) : [];
+      }
+      for (const id of chunk) if (!(id in spotifyGenreCache)) spotifyGenreCache[id] = [];
+    } catch (_) {
+      for (const id of chunk) if (!(id in spotifyGenreCache)) spotifyGenreCache[id] = [];
+    }
+  }
+  for (const t of list) {
+    if (!t) continue;
+    if (Array.isArray(t.genres) && t.genres.length) continue;
+    const g = t.artistId ? spotifyGenreCache[t.artistId] : null;
+    if (Array.isArray(g) && g.length) t.genres = g.slice(0, 4);
+  }
+  return list;
 }
 async function spotifyArtistTracks(name, id = null, limit = 40) {
   const byRef = new Map();
@@ -1530,7 +1594,9 @@ async function spotifyArtistTracks(name, id = null, limit = 40) {
       if (items.length < 50) break;
     } catch (_) { break; }
   }
-  return [...byRef.values()].slice(0, limit);
+  const out = [...byRef.values()].slice(0, limit);
+  await spotifyHydrateArtistGenres(out);
+  return out;
 }
 async function spotifyPool(seeds, targetSec = 0, targets = null, onProgress = null, ctrl = null) {
   if (!GSB_KEY && !FREQBLOG_KEY) throw new Error("GETSONGBPM_API_KEY not set — add it to credentials.txt");
