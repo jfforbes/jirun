@@ -65,6 +65,8 @@
   .seedchip .t{white-space:nowrap;overflow:hidden;text-overflow:ellipsis;color:var(--text)}
   .seedchip .art{color:var(--muted);font-size:11px}
   .seedchip button{background:none;border:none;color:var(--muted);font-size:16px;cursor:pointer;line-height:1;padding:0 2px}
+  .seed-actions{display:flex;justify-content:flex-end;margin-top:8px}
+  .seed-actions .btn{margin-top:0;width:auto;padding:6px 10px;font-size:12px}
   .hint{font-size:12px;color:var(--muted);margin-top:10px}
   .seedcount{font-family:var(--mono);color:var(--muted)}
   table{width:100%;border-collapse:collapse}
@@ -546,9 +548,34 @@ $("#search").addEventListener("keydown",(e)=>{
   else if(e.key==="Escape"){$("#results").hidden=true;}
 });
 function addSeed(t){if(state.seeds.some(s=>s.id===t.id))return;state.seeds.push(t);$("#search").value="";$("#results").hidden=true;currentHits=[];hlIndex=-1;renderSeeds();}
+function resetRunState(){
+  lastPlaylist=[];
+  lastResult=null;
+  lastCandidates=[];
+  excludedIds=new Set();
+  playlistExportName=null;
+  closeAddTrackPanel();
+  const area=$("#results-area");
+  if(area)area.innerHTML="";
+}
+function clearAllSeeds(){
+  if(!state.seeds.length)return;
+  state.seeds=[];
+  resetRunState();
+  renderSeeds();
+  setConn(LOGGEDIN?"on":"off",LOGGEDIN?"Backlog cleared. Add new artists to start fresh.":"Log in first (button up top).");
+}
 function renderSeeds(){
-  const wrap=$("#seeds");wrap.innerHTML=state.seeds.map((s,i)=>`<span class="seedchip"><span class="t">${s.name||s.title||"?"}</span><button data-seed="${i}" aria-label="remove">×</button></span>`).join("");
-  wrap.querySelectorAll("button").forEach(b=>b.onclick=()=>{state.seeds.splice(+b.dataset.seed,1);renderSeeds();});
+  const wrap=$("#seeds");
+  wrap.innerHTML=state.seeds.map((s,i)=>`<span class="seedchip"><span class="t">${s.name||s.title||"?"}</span><button data-seed="${i}" aria-label="remove">×</button></span>`).join("")
+    +(state.seeds.length?`<div class="seed-actions"><button type="button" class="btn secondary" id="clearSeedsBtn">Clear all</button></div>`:"");
+  wrap.querySelectorAll("button[data-seed]").forEach(b=>b.onclick=()=>{
+    state.seeds.splice(+b.dataset.seed,1);
+    if(!state.seeds.length)resetRunState();
+    renderSeeds();
+  });
+  const clearBtn=$("#clearSeedsBtn");
+  if(clearBtn)clearBtn.onclick=()=>clearAllSeeds();
   $("#seedCount").textContent=`${state.seeds.length}`;
   const has=state.seeds.length>0;const btn=$("#build");btn.disabled=!has;
   const fromPl=lastPlaylist.length?artistsFromPlaylist(lastPlaylist).length:0;
