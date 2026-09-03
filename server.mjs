@@ -607,8 +607,95 @@ async function lastfmSimilar(name, limit = 40) {
     const r = await fetch(u, { headers: { Accept: "application/json" } });
     if (!r.ok) return [];
     const j = await r.json();
-    return (j.similarartists?.artist || []).map((a) => a.name).filter(Boolean);
+    return (j.similarartists?.artist || [])
+      .map((a) => ({
+        name: a?.name || "",
+        match: Math.max(0, parseFloat(a?.match) || 0),
+      }))
+      .filter((a) => a.name);
   } catch (_) { return []; }
+}
+/** Top artists for a genre/tag (Last.fm) — used for genre-overlap fan-out. */
+async function lastfmTagTopArtists(tag, limit = 40) {
+  const t = String(tag || "").trim();
+  if (!LASTFM_KEY || !t) return [];
+  try {
+    const u = `${LASTFM_BASE}?method=tag.getTopArtists&tag=${encodeURIComponent(t)}&api_key=${LASTFM_KEY}&format=json&limit=${limit}`;
+    const r = await fetch(u, { headers: { Accept: "application/json" } });
+    if (!r.ok) return [];
+    const j = await r.json();
+    const raw = j.topartists?.artist;
+    const list = Array.isArray(raw) ? raw : raw ? [raw] : [];
+    return list.map((a) => a?.name).filter(Boolean);
+  } catch (_) { return []; }
+}
+/** Rank genres from candidate tracks; seed artists count heavier. */
+function topGenresFromCandidates(candidates, { artistIds = [], artistNames = [], limit = 8 } = {}) {
+  const seedIds = new Set((artistIds || []).map(String).filter(Boolean));
+  const seedNames = new Set((artistNames || []).map((n) => String(n || "").toLowerCase()).filter(Boolean));
+  const counts = new Map();
+  for (const t of candidates || []) {
+    const genres = Array.isArray(t?.genres) ? t.genres : [];
+    if (!genres.length) continue;
+    const fromSeed =
+      (t.artistId && seedIds.has(String(t.artistId))) ||
+      (t.artist && seedNames.has(String(t.artist).toLowerCase()));
+    const w = fromSeed ? 3 : 1;
+    for (const g of genres) {
+      const key = String(g || "").trim().toLowerCase();
+      if (!key || key.length < 2) continue;
+      counts.set(key, (counts.get(key) || 0) + w);
+    }
+  }
+  return [...counts.entries()]
+    .sort((a, b) => b[1] - a[1] || a[0].localeCompare(b[0]))
+    .slice(0, limit)
+    .map(([g]) => g);
+}
+/**
+ * Priority queue helpers: keep pending artists ordered by multi-source vote score
+ * (similar-to-many-seeds + Last.fm match + genre fan-out).
+ */
+function makeScoredQueue() {
+  const order = [];
+  const seen = new Set();
+  const score = new Map();
+  const label = new Map();
+  return {
+    size: () => order.length,
+    has: (key) => seen.has(key),
+    add(key, pts = 1, displayName = null) {
+      const k = String(key || "").trim();
+      if (!k) return false;
+      score.set(k, (score.get(k) || 0) + Math.max(0, +pts || 0));
+      if (displayName) label.set(k, displayName);
+      if (seen.has(k)) return false;
+      seen.add(k);
+      order.push(k);
+      return true;
+    },
+    take(n, { skip } = {}) {
+      const skipFn = typeof skip === "function" ? skip : () => false;
+      order.sort((a, b) => (score.get(b) || 0) - (score.get(a) || 0));
+      const out = [];
+      const keep = [];
+      for (const k of order) {
+        if (out.length < n && !skipFn(k)) {
+          out.push(k);
+          seen.delete(k);
+        } else if (!skipFn(k)) {
+          keep.push(k);
+        } else {
+          seen.delete(k);
+          score.delete(k);
+          label.delete(k);
+        }
+      }
+      order.length = 0;
+      for (const k of keep) order.push(k);
+      return out.map((k) => ({ key: k, name: label.get(k) || k, score: score.get(k) || 0 }));
+    },
+  };
 }
 
 /* ============ TIDAL ============ */
@@ -1344,42 +1431,48 @@ async function tidalPool(seeds, targetSec = 0, targets = null, onProgress = null
     return fresh;
   }
   async function tidalSimilarIds(ids, detail) {
-    const out = [];
+    const votes = new Map(); // id -> score
     const fresh = ids.filter(Boolean);
-    if (!fresh.length) return out;
+    if (!fresh.length) return [];
     report("similar", { detail, pendingArtists: fresh.length });
     await mapLimit(fresh, 6, async (aid) => {
       try {
         const j = await tapi(`/artists/${aid}/relationships/similarArtists?countryCode=${COUNTRY}`);
-        for (const d of j.data || []) if (d?.id) out.push(String(d.id));
+        const rows = j.data || [];
+        rows.forEach((d, i) => {
+          if (!d?.id) return;
+          const id = String(d.id);
+          // Earlier in Tidal's similar list = stronger; each seed vote adds.
+          const pts = 1 + Math.max(0, (30 - i) / 30);
+          votes.set(id, (votes.get(id) || 0) + pts);
+        });
       } catch (_) {}
     });
-    return out;
+    return [...votes.entries()]
+      .map(([id, score]) => ({ id, score }))
+      .sort((a, b) => b.score - a.score);
   }
 
   report("start", { detail: "Gathering songs from seed artists" });
   await fetchArtists(seedIds, true, "seed artists");
   await fillFromTempoCatalog("Stamping tempos from BPM catalog");
 
-  // Persistent BFS queue — previously each ring discarded undiscovered artists.
-  const pendingIds = [];
-  const pendingIdSet = new Set();
-  const pendingNames = [];
-  const pendingNameSet = new Set();
-  const enqueueId = (id) => {
+  // Scored BFS queues — multi-seed votes + Last.fm match + genre fan-out.
+  const idQueue = makeScoredQueue();
+  const nameQueue = makeScoredQueue();
+  const genreTried = new Set();
+  const enqueueId = (id, pts = 1, name = null) => {
     const s = String(id || "");
-    if (!s || doneArtists.has(s) || pendingIdSet.has(s)) return;
-    pendingIdSet.add(s);
-    pendingIds.push(s);
+    if (!s || doneArtists.has(s)) return;
+    if (name) idToName.set(s, name);
+    idQueue.add(s, pts, name || idToName.get(s) || s);
   };
-  const enqueueName = (nm) => {
+  const enqueueName = (nm, pts = 1) => {
     const name = String(nm || "").trim();
     if (!name) return;
     const k = name.toLowerCase();
-    if (pendingNameSet.has(k)) return;
     knownNames.set(k, name);
-    pendingNameSet.add(k);
-    pendingNames.push(name);
+    nameQueue.add(k, pts, name);
   };
   let expandFromIds = [...seedIds];
   let expandFromNames = [...seedNames];
@@ -1396,16 +1489,16 @@ async function tidalPool(seeds, targetSec = 0, targets = null, onProgress = null
       .map((c) => `${c.cadence}spm`).slice(0, 3).join(", ");
     report("expand", {
       detail: shortNote
-        ? `Ring ${level} · still short on ${shortNote} · queue ${pendingIds.length + pendingNames.length}`
-        : `Gathering songs · related artists ring ${level} · queue ${pendingIds.length + pendingNames.length}`,
+        ? `Ring ${level} · still short on ${shortNote} · queue ${idQueue.size() + nameQueue.size()}`
+        : `Gathering songs · related artists ring ${level} · queue ${idQueue.size() + nameQueue.size()}`,
       level,
-      pendingQueue: pendingIds.length + pendingNames.length,
+      pendingQueue: idQueue.size() + nameQueue.size(),
     });
 
     // Discover related artists from the artists we just fetched (or seeds on ring 1).
     if (expandFromIds.length && doneArtists.size < ARTIST_CAP) {
       const sim = await tidalSimilarIds(expandFromIds.slice(0, 100), `Tidal similar · ring ${level}`);
-      for (const id of sim) enqueueId(id);
+      for (const row of sim) enqueueId(row.id, row.score);
     }
     if (LASTFM_KEY && expandFromNames.length && doneArtists.size < ARTIST_CAP) {
       const lists = await mapLimit(
@@ -1413,36 +1506,58 @@ async function tidalPool(seeds, targetSec = 0, targets = null, onProgress = null
         8,
         (n) => lastfmSimilar(n, level <= 2 ? 50 : 35),
       );
-      for (const names of lists) for (const nm of names) enqueueName(nm);
+      for (const rows of lists) {
+        for (const row of rows || []) {
+          // match is 0..1; bump so a strong Last.fm hit can beat a weak single Tidal vote
+          const pts = 0.6 + Math.min(1.4, (row.match || 0) * 1.4);
+          enqueueName(row.name, pts);
+        }
+      }
+    }
+
+    // Genre-overlap fan-out: after seeds (ring 1) and again mid-run if still short.
+    if (LASTFM_KEY && doneArtists.size < ARTIST_CAP && (level === 1 || (level >= 4 && level % 4 === 0))) {
+      const genres = topGenresFromCandidates(candidates, {
+        artistIds: level === 1 ? seedIds : [],
+        artistNames: level === 1 ? seedNames : [],
+        limit: level === 1 ? 6 : 4,
+      }).filter((g) => !genreTried.has(g));
+      for (const g of genres) genreTried.add(g);
+      if (genres.length) {
+        report("similar", {
+          detail: `Genre fan-out · ${genres.slice(0, 3).join(", ")}${genres.length > 3 ? "…" : ""}`,
+          level,
+        });
+        const tagLists = await mapLimit(genres, 4, (g) => lastfmTagTopArtists(g, level <= 2 ? 35 : 25));
+        for (const names of tagLists) {
+          for (const nm of names || []) enqueueName(nm, 0.85);
+        }
+      }
     }
 
     // Resolve a chunk of pending Last.fm names → Tidal ids (into the id queue).
-    if (pendingNames.length && doneArtists.size < ARTIST_CAP) {
-      const nameChunk = [];
-      while (nameChunk.length < 50 && pendingNames.length) {
-        const nm = pendingNames.shift();
-        pendingNameSet.delete(nm.toLowerCase());
-        nameChunk.push(nm);
-      }
+    if (nameQueue.size() && doneArtists.size < ARTIST_CAP) {
+      const nameChunk = nameQueue.take(50);
       report("resolve", { detail: `resolving ${nameChunk.length} artists · ring ${level}`, level });
-      const resolved = await mapLimit(nameChunk, 8, async (n) => {
-        const id = await tidalResolveArtist(n);
-        if (id) idToName.set(String(id), n);
-        return id;
+      const resolved = await mapLimit(nameChunk, 8, async (row) => {
+        const id = await tidalResolveArtist(row.name);
+        if (id) {
+          idToName.set(String(id), row.name);
+          return { id: String(id), score: row.score, name: row.name };
+        }
+        return null;
       });
-      for (const id of resolved) enqueueId(id);
+      for (const row of resolved) {
+        if (row?.id) enqueueId(row.id, row.score, row.name);
+      }
     }
 
-    // Fetch the next batch from the persistent queue (do not drop the rest).
-    const batch = [];
-    while (batch.length < POOL_RING_BATCH && pendingIds.length && doneArtists.size + batch.length < ARTIST_CAP) {
-      const id = pendingIds.shift();
-      pendingIdSet.delete(id);
-      if (id && !doneArtists.has(id)) batch.push(id);
-    }
+    // Fetch the next batch from the scored id queue (highest votes first).
+    const batchRows = idQueue.take(POOL_RING_BATCH, { skip: (id) => doneArtists.has(id) });
+    const batch = batchRows.map((r) => r.key);
 
     if (!batch.length) {
-      if (!pendingNames.length && !pendingIds.length) break;
+      if (!nameQueue.size() && !idQueue.size()) break;
       // Names still pending resolution — continue without a fetch this ring.
       expandFromIds = [];
       expandFromNames = [];
@@ -1467,13 +1582,8 @@ async function tidalPool(seeds, targetSec = 0, targets = null, onProgress = null
     await ingestTempoFill("Importing songs at your target tempos");
   }
   // One more related-artist push if still short and we have queue/budget left.
-  if (!userStop() && !poolNeed(targetSec, targets, candidates).canFill && !hardStop() && pendingIds.length && doneArtists.size < ARTIST_CAP) {
-    const extra = [];
-    while (extra.length < POOL_RING_BATCH && pendingIds.length && doneArtists.size + extra.length < ARTIST_CAP) {
-      const id = pendingIds.shift();
-      pendingIdSet.delete(id);
-      if (id && !doneArtists.has(id)) extra.push(id);
-    }
+  if (!userStop() && !poolNeed(targetSec, targets, candidates).canFill && !hardStop() && idQueue.size() && doneArtists.size < ARTIST_CAP) {
+    const extra = idQueue.take(POOL_RING_BATCH, { skip: (id) => doneArtists.has(id) }).map((r) => r.key);
     if (extra.length) {
       report("expand", { detail: `Final expansion · ${extra.length} more related artists`, level: currentLevel + 1 });
       await fetchArtists(extra, false, "final related artists");
@@ -1518,6 +1628,20 @@ async function sapi(pq, { method = "GET", body } = {}) {
 async function spotifySearchArtists(q) {
   const j = await sapi(`/search?q=${encodeURIComponent(q)}&type=artist&limit=10`);
   return (j.artists?.items || []).map((a) => ({ id: a.id, name: a.name }));
+}
+/** Spotify supports genre:"..." artist search — useful fan-out when Last.fm tags map cleanly. */
+async function spotifyArtistsByGenre(genre, limit = 20) {
+  const g = String(genre || "").trim();
+  if (!g) return [];
+  try {
+    const q = `genre:"${g}"`;
+    const j = await sapi(`/search?q=${encodeURIComponent(q)}&type=artist&limit=${Math.min(50, Math.max(1, limit))}`);
+    return (j.artists?.items || [])
+      .filter((a) => a?.id && a?.name)
+      .map((a) => ({ id: String(a.id), name: a.name }));
+  } catch (_) {
+    return [];
+  }
 }
 async function spotifySearchTracks(q) {
   const query = (q || "").trim();
@@ -1759,16 +1883,15 @@ async function spotifyPool(seeds, targetSec = 0, targets = null, onProgress = nu
   await fetchNames(seedNames, "seed artists", { seedWeight: true });
   await fillFromTempoCatalog("Stamping tempos from BPM catalog");
 
-  const pending = [];
-  const pendingSet = new Set();
-  const enqueueName = (nm) => {
+  const nameQueue = makeScoredQueue();
+  const genreTried = new Set();
+  const enqueueName = (nm, pts = 1) => {
     const name = String(nm || "").trim();
     if (!name) return;
     const k = name.toLowerCase();
-    if (doneNames.has(k) || pendingSet.has(k)) return;
+    if (doneNames.has(k)) return;
     knownNames.set(k, name);
-    pendingSet.add(k);
-    pending.push(name);
+    nameQueue.add(k, pts, name);
   };
   let expandFrom = [...seedNames];
 
@@ -1778,33 +1901,65 @@ async function spotifyPool(seeds, targetSec = 0, targets = null, onProgress = nu
     if (need.canFill) break;
     if (stopNow()) break;
     if (doneNames.size >= ARTIST_CAP || candidates.length >= TRACK_CAP) break;
-    if (!LASTFM_KEY) break;
 
     const shortNote = (need.byCadence || []).filter((c) => c.short > 30)
       .map((c) => `${c.cadence}spm`).slice(0, 3).join(", ");
     report("expand", {
       detail: shortNote
-        ? `Ring ${level} · still short on ${shortNote} · queue ${pending.length}`
-        : `Gathering songs · related artists ring ${level} · queue ${pending.length}`,
+        ? `Ring ${level} · still short on ${shortNote} · queue ${nameQueue.size()}`
+        : `Gathering songs · related artists ring ${level} · queue ${nameQueue.size()}`,
       level,
-      pendingQueue: pending.length,
+      pendingQueue: nameQueue.size(),
     });
 
-    if (expandFrom.length) {
+    if (LASTFM_KEY && expandFrom.length) {
       const lists = await mapLimit(
         expandFrom.slice(0, 80),
         8,
         (n) => lastfmSimilar(n, level <= 2 ? 50 : 35),
       );
-      for (const names of lists) for (const nm of names) enqueueName(nm);
+      for (const rows of lists) {
+        for (const row of rows || []) {
+          const pts = 0.6 + Math.min(1.4, (row.match || 0) * 1.4);
+          enqueueName(row.name, pts);
+        }
+      }
     }
 
-    const batch = [];
-    while (batch.length < POOL_RING_BATCH && pending.length && doneNames.size + batch.length < ARTIST_CAP) {
-      const nm = pending.shift();
-      pendingSet.delete(nm.toLowerCase());
-      if (nm && !doneNames.has(nm.toLowerCase())) batch.push(nm);
+    // Genre-overlap fan-out via Last.fm tags + Spotify genre search.
+    if (doneNames.size < ARTIST_CAP && (level === 1 || (level >= 4 && level % 4 === 0))) {
+      const genres = topGenresFromCandidates(candidates, {
+        artistIds: level === 1 ? [...seedIdByName.values()] : [],
+        artistNames: level === 1 ? seedNames : [],
+        limit: level === 1 ? 6 : 4,
+      }).filter((g) => !genreTried.has(g));
+      for (const g of genres) genreTried.add(g);
+      if (genres.length) {
+        report("similar", {
+          detail: `Genre fan-out · ${genres.slice(0, 3).join(", ")}${genres.length > 3 ? "…" : ""}`,
+          level,
+        });
+        if (LASTFM_KEY) {
+          const tagLists = await mapLimit(genres, 4, (g) => lastfmTagTopArtists(g, level <= 2 ? 35 : 25));
+          for (const names of tagLists) {
+            for (const nm of names || []) enqueueName(nm, 0.85);
+          }
+        }
+        const spotLists = await mapLimit(genres, 3, (g) => spotifyArtistsByGenre(g, 15));
+        for (const arts of spotLists) {
+          for (const a of arts || []) {
+            if (a?.name) {
+              if (a.id) seedIdByName.set(a.name.toLowerCase(), a.id);
+              enqueueName(a.name, 1.0);
+            }
+          }
+        }
+      }
     }
+
+    const batch = nameQueue
+      .take(POOL_RING_BATCH, { skip: (k) => doneNames.has(k) })
+      .map((r) => r.name);
     if (!batch.length) break;
 
     await fetchNames(batch, `related artists · ring ${level}`);
@@ -1821,13 +1976,10 @@ async function spotifyPool(seeds, targetSec = 0, targets = null, onProgress = nu
   if (!userStop() && !poolNeed(targetSec, targets, candidates).canFill) {
     await ingestTempoFill("Importing songs at your target tempos");
   }
-  if (!userStop() && !poolNeed(targetSec, targets, candidates).canFill && !hardStop() && pending.length && doneNames.size < ARTIST_CAP) {
-    const extra = [];
-    while (extra.length < POOL_RING_BATCH && pending.length && doneNames.size + extra.length < ARTIST_CAP) {
-      const nm = pending.shift();
-      pendingSet.delete(nm.toLowerCase());
-      if (nm && !doneNames.has(nm.toLowerCase())) extra.push(nm);
-    }
+  if (!userStop() && !poolNeed(targetSec, targets, candidates).canFill && !hardStop() && nameQueue.size() && doneNames.size < ARTIST_CAP) {
+    const extra = nameQueue
+      .take(POOL_RING_BATCH, { skip: (k) => doneNames.has(k) })
+      .map((r) => r.name);
     if (extra.length) {
       report("expand", { detail: `Final expansion · ${extra.length} more related artists`, level: currentLevel + 1 });
       await fetchNames(extra, "final related artists");
@@ -2096,8 +2248,12 @@ const server = http.createServer(async (req, res) => {
       if (!LASTFM_KEY) return sendJSON(res, 200, { error: "LASTFM_API_KEY not set" });
       const artist = url.searchParams.get("artist") || "";
       if (!artist) return sendJSON(res, 400, { error: "add ?artist=..." });
-      const names = await lastfmSimilar(artist, 20);
-      return sendJSON(res, 200, { similarCount: names.length, similar: names.slice(0, 15) });
+      const rows = await lastfmSimilar(artist, 20);
+      return sendJSON(res, 200, {
+        similarCount: rows.length,
+        similar: rows.slice(0, 15).map((r) => r.name),
+        scored: rows.slice(0, 15),
+      });
     }
     // static
     const file = url.pathname === "/" ? "paceBeat.html" : url.pathname.slice(1);
