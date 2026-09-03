@@ -556,7 +556,7 @@ function autofillZones(){
 $("#autofillZones").onclick=autofillZones;
 function renderCal(){const tb=$("#calTable tbody");tb.innerHTML="";state.cal.forEach((c,i)=>{const tr=document.createElement("tr");tr.innerHTML=`<td style="font-family:var(--mono);color:var(--pace);padding-left:4px">${c.zone||"—"}</td><td><input data-k="pace" data-i="${i}" value="${c.pace}" inputmode="numeric"/></td><td><input data-k="cadence" data-i="${i}" value="${c.cadence}" inputmode="numeric"/></td><td style="font-family:var(--mono);color:var(--muted);text-align:center">${c.n?c.n:"est"}</td><td><button class="row-x" data-del-cal="${i}">×</button></td>`;tb.appendChild(tr);});}
 const zoneAnchorFor=(name)=>state.cal.find(a=>a.zone===name);
-function renderSegs(){const tb=$("#segTable tbody");tb.innerHTML="";const zoneOpts=(sel)=>state.zones.map(z=>`<option value="${z.name}"${z.name===sel?" selected":""}>${z.name}</option>`).join("");state.segs.forEach((s,i)=>{const tr=document.createElement("tr");let col3;if(state.planMode==="zone"){const zsel=s.zone||state.zones[2]?.name;const a=zoneAnchorFor(zsel);const cad=a?`→ ${a.cadence} spm`:"no data — import runs";col3=`<td><select data-sk="zone" data-i="${i}" style="text-align:center">${zoneOpts(zsel)}</select><div style="font-size:10.5px;color:var(--pace);text-align:center;margin-top:3px;font-family:var(--mono)">${cad}</div></td>`;}else{col3=`<td><input data-sk="pace" data-i="${i}" value="${s.pace||"8:40"}" inputmode="numeric"/></td>`;}tr.innerHTML=`<td><input data-sk="startMile" data-i="${i}" value="${s.startMile}" inputmode="decimal"/></td><td><input data-sk="endMile" data-i="${i}" value="${s.endMile}" inputmode="decimal"/></td>${col3}<td><button class="row-x" data-del-seg="${i}">×</button></td>`;tb.appendChild(tr);});}
+function renderSegs(){const tb=$("#segTable tbody");tb.innerHTML="";const zoneOpts=(sel)=>state.zones.map(z=>`<option value="${z.name}"${z.name===sel?" selected":""}>${z.name}</option>`).join("");const cc=constantCadence();state.segs.forEach((s,i)=>{const tr=document.createElement("tr");let col3;if(state.planMode==="zone"){const zsel=s.zone||state.zones[2]?.name;const cad=`→ ${cc} spm`;col3=`<td><select data-sk="zone" data-i="${i}" style="text-align:center">${zoneOpts(zsel)}</select><div style="font-size:10.5px;color:var(--pace);text-align:center;margin-top:3px;font-family:var(--mono)">${cad}</div></td>`;}else{col3=`<td><input data-sk="pace" data-i="${i}" value="${s.pace||"8:40"}" inputmode="numeric"/></td>`;}tr.innerHTML=`<td><input data-sk="startMile" data-i="${i}" value="${s.startMile}" inputmode="decimal"/></td><td><input data-sk="endMile" data-i="${i}" value="${s.endMile}" inputmode="decimal"/></td>${col3}<td><button class="row-x" data-del-seg="${i}">×</button></td>`;tb.appendChild(tr);});}
 function setPlanMode(m){state.planMode=m;document.querySelectorAll("#planMode button").forEach(b=>b.setAttribute("aria-pressed",b.dataset.pm===m));$("#segCol3").textContent=m==="zone"?"Zone":"Pace /mi";state.segs.forEach(s=>{if(m==="zone"&&!s.zone)s.zone=state.zones[2]?.name||"Z3";if(m==="pace"&&!s.pace)s.pace="8:40";});renderSegs();}
 document.querySelectorAll("#planMode button").forEach(b=>b.onclick=()=>setPlanMode(b.dataset.pm));
 document.addEventListener("input",(e)=>{const t=e.target;if(t.dataset.k!=null){state.cal[+t.dataset.i][t.dataset.k]=t.value;saveCal();}if(t.dataset.z!=null){state.zones[+t.dataset.i][t.dataset.z]=+t.value;saveCal();}if(t.dataset.sk!=null){state.segs[+t.dataset.i][t.dataset.sk]=t.value;if(t.dataset.sk==="zone")renderSegs();}if(t.id==="tol"){state.tol=+t.value;$("#tolVal").textContent="±"+t.value;}});
@@ -607,30 +607,36 @@ function toggleMode(id,key){const el=$(id);el.onclick=()=>{state.modes[key]=!sta
 toggleMode("#mDirect","direct");toggleMode("#mHalf","half");
 const cadColor=(cad)=>{const t=Math.max(0,Math.min(1,(cad-162)/26));const a=[12,102,228],b=[130,112,219];return`rgb(${a.map((v,i)=>Math.round(v+(b[i]-v)*t)).join(",")})`;};
 
-function plannedCadences(){
-  const cadenceModel=makeCadenceModel(state.cal);
-  const zoneAnchor=(name)=>zoneAnchorFor(name)||state.cal[0]||{pace:"9:00",cadence:165};
-  const out=[];
-  for(const seg of state.segs){
-    if(state.planMode==="zone")out.push(+zoneAnchor(seg.zone).cadence);
-    else out.push(+cadenceModel(seg.pace||"9:00"));
+function constantCadence(){
+  const entries=Array.isArray(state.cal)?state.cal:[];
+  const withCad=entries.filter(e=>+(e?.cadence||0)>0);
+  if(!withCad.length)return 165;
+  // If Garmin imported sample counts, weight by `n` so real data dominates.
+  const hasN=withCad.some(e=>+(e?.n||0)>0);
+  if(hasN){
+    const sum=withCad.reduce((s,e)=>s+(+e.cadence)*Math.max(1,+e.n||0),0);
+    const w=withCad.reduce((s,e)=>s+Math.max(1,+e.n||0),0);
+    return Math.round(sum/Math.max(1,w));
   }
-  return[...new Set(out.filter((c)=>c>0))];
+  const avg=withCad.reduce((s,e)=>s+(+e.cadence),0)/withCad.length;
+  return Math.round(avg);
+}
+
+function plannedCadences(){
+  return [constantCadence()];
 }
 /** Seconds of music required per cadence band (segments sharing a cadence are summed). */
 function plannedCadenceNeeds(){
-  const cadenceModel=makeCadenceModel(state.cal);
   const zoneAnchor=(name)=>zoneAnchorFor(name)||state.cal[0]||{pace:"9:00",cadence:165};
+  const cadence=constantCadence();
   const byCad=new Map();
   for(const seg of state.segs){
-    let cadence, paceSec;
+    let paceSec;
     if(state.planMode==="zone"){
       const a=zoneAnchor(seg.zone);
       paceSec=paceToSeconds(a.pace);
-      cadence=Math.round(+a.cadence);
     }else{
       paceSec=paceToSeconds(seg.pace||"9:00");
-      cadence=Math.round(+cadenceModel(seg.pace||"9:00"));
     }
     if(!(cadence>0))continue;
     const sec=Math.max(0,(+seg.endMile-+seg.startMile))*paceSec;
@@ -640,10 +646,10 @@ function plannedCadenceNeeds(){
 }
 function packOpts(extra={}){
   const modes=Object.entries(state.modes).filter(([,v])=>v).map(([k])=>k);
-  const cadenceModel=makeCadenceModel(state.cal);
+  const cadenceModel=()=>constantCadence();
   const zoneAnchor=(name)=>zoneAnchorFor(name)||state.cal[0]||{pace:"9:00",cadence:165};
   const resolveSegment=state.planMode==="zone"
-    ? (seg)=>{const a=zoneAnchor(seg.zone);return{paceSec:paceToSeconds(a.pace),cadence:+a.cadence,label:seg.zone};}
+    ? (seg)=>{const a=zoneAnchor(seg.zone);return{paceSec:paceToSeconds(a.pace),cadence:constantCadence(),label:seg.zone};}
     : undefined;
   return{cadenceModel,tol:state.tol,modes,allowRepeats:state.repeat,resolveSegment,excludedIds:excludedIds,...extra};
 }
