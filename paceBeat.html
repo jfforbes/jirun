@@ -104,6 +104,11 @@
   .track .rm:hover{color:var(--warn);background:var(--surface-2)}
   .tag{font-family:var(--mono);font-size:10.5px;padding:2px 7px;border-radius:3px;white-space:nowrap;font-weight:700}
   .tag.half{color:var(--pace);background:var(--chip)}.tag.direct{color:var(--chip-direct);background:var(--chip-direct-bg)}
+  .tag.manual{color:var(--muted);background:var(--surface-2)}
+  .add-track{margin-top:10px;position:relative}
+  .add-track .addrow{margin-top:0}
+  .add-track .searchwrap{margin-top:8px}
+  .add-track .results .r .meta{font-size:11px;color:var(--muted);white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
   .dur{font-family:var(--mono);font-size:11px;color:var(--muted);text-align:right}
   .note{font-size:12px;color:var(--warn);margin-top:10px;font-weight:600}
   .empty{color:var(--muted);font-size:13px;text-align:center;padding:24px 8px}
@@ -150,7 +155,7 @@
       <div class="conn off" id="connStatus" style="margin-top:2px">Checking login…</div>
       <button class="btn" id="loginBtn" style="display:none">Log in</button>
       <button class="btn" id="logoutBtn" style="display:none">Log out</button>
-      <div class="hint" style="margin-top:8px">One-time login through the local bridge. Playlists land in whichever service you're logged into. Tidal artist search uses catalog lookup (paste a tidal.com/artist/… link if typeahead misses).</div>
+      <div class="hint" style="margin-top:8px">One-time login through the local bridge. Playlists land in whichever service you're logged into.</div>
     </div>
     <p class="eyebrow" style="margin-top:14px">Backlog <span class="seedcount" id="seedCount">0</span></p>
     <div class="searchwrap">
@@ -193,7 +198,7 @@
     <p class="eyebrow">Automation · match rules</p>
     <div class="controls">
       <label>Tolerance <span class="rowval" id="tolVal">±3</span> bpm
-        <input type="range" id="tol" min="1" max="12" value="3" style="padding:0;height:28px" /></label>
+        <input type="range" id="tol" min="0" max="12" value="3" style="padding:0;height:28px" /></label>
       <label>Sync
         <div class="seg-modes">
           <span class="chip" id="mDirect" aria-pressed="true" role="button" tabindex="0">Direct</span>
@@ -221,7 +226,9 @@ function keepMatchedTracksBySeg(plan,opts){
   const excluded=excludedIds instanceof Set?excludedIds:new Set(excludedIds||[]);
   return plan.map((p)=>p.tracks.filter((t)=>{
     const k=trackKey(t);
-    if(!k||excluded.has(k)||t.bpm==null)return false;
+    if(!k||excluded.has(k))return false;
+    if(t.manual)return true;
+    if(t.bpm==null)return false;
     return !!bpmMatch(t.bpm,p.cadence,tol,modes);
   }));
 }
@@ -332,6 +339,24 @@ let LOGGEDIN=false, HEALTH={};
 const api={
   async health(){try{const r=await fetch("/api/health");HEALTH=await r.json();LOGGEDIN=!!(HEALTH[state.service]?.loggedIn);return HEALTH;}catch(e){HEALTH={};LOGGEDIN=false;return{ok:false,error:e.message};}},
   async search(q){const r=await fetch(`/api/search?service=${state.service}&q=${encodeURIComponent(q)}`);const j=await r.json();if(!r.ok)throw new Error(j.error||r.status);return j;},
+  async searchTracks(q){const r=await fetch(`/api/search-tracks?service=${state.service}&q=${encodeURIComponent(q)}`);const j=await r.json();if(!r.ok)throw new Error(j.error||r.status);return Array.isArray(j)?j:(j.tracks||[]);},
+  async trackBpm(track){
+    const r=await fetch(`/api/track-bpm`,{
+      method:"POST",
+      headers:{"Content-Type":"application/json"},
+      body:JSON.stringify({
+        service:state.service,
+        artist:track?.artist||"",
+        title:track?.title||"",
+        isrc:track?.isrc||null,
+        trackId:track?.id||track?.ref||null,
+        ref:track?.ref||track?.id||null,
+      }),
+    });
+    const j=await r.json().catch(()=>({}));
+    if(!r.ok)throw new Error(j.error||r.status);
+    return j;
+  },
   async pool(seeds,targetSec,targets,onProgress){
     let r;
     try{r=await fetch(`/api/pool`,{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify({service:state.service,targetSec:targetSec||0,targets:targets||null,seeds:seeds.map(s=>({id:s.id,name:s.name||s.title||""}))})});}
@@ -484,7 +509,7 @@ async function runSearch(q){
   try{hits=await api.search(q);}
   catch(err){currentHits=[];box.hidden=false;box.innerHTML=`<div class="empty">Search error: ${err.message}</div>`;return;}
   currentHits=hits;hlIndex=-1;
-  if(!hits.length){box.hidden=false;box.innerHTML=`<div class="empty">No matches for "${q}". Try the full name, or paste a Tidal artist URL.</div>`;return;}
+  if(!hits.length){box.hidden=false;box.innerHTML=`<div class="empty">No matches for "${q}". Try another spelling.</div>`;return;}
   renderResultsList();
 }
 $("#search").addEventListener("keydown",(e)=>{
@@ -869,6 +894,102 @@ function removeTrack(segIdx,trackIdx){
   lastPlaylist=lastResult.plan.flatMap((p)=>p.tracks);
   renderResults(lastResult);
 }
+function refreshPlanTotals(){
+  if(!lastResult)return;
+  for(const p of lastResult.plan){
+    p.filledSec=p.tracks.reduce((s,x)=>s+(x.durationSec||210),0);
+    p.shortfallSec=Math.max(0,p.segDuration-p.filledSec);
+  }
+  lastResult.totalFilledSec=lastResult.plan.reduce((s,p)=>s+p.filledSec,0);
+  lastResult.trackCount=lastResult.plan.reduce((n,p)=>n+p.tracks.length,0);
+  lastPlaylist=lastResult.plan.flatMap((p)=>p.tracks);
+}
+function matchTagHtml(t){
+  if(t.matchMode==="manual")return`<span class="tag manual">manual</span>`;
+  if(t.matchMode==="half")return`<span class="tag half">½× ${t.matchTarget}</span>`;
+  return`<span class="tag direct">→ ${t.matchTarget}</span>`;
+}
+let addTrackSeg=null, addTrackHits=[], addTrackHl=-1, addTrackTimer=null;
+function closeAddTrackPanel(){
+  addTrackSeg=null;addTrackHits=[];addTrackHl=-1;
+  clearTimeout(addTrackTimer);
+}
+async function addManualTrack(segIdx,track){
+  if(!lastResult?.plan?.[segIdx]||!track)return;
+  const k=trackKey(track);
+  if(k&&lastPlaylist.some((t)=>trackKey(t)===k)&&!state.repeat){
+    alert("That song is already on this playlist.");
+    return;
+  }
+  if(k)excludedIds.delete(k);
+  let bpm=track.bpm!=null?Number(track.bpm):null;
+  try{
+    const j=await api.trackBpm(track);
+    if(j.bpm!=null)bpm=Number(j.bpm);
+  }catch(_){}
+  const cad=lastResult.plan[segIdx].cadence;
+  const modes=Object.entries(state.modes).filter(([,v])=>v).map(([k])=>k);
+  const m=bpm!=null?bpmMatch(bpm,cad,state.tol,modes):null;
+  const row={
+    ...track,
+    service:track.service||state.service,
+    bpm:bpm,
+    matchMode:m?.mode||"manual",
+    matchTarget:Math.round(m?.target||cad),
+    manual:true,
+  };
+  lastResult.plan[segIdx].tracks.push(row);
+  lastCandidates=mergeCandidates(lastCandidates,[row]);
+  refreshPlanTotals();
+  closeAddTrackPanel();
+  renderResults(lastResult);
+}
+function renderAddTrackHits(box){
+  if(!addTrackHits.length){box.hidden=true;return;}
+  box.hidden=false;
+  box.innerHTML=addTrackHits.map((t,i)=>{
+    const title=(t.title||"?").replace(/</g,"&lt;");
+    const art=(t.artist||"").replace(/</g,"&lt;");
+    const dur=t.durationSec?fmtClock(t.durationSec):"";
+    return`<div class="r${i===addTrackHl?" hl":""}" data-i="${i}"><div><div class="title">${title}</div><div class="meta">${art}${dur?` · ${dur}`:""}</div></div></div>`;
+  }).join("");
+  box.querySelectorAll(".r").forEach((el)=>{
+    el.addEventListener("mousedown",(ev)=>{
+      ev.preventDefault();
+      const hit=addTrackHits[+el.dataset.i];
+      if(hit!=null&&addTrackSeg!=null)addManualTrack(addTrackSeg,hit);
+    });
+  });
+}
+function wireAddTrackPanel(root){
+  const wrap=root.querySelector(".add-track-panel");
+  if(!wrap)return;
+  const input=wrap.querySelector("input");
+  const box=wrap.querySelector(".results");
+  const segIdx=+wrap.dataset.seg;
+  addTrackSeg=segIdx;
+  input.focus();
+  const run=async(q)=>{
+    if(!q.trim()){addTrackHits=[];addTrackHl=-1;box.hidden=true;return;}
+    if(!LOGGEDIN){box.hidden=false;box.innerHTML=`<div class="empty">Log in first.</div>`;return;}
+    try{
+      addTrackHits=await api.searchTracks(q);
+      addTrackHl=-1;
+      if(!addTrackHits.length){box.hidden=false;box.innerHTML=`<div class="empty">No songs for "${q.replace(/"/g,"&quot;")}".</div>`;return;}
+      renderAddTrackHits(box);
+    }catch(err){
+      addTrackHits=[];box.hidden=false;box.innerHTML=`<div class="empty">Search error: ${err.message}</div>`;
+    }
+  };
+  input.addEventListener("input",()=>{clearTimeout(addTrackTimer);addTrackTimer=setTimeout(()=>run(input.value),220);});
+  input.addEventListener("keydown",(e)=>{
+    if(e.key==="Escape"){closeAddTrackPanel();renderResults(lastResult);return;}
+    if(box.hidden||!addTrackHits.length)return;
+    if(e.key==="ArrowDown"){e.preventDefault();addTrackHl=Math.min(addTrackHl+1,addTrackHits.length-1);renderAddTrackHits(box);}
+    else if(e.key==="ArrowUp"){e.preventDefault();addTrackHl=Math.max(addTrackHl-1,0);renderAddTrackHits(box);}
+    else if(e.key==="Enter"&&addTrackHl>=0){e.preventDefault();addManualTrack(segIdx,addTrackHits[addTrackHl]);}
+  });
+}
 async function correctTrackBpm(segIdx,trackIdx){
   const t=lastResult?.plan?.[segIdx]?.tracks?.[trackIdx];
   if(!t)return;
@@ -894,14 +1015,17 @@ function renderResults(res){
   const segs=res.plan.map((p,si)=>{
     const tracks=p.tracks.length?p.tracks.map((t,ti)=>`<div class="track">
       <div><div class="title">${t.title}</div><div class="art">${t.artist||""}</div></div>
-      <div style="text-align:right"><span class="bpm">${t.bpm}</span> <span class="tag ${t.matchMode}">${t.matchMode==="half"?"½× "+t.matchTarget:"→ "+t.matchTarget}</span></div>
+      <div style="text-align:right"><span class="bpm">${t.bpm??"—"}</span> ${matchTagHtml(t)}</div>
       <div class="dur">${fmtClock(t.durationSec)}</div>
       <button type="button" class="edit" data-seg="${si}" data-track="${ti}" title="Correct BPM" aria-label="Correct BPM for ${t.title}">✎</button>
       <button type="button" class="rm" data-seg="${si}" data-track="${ti}" title="Remove from playlist" aria-label="Remove ${t.title}">×</button>
     </div>`).join("")
-      :`<div class="empty">No songs in band. Search again, widen tolerance, or allow repeats.</div>`;
-    const note=p.shortfallSec>30?`<div class="note">▲ short by ${fmtClock(p.shortfallSec)} — only ${fmtClock(p.filledSec)} of ${fmtClock(p.segDuration)} matched ~${Math.round(p.cadence)}spm. Remove songs you don't want, then Search again or Ship it again (backlog + playlist artists).${bpmHint}</div>`:"";
-    return`<section><div class="seg-head"><span class="miles">Miles ${p.segment.startMile}–${p.segment.endMile} <span style="color:var(--muted);font-weight:400">@ ${p.label}</span></span><span class="cad">${Math.round(p.cadence)} spm · need ${fmtClock(p.segDuration)}</span></div>${tracks}${note}</section>`;
+      :`<div class="empty">No songs in band. Add a song, Search again, widen tolerance, or allow repeats.</div>`;
+    const note=p.shortfallSec>30?`<div class="note">▲ short by ${fmtClock(p.shortfallSec)} — only ${fmtClock(p.filledSec)} of ${fmtClock(p.segDuration)} matched ~${Math.round(p.cadence)}spm. Remove songs you don't want, add songs, or Search again / Ship it again.${bpmHint}</div>`:"";
+    const addPanel=addTrackSeg===si
+      ?`<div class="add-track add-track-panel" data-seg="${si}"><div class="searchwrap"><input type="search" placeholder="Search a song to add…" autocomplete="off" /><div class="results" hidden></div></div><button type="button" class="addrow" data-cancel-add="${si}" style="margin-top:8px">Cancel</button></div>`
+      :`<div class="add-track"><button type="button" class="addrow" data-open-add="${si}">+ add song</button></div>`;
+    return`<section><div class="seg-head"><span class="miles">Miles ${p.segment.startMile}–${p.segment.endMile} <span style="color:var(--muted);font-weight:400">@ ${p.label}</span></span><span class="cad">${Math.round(p.cadence)} spm · need ${fmtClock(p.segDuration)}</span></div>${tracks}${addPanel}${note}</section>`;
   }).join("");
   const canExport=LOGGEDIN&&lastPlaylist.some(t=>t.ref||t.id);
   const plArtists=artistsFromPlaylist(lastPlaylist);
@@ -932,8 +1056,15 @@ function renderResults(res){
   $("#results-area").querySelectorAll(".edit").forEach((btn)=>{
     btn.onclick=()=>correctTrackBpm(+btn.dataset.seg,+btn.dataset.track);
   });
+  $("#results-area").querySelectorAll("[data-open-add]").forEach((btn)=>{
+    btn.onclick=()=>{addTrackSeg=+btn.dataset.openAdd;addTrackHits=[];addTrackHl=-1;renderResults(lastResult);};
+  });
+  $("#results-area").querySelectorAll("[data-cancel-add]").forEach((btn)=>{
+    btn.onclick=()=>{closeAddTrackPanel();renderResults(lastResult);};
+  });
+  if(addTrackSeg!=null)wireAddTrackPanel($("#results-area"));
   const again=$("#searchAgainBtn");
-  if(again)again.onclick=()=>runPoolSearch({keepMatchedOnly:true,includePlaylistArtists:true,includeSeeds:true});
+  if(again)again.onclick=()=>{closeAddTrackPanel();runPoolSearch({keepMatchedOnly:true,includePlaylistArtists:true,includeSeeds:true});};
   const exportNameInput=$("#exportName");
   if(exportNameInput){
     exportNameInput.oninput=()=>{playlistExportName=exportNameInput.value;};

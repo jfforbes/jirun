@@ -815,16 +815,145 @@ async function externalArtistNames(query, limit = 8) {
   return [];
 }
 /**
- * Tidal OpenAPI /v2/searchResults/{id} currently 400s with INVALID_RESOURCE_ID for many
- * third-party apps (see tidal-music/discussions/366). Classic v1 wants legacy r_usr.
- * Work around by resolving artists via handle/id and external name search.
+ * Tidal retired free-text /searchResults/{query} (400 INVALID_RESOURCE_ID).
+ * Prefer /searchSuggestions with filter[query] + include=directHits, then path form.
+ */
+async function tidalFetchSearchSuggestions(query, { debugLog = null } = {}) {
+  const q = (query || "").trim();
+  if (!q) return null;
+  const enc = encodeURIComponent(q);
+  const paths = [
+    `/searchSuggestions?filter[query]=${enc}&countryCode=${COUNTRY}&include=directHits`,
+    `/searchSuggestions/${enc}?countryCode=${COUNTRY}&include=directHits`,
+  ];
+  const getters = [];
+  try { await accessToken("tidal"); getters.push({ kind: "user", get: tapi }); } catch (e) {
+    if (debugLog) debugLog.push({ via: "suggestions/auth-user", error: String(e.message || e) });
+  }
+  getters.push({ kind: "catalog", get: tapiCatalog });
+  for (const { kind, get } of getters) {
+    for (const path of paths) {
+      try {
+        const payload = await get(path);
+        if (debugLog) {
+          const hits = payload?.data?.relationships?.directHits?.data || [];
+          debugLog.push({
+            via: `suggestions/${kind}`,
+            path: path.slice(0, 80),
+            directHits: Array.isArray(hits) ? hits.length : 0,
+            included: Array.isArray(payload?.included) ? payload.included.length : 0,
+          });
+        }
+        if (payload) return payload;
+      } catch (e) {
+        if (debugLog) debugLog.push({ via: `suggestions/${kind}`, path: path.slice(0, 80), error: String(e.message || e) });
+      }
+    }
+  }
+  return null;
+}
+function tidalSuggestionRefs(payload, type) {
+  const out = [];
+  const seen = new Set();
+  const push = (id) => {
+    const sid = id != null ? String(id) : "";
+    if (!sid || seen.has(sid)) return;
+    seen.add(sid);
+    out.push(sid);
+  };
+  const fromRel = payload?.data?.relationships?.directHits?.data;
+  if (Array.isArray(fromRel)) {
+    for (const ref of fromRel) {
+      if (ref?.type === type && ref.id != null) push(ref.id);
+    }
+  }
+  for (const x of payload?.included || []) {
+    if (x?.type === type && x.id != null) push(x.id);
+  }
+  return out;
+}
+async function tidalArtistsFromSuggestions(payload) {
+  if (!payload) return [];
+  const extracted = tidalExtractArtists(payload);
+  const fromHits = tidalSuggestionRefs(payload, "artists").map((id) => {
+    const hit = extracted.find((a) => String(a.id) === String(id));
+    return hit || { id: String(id), name: "" };
+  });
+  const merged = [];
+  for (const a of [...fromHits, ...extracted]) {
+    if (!a?.id) continue;
+    if (!merged.some((x) => String(x.id) === String(a.id))) merged.push({ id: String(a.id), name: a.name || "" });
+  }
+  return (await tidalHydrateArtistNames(merged)).filter((a) => a.name && a.name !== "?");
+}
+async function tidalTracksFromSuggestions(payload) {
+  if (!payload) return [];
+  const included = payload.included || [];
+  const byId = new Map();
+  for (const x of included) {
+    if (x?.type === "tracks" && x.id) byId.set(String(x.id), tidalMapTrack(x, included));
+  }
+  const ids = tidalSuggestionRefs(payload, "tracks");
+  const missing = ids.filter((id) => !byId.has(String(id)));
+  if (missing.length) {
+    for (let i = 0; i < missing.length; i += 20) {
+      const chunk = missing.slice(i, i + 20);
+      try {
+        const j = await tapiCatalog(`/tracks?filter[id]=${chunk.join(",")}&countryCode=${COUNTRY}&include=artists,genres`);
+        for (const tr of j.data || []) {
+          if (tr?.type === "tracks" && tr.id) byId.set(String(tr.id), tidalMapTrack(tr, j.included || []));
+        }
+      } catch (_) {
+        try {
+          const j = await tapi(`/tracks?filter[id]=${chunk.join(",")}&countryCode=${COUNTRY}&include=artists,genres`);
+          for (const tr of j.data || []) {
+            if (tr?.type === "tracks" && tr.id) byId.set(String(tr.id), tidalMapTrack(tr, j.included || []));
+          }
+        } catch (_) {}
+      }
+    }
+  }
+  const ordered = [];
+  for (const id of ids) {
+    const t = byId.get(String(id));
+    if (t) ordered.push(t);
+  }
+  if (!ordered.length) return [...byId.values()].slice(0, 10);
+  return ordered.slice(0, 10);
+}
+/** Accept pasted Tidal track URLs or bare numeric ids when query looks like an id. */
+function tidalParseTrackRef(q) {
+  const s = String(q || "").trim();
+  if (!s) return null;
+  const url = s.match(/(?:tidal\.com|listen\.tidal\.com)\/(?:browse\/)?track\/(\d+)/i);
+  if (url) return url[1];
+  return null;
+}
+async function tidalTrackById(id) {
+  if (!id) return null;
+  for (const getter of [tapiCatalog, tapi]) {
+    try {
+      const j = await getter(`/tracks/${encodeURIComponent(id)}?countryCode=${COUNTRY}&include=artists,genres`);
+      const tr = j?.data;
+      if (tr?.type === "tracks" && tr.id) return tidalMapTrack(tr, j.included || []);
+    } catch (_) {}
+  }
+  try {
+    const j = await tapiCatalog(`/tracks?filter[id]=${encodeURIComponent(id)}&countryCode=${COUNTRY}&include=artists,genres`);
+    const tr = (j.data || []).find((x) => x?.type === "tracks" && String(x.id) === String(id));
+    if (tr) return tidalMapTrack(tr, j.included || []);
+  } catch (_) {}
+  return null;
+}
+/**
+ * Artist search: pasted URL → searchSuggestions → handle → external names → legacy searchResults.
  */
 async function tidalSearchArtists(q, { debug = false } = {}) {
   const query = (q || "").trim();
-  if (query.length < 1) return debug ? { artists: [], debug: [], build: "search-ext-72cc" } : [];
+  if (query.length < 1) return debug ? { artists: [], debug: [], build: "search-suggestions-72cc" } : [];
   const enc = encodeURIComponent(query);
   const debugLog = [];
-  const done = (artists) => (debug ? { artists, debug: debugLog, build: "search-ext-72cc" } : artists);
+  const done = (artists) => (debug ? { artists, debug: debugLog, build: "search-suggestions-72cc" } : artists);
   const finish = async (payload, via) => {
     const extracted = tidalExtractArtists(payload || {});
     const out = (await tidalHydrateArtistNames(extracted)).filter((a) => a.name && a.name !== "?");
@@ -849,7 +978,17 @@ async function tidalSearchArtists(q, { debug = false } = {}) {
     }
   }
 
-  // 1) Direct handle for the typed query (fast path for names like "underoath")
+  // 1) Native searchSuggestions (replacement for retired searchResults)
+  try {
+    const suggestions = await tidalFetchSearchSuggestions(query, { debugLog: debug ? debugLog : null });
+    const fromSug = await tidalArtistsFromSuggestions(suggestions);
+    if (debug) debugLog.push({ via: "suggestions/artists", named: fromSug.length, sample: fromSug.slice(0, 3) });
+    if (fromSug.length) return done(fromSug.slice(0, 10));
+  } catch (e) {
+    if (debug) debugLog.push({ via: "suggestions/artists", error: String(e.message || e) });
+  }
+
+  // 2) Direct handle for the typed query (fast path for names like "underoath")
   try {
     const byHandle = await tidalArtistsByHandle(query);
     if (debug) debugLog.push({ via: "handle/query", handle: tidalNameToHandle(query), named: byHandle.length, sample: byHandle.slice(0, 3) });
@@ -858,8 +997,7 @@ async function tidalSearchArtists(q, { debug = false } = {}) {
     if (debug) debugLog.push({ via: "handle/query", error: String(e.message || e) });
   }
 
-  // 2) External fuzzy name search → resolve each candidate on Tidal by handle
-  //    (bypasses broken searchResults; see github.com/orgs/tidal-music/discussions/366)
+  // 3) External fuzzy name search → resolve each candidate on Tidal by handle
   if (query.length >= 2) {
     try {
       const names = await externalArtistNames(query, 10);
@@ -886,8 +1024,7 @@ async function tidalSearchArtists(q, { debug = false } = {}) {
     }
   }
 
-  // 3) Native OpenAPI search last — currently broken for many third-party apps, but
-  //    keep it so we pick it up automatically if Tidal fixes access.
+  // 4) Legacy searchResults last — usually 400 now, kept for auto-recovery if Tidal restores it
   const getters = [];
   try { await accessToken("tidal"); getters.push({ kind: "user", get: tapi }); } catch (e) {
     if (debug) debugLog.push({ via: "openapi/auth-user", error: String(e.message || e) });
@@ -913,6 +1050,34 @@ async function tidalSearchArtists(q, { debug = false } = {}) {
     } catch (e) {
       if (debug) debugLog.push({ via: `openapi/${kind}`, error: String(e.message || e) });
     }
+  }
+
+  return done([]);
+}
+async function tidalSearchTracks(q, { debug = false } = {}) {
+  const query = (q || "").trim();
+  if (query.length < 1) return debug ? { tracks: [], debug: [], build: "search-suggestions-72cc" } : [];
+  const debugLog = [];
+  const done = (tracks) => (debug ? { tracks, debug: debugLog, build: "search-suggestions-72cc" } : tracks);
+
+  const directId = tidalParseTrackRef(query);
+  if (directId) {
+    try {
+      const t = await tidalTrackById(directId);
+      if (debug) debugLog.push({ via: "direct-track-id", id: directId, named: t ? 1 : 0, sample: t ? [t] : [] });
+      if (t) return done([t]);
+    } catch (e) {
+      if (debug) debugLog.push({ via: "direct-track-id", error: String(e.message || e) });
+    }
+  }
+
+  try {
+    const suggestions = await tidalFetchSearchSuggestions(query, { debugLog: debug ? debugLog : null });
+    const tracks = await tidalTracksFromSuggestions(suggestions);
+    if (debug) debugLog.push({ via: "suggestions/tracks", named: tracks.length, sample: tracks.slice(0, 3) });
+    if (tracks.length) return done(tracks);
+  } catch (e) {
+    if (debug) debugLog.push({ via: "suggestions/tracks", error: String(e.message || e) });
   }
 
   return done([]);
@@ -1290,6 +1455,22 @@ async function spotifySearchArtists(q) {
   const j = await sapi(`/search?q=${encodeURIComponent(q)}&type=artist&limit=10`);
   return (j.artists?.items || []).map((a) => ({ id: a.id, name: a.name }));
 }
+async function spotifySearchTracks(q) {
+  const query = (q || "").trim();
+  if (!query) return [];
+  // Spotify open URLs / URIs
+  const uri = query.match(/spotify:track:([A-Za-z0-9]+)/i);
+  const url = query.match(/open\.spotify\.com\/track\/([A-Za-z0-9]+)/i);
+  const id = uri?.[1] || url?.[1] || null;
+  if (id) {
+    try {
+      const t = await sapi(`/tracks/${encodeURIComponent(id)}`);
+      return t?.id ? [spotifyMapTrack(t)] : [];
+    } catch (_) { /* fall through to text search */ }
+  }
+  const j = await sapi(`/search?q=${encodeURIComponent(query)}&type=track&limit=10`);
+  return (j.tracks?.items || []).map((t) => spotifyMapTrack(t));
+}
 const spotifyArtistIdCache = {};
 async function spotifyResolveArtist(name) {
   const k = (name || "").toLowerCase();
@@ -1623,6 +1804,7 @@ async function spotifyPlaylistArtists(id) {
 
 /* ============ dispatch ============ */
 const searchArtists = (svc, q) => (svc === "spotify" ? spotifySearchArtists(q) : tidalSearchArtists(q));
+const searchTracks = (svc, q) => (svc === "spotify" ? spotifySearchTracks(q) : tidalSearchTracks(q));
 const buildPool = (svc, seeds, targetSec, targets, onProgress) => (svc === "spotify" ? spotifyPool(seeds, targetSec, targets, onProgress) : tidalPool(seeds, targetSec, targets, onProgress));
 const createPlaylist = (svc, name, refs) => (svc === "spotify" ? spotifyCreatePlaylist(name, refs) : tidalCreatePlaylist(name, refs));
 const myPlaylists = (svc) => (svc === "spotify" ? spotifyMyPlaylists() : tidalMyPlaylists());
@@ -1673,6 +1855,29 @@ const server = http.createServer(async (req, res) => {
         return sendJSON(res, 200, await tidalSearchArtists(q, { debug: true }));
       }
       return sendJSON(res, 200, await searchArtists(svc, q));
+    }
+    if (url.pathname === "/api/search-tracks") {
+      const svc = url.searchParams.get("service") || "tidal";
+      const q = url.searchParams.get("q") || "";
+      if (!q.trim()) return sendJSON(res, 400, { error: "empty query" });
+      if (svc === "tidal" && url.searchParams.get("debug") === "1") {
+        return sendJSON(res, 200, await tidalSearchTracks(q, { debug: true }));
+      }
+      return sendJSON(res, 200, await searchTracks(svc, q));
+    }
+    if (url.pathname === "/api/track-bpm" && req.method === "POST") {
+      const body = await readBody(req);
+      const track = {
+        service: body?.service || "tidal",
+        artist: body?.artist || "",
+        title: body?.title || "",
+        isrc: body?.isrc || null,
+        id: body?.trackId || body?.id || null,
+        ref: body?.ref || body?.trackId || body?.id || null,
+      };
+      if (!track.title && !track.artist) return sendJSON(res, 400, { error: "artist/title required" });
+      const bpm = await bpmForTrack(track);
+      return sendJSON(res, 200, { ok: true, bpm, artist: track.artist, title: track.title });
     }
     if (url.pathname === "/api/pool" && req.method === "POST") {
       const body = await readBody(req);
