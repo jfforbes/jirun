@@ -123,6 +123,9 @@
   .legend{display:flex;gap:14px;font-size:11px;color:var(--muted);margin-top:6px;flex-wrap:wrap}
   a{color:var(--pace)}
   .pool-progress{padding:20px 8px 8px;text-align:center}
+  .pool-progress .stop-row{margin-top:14px;max-width:280px;margin-left:auto;margin-right:auto}
+  .pool-progress .stop-row .btn{margin-top:0}
+  .pool-progress .stop-hint{font-size:11px;color:var(--muted);margin-top:8px}
   .pool-progress .status{font-size:13px;color:var(--text);margin:0 0 14px;line-height:1.4}
   .pool-progress .bar{height:8px;border-radius:999px;background:var(--surface-2);border:1px solid var(--line);overflow:hidden;position:relative}
   .pool-progress .bar > i{display:block;height:100%;width:0%;border-radius:inherit;background:var(--pace);transition:width .35s ease}
@@ -345,10 +348,17 @@ const api={
     if(!r.ok)throw new Error(j.error||r.status);
     return j;
   },
-  async pool(seeds,targetSec,targets,onProgress){
+  async pool(seeds,targetSec,targets,onProgress,{signal}={}){
     let r;
-    try{r=await fetch(`/api/pool`,{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify({service:state.service,targetSec:targetSec||0,targets:targets||null,seeds:seeds.map(s=>({id:s.id,name:s.name||s.title||""}))})});}
-    catch(e){throw new Error("Lost connection to the local bridge while building the pool. Keep node server.mjs running, then try again.");}
+    try{r=await fetch(`/api/pool`,{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify({service:state.service,targetSec:targetSec||0,targets:targets||null,seeds:seeds.map(s=>({id:s.id,name:s.name||s.title||""}))}),signal});}
+    catch(e){
+      if(signal?.aborted){
+        const err=new Error("stopped");
+        err.code="aborted";
+        throw err;
+      }
+      throw new Error("Lost connection to the local bridge while building the pool. Keep node server.mjs running, then try again.");
+    }
     if(!r.ok){
       const j=await r.json().catch(()=>({}));
       throw new Error(j.error||r.status);
@@ -363,26 +373,66 @@ const api={
     }
     const reader=r.body.getReader();
     const decoder=new TextDecoder();
-    let buf="", candidates=null, err=null, poolMeta=null;
-    while(true){
-      const {done,value}=await reader.read();
-      if(done)break;
-      buf+=decoder.decode(value,{stream:true});
-      let nl;
-      while((nl=buf.indexOf("\n"))>=0){
-        const line=buf.slice(0,nl).trim();
-        buf=buf.slice(nl+1);
-        if(!line)continue;
-        let msg; try{msg=JSON.parse(line);}catch(_){continue;}
-        if(msg.type==="progress"){if(typeof onProgress==="function")onProgress(msg);}
-        else if(msg.type==="done"){candidates=Array.isArray(msg.candidates)?msg.candidates:[];poolMeta=msg.meta||null;}
-        else if(msg.type==="error"){err=msg.error||"pool failed";}
+    let buf="", latest=null, err=null, poolMeta=null, stopped=false;
+    const finishWith=(list,meta={},wasStopped=false)=>{
+      const out=Array.isArray(list)?list:[];
+      out.meta={
+        poolSize:out.length,
+        bpmHit:out.filter((t)=>t.bpm!=null).length,
+        bpmMiss:out.filter((t)=>t.bpm==null).length,
+        bpmHitRate:out.length?out.filter((t)=>t.bpm!=null).length/out.length:0,
+        stopped:!!wasStopped,
+        ...meta,
+        stopped:!!wasStopped||!!meta.stopped,
+      };
+      return out;
+    };
+    try{
+      while(true){
+        const {done,value}=await reader.read();
+        if(done)break;
+        buf+=decoder.decode(value,{stream:true});
+        let nl;
+        while((nl=buf.indexOf("\n"))>=0){
+          const line=buf.slice(0,nl).trim();
+          buf=buf.slice(nl+1);
+          if(!line)continue;
+          let msg; try{msg=JSON.parse(line);}catch(_){continue;}
+          if(msg.type==="progress"){if(typeof onProgress==="function")onProgress(msg);}
+          else if(msg.type==="snapshot"){
+            latest=Array.isArray(msg.candidates)?msg.candidates:latest;
+            if(typeof onProgress==="function"){
+              onProgress({
+                stage:"gather",
+                phase:"snapshot",
+                tracks:latest?.length||0,
+                detail:msg.stopped?"Stopping — keeping songs gathered so far…":undefined,
+                canStop:!!(latest&&latest.length),
+              });
+            }
+          }
+          else if(msg.type==="done"){
+            latest=Array.isArray(msg.candidates)?msg.candidates:(latest||[]);
+            poolMeta=msg.meta||null;
+            stopped=!!msg.stopped||!!msg.meta?.stopped;
+          }
+          else if(msg.type==="error"){err=msg.error||"pool failed";}
+        }
       }
+    }catch(e){
+      if(signal?.aborted){
+        if(!Array.isArray(latest)||!latest.length){
+          const empty=new Error("Stopped before any matching songs were found.");
+          empty.code="stopped-empty";
+          throw empty;
+        }
+        return finishWith(latest,poolMeta||{},true);
+      }
+      throw e;
     }
     if(err)throw new Error(err);
-    if(!Array.isArray(candidates))throw new Error("Pool ended without results — is the bridge still running?");
-    candidates.meta=poolMeta;
-    return candidates;
+    if(!Array.isArray(latest))throw new Error("Pool ended without results — is the bridge still running?");
+    return finishWith(latest,poolMeta||{},stopped);
   },
   async bpmCorrect(track,bpm){
     const r=await fetch(`/api/bpm-correct`,{
@@ -638,7 +688,8 @@ async function runPoolSearch({keepMatchedOnly=false,includePlaylistArtists=false
   const combined=mergeArtistSeeds(fromBacklog,fromPlaylist);
   if(!combined.length)return;
 
-  const loading=startLoading(area);
+  const abort=new AbortController();
+  const loading=startLoading(area,{onStop:()=>abort.abort()});
   const nPl=fromPlaylist.length,nSeed=fromBacklog.length;
   if(includePlaylistArtists&&nPl){
     loading.update({stage:"gather",phase:"resolve",pct:3,detail:`Resolving ${combined.length} artists (${nSeed} backlog + ${nPl} from playlist)…`});
@@ -660,13 +711,30 @@ async function runPoolSearch({keepMatchedOnly=false,includePlaylistArtists=false
   });
   const targets={cadences:plannedCadences(),cadenceNeeds:plannedCadenceNeeds(),tol:state.tol,modes};
   let candidates;
-  try{candidates=await api.pool(seeds,plannedSeconds(),targets,loading.update);}
-  catch(e){loading.stop();area.innerHTML=`<section><div class="empty">Sprint blocked: ${e.message}</div></section>`;return;}
+  try{candidates=await api.pool(seeds,plannedSeconds(),targets,loading.update,{signal:abort.signal});}
+  catch(e){
+    loading.stop();
+    if(e.code==="stopped-empty"||e.code==="aborted"){
+      area.innerHTML=`<section><div class="empty">Stopped before any BPM-matched songs came back. Wait a bit longer next time, or add more seeds.</div></section>`;
+      if(lastResult)setTimeout(()=>renderResults(lastResult),1600);
+      return;
+    }
+    area.innerHTML=`<section><div class="empty">Sprint blocked: ${e.message}</div></section>`;
+    return;
+  }
   if(!candidates.length){loading.stop();area.innerHTML=`<section><div class="empty">No candidates with BPM came back. Add more seeds, widen tolerance, or check /api/bpmtest.</div></section>`;return;}
-  loading.update({stage:"pack",phase:"pack",pct:94,detail:keepMatchedOnly?"Keeping BPM-matched songs, then expanding…":"Building playlist from matched songs"});
+  const stoppedEarly=!!candidates.meta?.stopped;
+  loading.update({
+    stage:"pack",
+    phase:"pack",
+    pct:94,
+    detail:stoppedEarly
+      ?"Stopped early — building playlist from songs so far…"
+      :keepMatchedOnly?"Keeping BPM-matched songs, then expanding…":"Building playlist from matched songs",
+  });
   const keepBySeg=keepMatchedOnly&&lastResult?keepMatchedTracksBySeg(lastResult.plan,packOpts()):null;
   const res=buildPlaylist(state.segs,mergeCandidates(lastCandidates,candidates),packOpts({keepBySeg}));
-  loading.update({stage:"pack",phase:"pack",pct:100,detail:"Playlist ready"});
+  loading.update({stage:"pack",phase:"pack",pct:100,detail:stoppedEarly?"Playlist ready (stopped early)":"Playlist ready"});
   loading.stop();
   applyPlaylistResult(res,candidates);
   renderSeeds();
@@ -720,16 +788,31 @@ function poolProgressView(p){
   if(p?.elapsedSec!=null)bits.push(`${p.elapsedSec}s`);
   return {detail, pct, meta:bits.join(" · ")};
 }
-function startLoading(area){
+function startLoading(area,{onStop}={}){
   let view=poolProgressView({stage:"gather",pct:2,detail:"Starting playlist build"});
+  let canStop=false;
+  let stopping=false;
   const render=()=>{
     const indeterminate=view.pct==null;
     const width=indeterminate?"":`style="width:${view.pct}%"`;
+    const stopLabel=stopping?"Stopping…":canStop?"Stop & use playlist":"Stop when songs appear";
     area.innerHTML=`<section class="pool-progress" aria-live="polite">
       <p class="status">${view.detail}</p>
       <div class="bar${indeterminate?" indeterminate":""}" role="progressbar"${indeterminate?"":` aria-valuemin="0" aria-valuemax="100" aria-valuenow="${view.pct}"`}><i ${width}></i></div>
       <div class="meta">${view.meta||"Building your cadence-matched playlist"}</div>
+      <div class="stop-row">
+        <button type="button" class="btn secondary" id="stopPoolBtn"${canStop&&!stopping?"":" disabled"}>${stopLabel}</button>
+        <div class="stop-hint">${canStop?"Keep what we've found so far and build the playlist now.":"Waiting for the first BPM-matched songs…"}</div>
+      </div>
     </section>`;
+    const btn=$("#stopPoolBtn");
+    if(btn&&onStop)btn.onclick=()=>{
+      if(!canStop||stopping)return;
+      stopping=true;
+      view={...view,detail:"Stopping — building playlist from songs so far…",pct:Math.max(view.pct||0,88)};
+      render();
+      onStop();
+    };
   };
   render();
   return {
@@ -738,6 +821,9 @@ function startLoading(area){
       const next=poolProgressView(msg);
       if(view.pct!=null&&next.pct!=null&&next.pct<view.pct&&msg?.stage!=="pack")next.pct=view.pct;
       view=next;
+      if(msg?.phase==="snapshot"||msg?.canStop||msg?.stopped)canStop=true;
+      if(msg?.tracks>0&&msg?.phase!=="resolve"&&msg?.phase!=="start")canStop=true;
+      if(msg?.phase==="pack")canStop=false;
       render();
     },
     stop(){},

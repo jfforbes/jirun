@@ -1114,10 +1114,19 @@ const POOL_ARTIST_CAP = 2000;
 const POOL_TRACK_CAP = 10000;
 const POOL_MAX_LEVELS = 80;
 const POOL_RING_BATCH = 90; // artists fetched per ring from the pending queue
-async function tidalPool(seeds, targetSec = 0, targets = null, onProgress = null) {
+async function tidalPool(seeds, targetSec = 0, targets = null, onProgress = null, ctrl = null) {
   if (!GSB_KEY && !FREQBLOG_KEY) throw new Error("GETSONGBPM_API_KEY not set — add it to credentials.txt");
   const started = Date.now();
   const hardStop = () => Date.now() - started > POOL_BUDGET_MS;
+  const userStop = () => !!(ctrl && typeof ctrl.shouldStop === "function" && ctrl.shouldStop());
+  const stopNow = () => hardStop() || userStop();
+  let lastSnapLen = -1;
+  const snap = () => {
+    if (!ctrl || typeof ctrl.onSnapshot !== "function") return;
+    if (candidates.length === lastSnapLen) return;
+    lastSnapLen = candidates.length;
+    try { ctrl.onSnapshot(candidates); } catch (_) {}
+  };
   const seedList = seeds.map((s) => (typeof s === "string" ? { id: s, name: "" } : s));
   const seedIds = seedList.map((s) => String(s.id));
   const seedNames = seedList.map((s) => s.name).filter(Boolean);
@@ -1183,7 +1192,8 @@ async function tidalPool(seeds, targetSec = 0, targets = null, onProgress = null
     let i = 0;
     while (i < order.length) {
       if (!finishAll && poolNeed(targetSec, targets, candidates).canFill) break;
-      if (!finishAll && hardStop()) break;
+      if (!finishAll && stopNow()) break;
+      if (finishAll && userStop()) break;
       // Seed phase: keep going past the soft ceiling only briefly; still stop on absolute overrun.
       if (finishAll && Date.now() - started > POOL_BUDGET_MS * 1.5) break;
       const batch = order.slice(i, i + 24);
@@ -1210,10 +1220,13 @@ async function tidalPool(seeds, targetSec = 0, targets = null, onProgress = null
           if (!knownNames.has(k)) knownNames.set(k, t.artist);
         }
       }
+      snap();
       if (cacheDirty) saveBpmCache();
+      if (userStop()) break;
     }
   }
   async function fillFromTempoCatalog(detail) {
+    if (userStop()) return 0;
     if (!pendingByKey.size || poolNeed(targetSec, targets, candidates).canFill) return 0;
     report("bpm", { detail });
     const n = await stampBpmFromTempoCatalog(
@@ -1224,9 +1237,11 @@ async function tidalPool(seeds, targetSec = 0, targets = null, onProgress = null
       (p) => report("bpm", { detail: p.detail || detail, tempoBpm: p.tempoBpm }),
     );
     report("bpm", { detail: `Tempo catalog stamped ${n} tracks`, stamped: n });
+    snap();
     return n;
   }
   async function ingestTempoFill(detail) {
+    if (userStop()) return 0;
     if (poolNeed(targetSec, targets, candidates).canFill) return 0;
     report("bpm", { detail });
     const n = await ingestTempoCatalogTracks({
@@ -1252,9 +1267,11 @@ async function tidalPool(seeds, targetSec = 0, targets = null, onProgress = null
       maxTracks: 250,
     });
     report("bpm", { detail: `Imported ${n} tempo-matched tracks`, stamped: n });
+    snap();
     return n;
   }
   async function fetchArtists(ids, seedWeight, detail) {
+    if (userStop()) return [];
     const fresh = ids.filter((a) => a && !doneArtists.has(a));
     fresh.forEach((a) => doneArtists.add(a));
     if (!fresh.length) return [];
@@ -1267,7 +1284,8 @@ async function tidalPool(seeds, targetSec = 0, targets = null, onProgress = null
     for (const tl of trackLists) for (const id of tl) if (!allTrackIds.has(id)) { allTrackIds.add(id); newIds.push(id); }
     const meta = [];
     for (let i = 0; i < newIds.length; i += 20) {
-      if (!seedWeight && hardStop()) break;
+      if (!seedWeight && stopNow()) break;
+      if (userStop()) break;
       const chunk = newIds.slice(i, i + 20);
       try {
         const t = await tapi(`/tracks?filter[id]=${chunk.join(",")}&countryCode=${COUNTRY}&include=artists,genres`);
@@ -1281,6 +1299,7 @@ async function tidalPool(seeds, targetSec = 0, targets = null, onProgress = null
       report("tracks", { detail, trackMeta: meta.length, trackIds: newIds.length });
     }
     await enrichBpm(meta, detail, { finishAll: !!seedWeight });
+    snap();
     return fresh;
   }
   async function tidalSimilarIds(ids, detail) {
@@ -1329,7 +1348,7 @@ async function tidalPool(seeds, targetSec = 0, targets = null, onProgress = null
     const need = poolNeed(targetSec, targets, candidates);
     // Stop as soon as every cadence band can pack the run — don't grind for extra buffer.
     if (need.canFill) break;
-    if (hardStop()) break;
+    if (stopNow()) break;
     if (doneArtists.size >= ARTIST_CAP || allTrackIds.size >= TRACK_CAP) break;
 
     const shortNote = (need.byCadence || []).filter((c) => c.short > 30)
@@ -1403,11 +1422,11 @@ async function tidalPool(seeds, targetSec = 0, targets = null, onProgress = null
   }
 
   await fillFromTempoCatalog("Final tempo catalog pass");
-  if (!poolNeed(targetSec, targets, candidates).canFill) {
+  if (!userStop() && !poolNeed(targetSec, targets, candidates).canFill) {
     await ingestTempoFill("Importing songs at your target tempos");
   }
   // One more related-artist push if still short and we have queue/budget left.
-  if (!poolNeed(targetSec, targets, candidates).canFill && !hardStop() && pendingIds.length && doneArtists.size < ARTIST_CAP) {
+  if (!userStop() && !poolNeed(targetSec, targets, candidates).canFill && !hardStop() && pendingIds.length && doneArtists.size < ARTIST_CAP) {
     const extra = [];
     while (extra.length < POOL_RING_BATCH && pendingIds.length && doneArtists.size + extra.length < ARTIST_CAP) {
       const id = pendingIds.shift();
@@ -1421,15 +1440,19 @@ async function tidalPool(seeds, targetSec = 0, targets = null, onProgress = null
     }
   }
   saveBpmCache();
+  snap();
   const finalNeed = poolNeed(targetSec, targets, candidates);
   report("done", {
-    detail: finalNeed.canFill
-      ? "Song pool ready — building playlist"
-      : hardStop()
-        ? "Time ceiling reached — building playlist with what we have"
-        : "Expanded as far as caps allow — building playlist",
+    detail: userStop()
+      ? "Stopped — building playlist from songs so far"
+      : finalNeed.canFill
+        ? "Song pool ready — building playlist"
+        : hardStop()
+          ? "Time ceiling reached — building playlist with what we have"
+          : "Expanded as far as caps allow — building playlist",
     bpmHit: bpmStats.hit,
     bpmTried: bpmStats.tried,
+    stopped: userStop(),
   });
   return candidates;
 }
@@ -1509,10 +1532,19 @@ async function spotifyArtistTracks(name, id = null, limit = 40) {
   }
   return [...byRef.values()].slice(0, limit);
 }
-async function spotifyPool(seeds, targetSec = 0, targets = null, onProgress = null) {
+async function spotifyPool(seeds, targetSec = 0, targets = null, onProgress = null, ctrl = null) {
   if (!GSB_KEY && !FREQBLOG_KEY) throw new Error("GETSONGBPM_API_KEY not set — add it to credentials.txt");
   const started = Date.now();
   const hardStop = () => Date.now() - started > POOL_BUDGET_MS;
+  const userStop = () => !!(ctrl && typeof ctrl.shouldStop === "function" && ctrl.shouldStop());
+  const stopNow = () => hardStop() || userStop();
+  let lastSnapLen = -1;
+  const snap = () => {
+    if (!ctrl || typeof ctrl.onSnapshot !== "function") return;
+    if (candidates.length === lastSnapLen) return;
+    lastSnapLen = candidates.length;
+    try { ctrl.onSnapshot(candidates); } catch (_) {}
+  };
   const seedList = seeds.map((s) => (typeof s === "string" ? { name: s } : s));
   const seedNames = seedList.map((s) => s.name).filter(Boolean);
   const ARTIST_CAP = POOL_ARTIST_CAP, TRACK_CAP = POOL_TRACK_CAP, MAX_LEVELS = POOL_MAX_LEVELS;
@@ -1574,7 +1606,8 @@ async function spotifyPool(seeds, targetSec = 0, targets = null, onProgress = nu
     let i = 0;
     while (i < order.length) {
       if (!finishAll && poolNeed(targetSec, targets, candidates).canFill) break;
-      if (!finishAll && hardStop()) break;
+      if (!finishAll && stopNow()) break;
+      if (finishAll && userStop()) break;
       if (finishAll && Date.now() - started > POOL_BUDGET_MS * 1.5) break;
       const batch = order.slice(i, i + 24);
       i += batch.length;
@@ -1596,10 +1629,13 @@ async function spotifyPool(seeds, targetSec = 0, targets = null, onProgress = nu
           if (key !== "|" && !pendingByKey.has(key)) pendingByKey.set(key, t);
         }
       }
+      snap();
       if (cacheDirty) saveBpmCache();
+      if (userStop()) break;
     }
   }
   async function fillFromTempoCatalog(detail) {
+    if (userStop()) return 0;
     if (!pendingByKey.size || poolNeed(targetSec, targets, candidates).canFill) return 0;
     report("bpm", { detail });
     const n = await stampBpmFromTempoCatalog(
@@ -1610,9 +1646,11 @@ async function spotifyPool(seeds, targetSec = 0, targets = null, onProgress = nu
       (p) => report("bpm", { detail: p.detail || detail, tempoBpm: p.tempoBpm }),
     );
     report("bpm", { detail: `Tempo catalog stamped ${n} tracks`, stamped: n });
+    snap();
     return n;
   }
   async function ingestTempoFill(detail) {
+    if (userStop()) return 0;
     if (poolNeed(targetSec, targets, candidates).canFill) return 0;
     report("bpm", { detail });
     const n = await ingestTempoCatalogTracks({
@@ -1627,9 +1665,11 @@ async function spotifyPool(seeds, targetSec = 0, targets = null, onProgress = nu
       maxTracks: 250,
     });
     report("bpm", { detail: `Imported ${n} tempo-matched tracks`, stamped: n });
+    snap();
     return n;
   }
   async function fetchNames(names, detail, { seedWeight = false } = {}) {
+    if (userStop()) return [];
     const fresh = names.filter((n) => n && !doneNames.has(n.toLowerCase()));
     fresh.forEach((n) => doneNames.add(n.toLowerCase()));
     if (!fresh.length) return [];
@@ -1643,6 +1683,7 @@ async function spotifyPool(seeds, targetSec = 0, targets = null, onProgress = nu
     const toBpm = [];
     for (const tl of lists) for (const t of tl) if (t && !seenRef.has(t.ref)) { seenRef.add(t.ref); toBpm.push(t); }
     await enrichBpm(toBpm, detail, { finishAll: seedWeight });
+    snap();
     return fresh;
   }
 
@@ -1667,7 +1708,7 @@ async function spotifyPool(seeds, targetSec = 0, targets = null, onProgress = nu
     currentLevel = level;
     const need = poolNeed(targetSec, targets, candidates);
     if (need.canFill) break;
-    if (hardStop()) break;
+    if (stopNow()) break;
     if (doneNames.size >= ARTIST_CAP || candidates.length >= TRACK_CAP) break;
     if (!LASTFM_KEY) break;
 
@@ -1699,6 +1740,7 @@ async function spotifyPool(seeds, targetSec = 0, targets = null, onProgress = nu
     if (!batch.length) break;
 
     await fetchNames(batch, `related artists · ring ${level}`);
+    if (userStop()) break;
     if (level === 1 || level % 2 === 0) await fillFromTempoCatalog(`Tempo catalog after ring ${level}`);
     if (level >= 3 && level % 3 === 0 && !poolNeed(targetSec, targets, candidates).canFill) {
       await ingestTempoFill(`Importing target-tempo songs · ring ${level}`);
@@ -1708,10 +1750,10 @@ async function spotifyPool(seeds, targetSec = 0, targets = null, onProgress = nu
   }
 
   await fillFromTempoCatalog("Final tempo catalog pass");
-  if (!poolNeed(targetSec, targets, candidates).canFill) {
+  if (!userStop() && !poolNeed(targetSec, targets, candidates).canFill) {
     await ingestTempoFill("Importing songs at your target tempos");
   }
-  if (!poolNeed(targetSec, targets, candidates).canFill && !hardStop() && pending.length && doneNames.size < ARTIST_CAP) {
+  if (!userStop() && !poolNeed(targetSec, targets, candidates).canFill && !hardStop() && pending.length && doneNames.size < ARTIST_CAP) {
     const extra = [];
     while (extra.length < POOL_RING_BATCH && pending.length && doneNames.size + extra.length < ARTIST_CAP) {
       const nm = pending.shift();
@@ -1725,15 +1767,19 @@ async function spotifyPool(seeds, targetSec = 0, targets = null, onProgress = nu
     }
   }
   saveBpmCache();
+  snap();
   const finalNeed = poolNeed(targetSec, targets, candidates);
   report("done", {
-    detail: finalNeed.canFill
-      ? "Song pool ready — building playlist"
-      : hardStop()
-        ? "Time ceiling reached — building playlist with what we have"
-        : "Expanded as far as caps allow — building playlist",
+    detail: userStop()
+      ? "Stopped — building playlist from songs so far"
+      : finalNeed.canFill
+        ? "Song pool ready — building playlist"
+        : hardStop()
+          ? "Time ceiling reached — building playlist with what we have"
+          : "Expanded as far as caps allow — building playlist",
     bpmHit: bpmStats.hit,
     bpmTried: bpmStats.tried,
+    stopped: userStop(),
   });
   return candidates;
 }
@@ -1805,7 +1851,7 @@ async function spotifyPlaylistArtists(id) {
 /* ============ dispatch ============ */
 const searchArtists = (svc, q) => (svc === "spotify" ? spotifySearchArtists(q) : tidalSearchArtists(q));
 const searchTracks = (svc, q) => (svc === "spotify" ? spotifySearchTracks(q) : tidalSearchTracks(q));
-const buildPool = (svc, seeds, targetSec, targets, onProgress) => (svc === "spotify" ? spotifyPool(seeds, targetSec, targets, onProgress) : tidalPool(seeds, targetSec, targets, onProgress));
+const buildPool = (svc, seeds, targetSec, targets, onProgress, ctrl) => (svc === "spotify" ? spotifyPool(seeds, targetSec, targets, onProgress, ctrl) : tidalPool(seeds, targetSec, targets, onProgress, ctrl));
 const createPlaylist = (svc, name, refs) => (svc === "spotify" ? spotifyCreatePlaylist(name, refs) : tidalCreatePlaylist(name, refs));
 const myPlaylists = (svc) => (svc === "spotify" ? spotifyMyPlaylists() : tidalMyPlaylists());
 const playlistArtists = (svc, id) => (svc === "spotify" ? spotifyPlaylistArtists(id) : tidalPlaylistArtists(id));
@@ -1893,17 +1939,42 @@ const server = http.createServer(async (req, res) => {
         "X-Accel-Buffering": "no",
       });
       const send = (obj) => { try { res.write(JSON.stringify(obj) + "\n"); } catch (_) {} };
+      let cancelled = false;
+      req.on("close", () => { cancelled = true; });
+      let lastSnapAt = 0;
+      let lastSnapN = -1;
       try {
-        const candidates = await buildPool(svc, seeds, +body.targetSec || 0, targets, (p) => send({ type: "progress", ...p }));
+        const candidates = await buildPool(
+          svc,
+          seeds,
+          +body.targetSec || 0,
+          targets,
+          (p) => send({ type: "progress", ...p }),
+          {
+            shouldStop: () => cancelled,
+            onSnapshot: (cands) => {
+              const n = Array.isArray(cands) ? cands.length : 0;
+              const now = Date.now();
+              if (n === lastSnapN && now - lastSnapAt < 2500) return;
+              if (n === lastSnapN) return;
+              if (now - lastSnapAt < 1000 && n - lastSnapN < 8) return;
+              lastSnapAt = now;
+              lastSnapN = n;
+              send({ type: "snapshot", candidates: cands, stopped: cancelled });
+            },
+          },
+        );
         const bpmHit = candidates.filter((t) => t.bpm != null).length;
         send({
           type: "done",
           candidates,
+          stopped: cancelled,
           meta: {
             poolSize: candidates.length,
             bpmHit,
             bpmMiss: candidates.length - bpmHit,
             bpmHitRate: candidates.length ? bpmHit / candidates.length : 0,
+            stopped: cancelled,
           },
         });
       } catch (e) {
