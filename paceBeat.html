@@ -167,30 +167,19 @@
     <select id="playlistPick" style="display:none;margin-top:8px"><option value="">Pick a playlist…</option></select>
   </section>
 
-  <section aria-label="Estimates">
-    <p class="eyebrow">Heart-rate zones</p>
-    <div style="display:flex;gap:10px;align-items:flex-end;margin-bottom:12px">
-      <label style="flex:1;font-size:11px;color:var(--muted);display:flex;flex-direction:column;gap:6px">Max HR<input id="maxHR" value="195" inputmode="numeric"/></label>
-      <button class="btn" id="calcZones" style="margin-top:0;flex:1">Calculate zones</button>
+  <section aria-label="Cadence">
+    <p class="eyebrow">Cadence</p>
+    <div style="display:flex;gap:10px;align-items:flex-end">
+      <label style="flex:1;font-size:11px;color:var(--muted);display:flex;flex-direction:column;gap:6px">Steps per minute (SPM)
+        <input id="spmInput" value="170" inputmode="numeric" style="font-size:18px;font-family:var(--mono);text-align:center;padding:10px" />
+      </label>
     </div>
-    <table id="zoneTable"><thead><tr><th>Zone</th><th>HR from</th><th>HR to</th></tr></thead><tbody></tbody></table>
-    <div class="legend" style="margin:8px 0 4px">Zones are 50/60/70/80/90% of max HR. Edit any row to fine-tune.</div>
-
-    <p class="eyebrow" style="margin-top:18px">Estimates · pace &amp; cadence by zone</p>
-    <table id="calTable"><thead><tr><th>Zone</th><th>Pace /mi</th><th>Cadence</th><th>Runs</th><th></th></tr></thead><tbody></tbody></table>
-    <button class="btn" id="garminBtn">Import Garmin runs (CSV) — sort by zone</button>
-    <button class="btn" id="autofillZones">Estimate the rest (fill empty zones)</button>
-    <input type="file" id="garminFile" accept=".csv" style="display:none" />
-    <div class="legend" id="garminStatus" style="margin-top:10px">Import sorts each run into a zone by average HR. "Estimate the rest" fills any zone without runs from the ones that have data.</div>
+    <div class="legend" style="margin-top:8px">One cadence for the whole run. All songs will match this SPM (within tolerance).</div>
   </section>
 
   <section aria-label="Sprint">
     <p class="eyebrow">Sprint · plan by the mile</p>
-    <div class="modes" id="planMode" style="margin-bottom:12px">
-      <button data-pm="pace" aria-pressed="true">By pace</button>
-      <button data-pm="zone" aria-pressed="false">By zone</button>
-    </div>
-    <table id="segTable"><thead><tr><th>From mi</th><th>To mi</th><th id="segCol3">Pace /mi</th><th></th></tr></thead><tbody></tbody></table>
+    <table id="segTable"><thead><tr><th>From mi</th><th>To mi</th><th>Pace /mi</th><th></th></tr></thead><tbody></tbody></table>
     <button class="addrow" id="addSeg">+ add ticket</button>
   </section>
 
@@ -219,7 +208,6 @@
 const paceToSeconds=(p)=>{if(typeof p==="number")return p;const[m,s]=String(p).split(":").map(Number);return(m||0)*60+(s||0);};
 const secondsToPace=(x)=>`${Math.floor(x/60)}:${String(Math.round(x%60)).padStart(2,"0")}`;
 const fmtClock=(t)=>{const h=Math.floor(t/3600),m=Math.floor((t%3600)/60),s=Math.round(t%60);const mm=String(m).padStart(h?2:1,"0"),ss=String(s).padStart(2,"0");return h?`${h}:${mm}:${ss}`:`${mm}:${ss}`;};
-function makeCadenceModel(a){const p=a.map(x=>({x:paceToSeconds(x.pace),y:+x.cadence})).filter(q=>q.x>0&&q.y>0).sort((m,n)=>m.x-n.x);if(!p.length)return()=>170;return(pace)=>{const x=paceToSeconds(pace);if(x<=p[0].x)return p[0].y;if(x>=p.at(-1).x)return p.at(-1).y;for(let i=0;i<p.length-1;i++){const A=p[i],B=p[i+1];if(x>=A.x&&x<=B.x){const t=(x-A.x)/(B.x-A.x);return A.y+t*(B.y-A.y);}}return p.at(-1).y;};}
 function bpmMatch(bpm,cad,tol,modes){const c=[];if(modes.includes("direct"))c.push({mode:"direct",target:cad});if(modes.includes("half"))c.push({mode:"half",target:cad/2});let b=null;for(const x of c){const d=Math.abs(bpm-x.target);if(d<=tol&&(!b||d<b.diff))b={...x,diff:d};}return b;}
 function keepMatchedTracksBySeg(plan,opts){
   const{tol=2,modes=["direct","half"],excludedIds}=opts;
@@ -420,26 +408,12 @@ const api={
 };
 
 /* ===================== STATE + UI ===================== */
-const state={service:"tidal",seeds:[],maxHR:195,
-  // HR zones (50/60/70/80/90% of max HR; "to" is exclusive upper bound)
-  zones:[
-    {name:"Z1",from:98,to:117},
-    {name:"Z2",from:117,to:137},
-    {name:"Z3",from:137,to:156},
-    {name:"Z4",from:156,to:176},
-    {name:"Z5",from:176,to:210},
-  ],
-  // calibration anchors, one per zone that has data: {zone,pace,cadence,n}
-  cal:[
-    {zone:"Z2",pace:"10:30",cadence:156,n:0},
-    {zone:"Z3",pace:"9:15",cadence:163,n:0},
-    {zone:"Z4",pace:"8:20",cadence:170,n:0},
-    {zone:"Z5",pace:"7:40",cadence:176,n:0},
-  ],
+const state={service:"tidal",seeds:[],
+  spm:170,
   segs:[{startMile:0,endMile:3,pace:"9:15"},{startMile:3,endMile:20,pace:"8:40"},{startMile:20,endMile:26.2,pace:"8:25"}],
-  tol:3,modes:{direct:true,half:true},repeat:false,planMode:"pace"};
-function saveCal(){try{localStorage.setItem("pb_cal",JSON.stringify({zones:state.zones,cal:state.cal,maxHR:state.maxHR}));}catch(_){}}
-function loadCal(){try{const s=JSON.parse(localStorage.getItem("pb_cal"));if(s){if(Array.isArray(s.zones))state.zones=s.zones;if(Array.isArray(s.cal))state.cal=s.cal;if(s.maxHR)state.maxHR=s.maxHR;}}catch(_){}}
+  tol:3,modes:{direct:true,half:true},repeat:false};
+function saveCal(){try{localStorage.setItem("pb_cal",JSON.stringify({spm:state.spm}));}catch(_){}}
+function loadCal(){try{const s=JSON.parse(localStorage.getItem("pb_cal"));if(s){if(+s.spm>0)state.spm=+s.spm;}}catch(_){}}
 const $=(s)=>document.querySelector(s);
 let lastPlaylist=[];
 let lastResult=null;
@@ -529,97 +503,19 @@ function renderSeeds(){
   btn.textContent=!has?"Refine the backlog first":fromPl?`Ship it again 🚀`:"Ship it 🚀";
 }
 
-function renderZones(){const tb=$("#zoneTable tbody");tb.innerHTML="";state.zones.forEach((z,i)=>{const tr=document.createElement("tr");tr.innerHTML=`<td style="font-family:var(--mono);color:var(--muted);padding-left:4px">${z.name}</td><td><input data-z="from" data-i="${i}" value="${z.from}" inputmode="numeric"/></td><td><input data-z="to" data-i="${i}" value="${z.to}" inputmode="numeric"/></td>`;tb.appendChild(tr);});}
-function computeZones(){const mx=+$("#maxHR").value||195;state.maxHR=mx;const p=[[.50,.60],[.60,.70],[.70,.80],[.80,.90],[.90,1.00]];state.zones=p.map((r,i)=>({name:"Z"+(i+1),from:Math.round(r[0]*mx),to:Math.round(r[1]*mx)}));renderZones();saveCal();}
-$("#calcZones").onclick=computeZones;
-$("#maxHR").addEventListener("change",computeZones);
-// Estimate pace/cadence for zones that have no run data, from the zones that do.
-function midHR(zoneName){const z=state.zones.find(z=>z.name===zoneName);return z?(+z.from+ +z.to)/2:null;}
-function linreg(pts){const n=pts.length;if(n<2)return null;let sx=0,sy=0,sxx=0,sxy=0;for(const[x,y]of pts){sx+=x;sy+=y;sxx+=x*x;sxy+=x*y;}const d=n*sxx-sx*sx;if(!d)return{m:0,b:sy/n};return{m:(n*sxy-sx*sy)/d,b:(sy-((n*sxy-sx*sy)/d)*sx)/n};}
-function autofillZones(){
-  const known=state.cal.filter(a=>midHR(a.zone)!=null).map(a=>({hr:midHR(a.zone),pace:paceToSeconds(a.pace),cad:+a.cadence}));
-  if(known.length<2){setGarmin("Need at least 2 zones with run data before I can estimate the rest.");return;}
-  const pReg=linreg(known.map(k=>[k.hr,k.pace])),cReg=linreg(known.map(k=>[k.hr,k.cad]));
-  const have=new Set(state.cal.map(a=>a.zone));let added=0;
-  for(const z of state.zones){
-    if(have.has(z.name))continue;
-    const hr=(+z.from+ +z.to)/2;
-    let ps=Math.round(pReg.m*hr+pReg.b);ps=Math.max(240,Math.min(1200,ps));
-    let cd=Math.round(cReg.m*hr+cReg.b);cd=Math.max(120,Math.min(210,cd));
-    state.cal.push({zone:z.name,pace:`${Math.floor(ps/60)}:${String(ps%60).padStart(2,"0")}`,cadence:cd,n:0});added++;
-  }
-  const order=state.zones.map(z=>z.name);
-  state.cal.sort((a,b)=>order.indexOf(a.zone)-order.indexOf(b.zone));
-  renderCal();saveCal();
-  setGarmin(added?`Estimated ${added} empty zone(s) from your real ones (marked "est"). Tweak any row.`:"Every zone already has data — nothing to estimate.");
-}
-$("#autofillZones").onclick=autofillZones;
-function renderCal(){const tb=$("#calTable tbody");tb.innerHTML="";state.cal.forEach((c,i)=>{const tr=document.createElement("tr");tr.innerHTML=`<td style="font-family:var(--mono);color:var(--pace);padding-left:4px">${c.zone||"—"}</td><td><input data-k="pace" data-i="${i}" value="${c.pace}" inputmode="numeric"/></td><td><input data-k="cadence" data-i="${i}" value="${c.cadence}" inputmode="numeric"/></td><td style="font-family:var(--mono);color:var(--muted);text-align:center">${c.n?c.n:"est"}</td><td><button class="row-x" data-del-cal="${i}">×</button></td>`;tb.appendChild(tr);});}
-const zoneAnchorFor=(name)=>state.cal.find(a=>a.zone===name);
-function renderSegs(){const tb=$("#segTable tbody");tb.innerHTML="";const zoneOpts=(sel)=>state.zones.map(z=>`<option value="${z.name}"${z.name===sel?" selected":""}>${z.name}</option>`).join("");const cc=constantCadence();state.segs.forEach((s,i)=>{const tr=document.createElement("tr");let col3;if(state.planMode==="zone"){const zsel=s.zone||state.zones[2]?.name;const cad=`→ ${cc} spm`;col3=`<td><select data-sk="zone" data-i="${i}" style="text-align:center">${zoneOpts(zsel)}</select><div style="font-size:10.5px;color:var(--pace);text-align:center;margin-top:3px;font-family:var(--mono)">${cad}</div></td>`;}else{col3=`<td><input data-sk="pace" data-i="${i}" value="${s.pace||"8:40"}" inputmode="numeric"/></td>`;}tr.innerHTML=`<td><input data-sk="startMile" data-i="${i}" value="${s.startMile}" inputmode="decimal"/></td><td><input data-sk="endMile" data-i="${i}" value="${s.endMile}" inputmode="decimal"/></td>${col3}<td><button class="row-x" data-del-seg="${i}">×</button></td>`;tb.appendChild(tr);});}
-function setPlanMode(m){state.planMode=m;document.querySelectorAll("#planMode button").forEach(b=>b.setAttribute("aria-pressed",b.dataset.pm===m));$("#segCol3").textContent=m==="zone"?"Zone":"Pace /mi";state.segs.forEach(s=>{if(m==="zone"&&!s.zone)s.zone=state.zones[2]?.name||"Z3";if(m==="pace"&&!s.pace)s.pace="8:40";});renderSegs();}
-document.querySelectorAll("#planMode button").forEach(b=>b.onclick=()=>setPlanMode(b.dataset.pm));
-document.addEventListener("input",(e)=>{const t=e.target;if(t.dataset.k!=null){state.cal[+t.dataset.i][t.dataset.k]=t.value;saveCal();}if(t.dataset.z!=null){state.zones[+t.dataset.i][t.dataset.z]=+t.value;saveCal();}if(t.dataset.sk!=null){state.segs[+t.dataset.i][t.dataset.sk]=t.value;if(t.dataset.sk==="zone")renderSegs();}if(t.id==="tol"){state.tol=+t.value;$("#tolVal").textContent="±"+t.value;}});
-document.addEventListener("click",(e)=>{const t=e.target;if(t.dataset.delCal!=null){state.cal.splice(+t.dataset.delCal,1);renderCal();saveCal();}if(t.dataset.delSeg!=null){state.segs.splice(+t.dataset.delSeg,1);renderSegs();}});
+function renderSegs(){const tb=$("#segTable tbody");tb.innerHTML="";state.segs.forEach((s,i)=>{const tr=document.createElement("tr");const col3=`<td><input data-sk="pace" data-i="${i}" value="${s.pace||"8:40"}" inputmode="numeric"/></td>`;tr.innerHTML=`<td><input data-sk="startMile" data-i="${i}" value="${s.startMile}" inputmode="decimal"/></td><td><input data-sk="endMile" data-i="${i}" value="${s.endMile}" inputmode="decimal"/></td>${col3}<td><button class="row-x" data-del-seg="${i}">×</button></td>`;tb.appendChild(tr);});}
+$("#spmInput").addEventListener("input",(e)=>{const v=+e.target.value;if(v>0&&v<=260){state.spm=Math.round(v);saveCal();}});
+document.addEventListener("input",(e)=>{const t=e.target;if(t.dataset.sk!=null){state.segs[+t.dataset.i][t.dataset.sk]=t.value;}if(t.id==="tol"){state.tol=+t.value;$("#tolVal").textContent="±"+t.value;}});
+document.addEventListener("click",(e)=>{const t=e.target;if(t.dataset.delSeg!=null){state.segs.splice(+t.dataset.delSeg,1);renderSegs();}});
 
-/* ---- Garmin CSV import: auto-derive pace→cadence anchors from real runs ---- */
-function parseCSVLine(line){const out=[];let cur="",q=false;for(let i=0;i<line.length;i++){const c=line[i];if(q){if(c==='"'){if(line[i+1]==='"'){cur+='"';i++;}else q=false;}else cur+=c;}else{if(c===','){out.push(cur);cur="";}else if(c==='"')q=true;else cur+=c;}}out.push(cur);return out;}
-function paceStrToSec(s){s=(s||"").trim();const m=/^(\d+):(\d{1,2})(?:\.\d+)?$/.exec(s);return m?(+m[1])*60+(+m[2]):null;}
-function zoneForHR(hr){for(const z of state.zones){if(hr>=z.from&&hr<z.to)return z.name;}if(state.zones.length&&hr>=state.zones[state.zones.length-1].from)return state.zones[state.zones.length-1].name;return null;}
-$("#garminBtn").onclick=()=>$("#garminFile").click();
-$("#garminFile").onchange=(e)=>{
-  const f=e.target.files[0];if(!f)return;
-  const r=new FileReader();
-  r.onload=()=>{
-    try{
-      const lines=String(r.result).split(/\r?\n/).filter(l=>l.trim());
-      const header=parseCSVLine(lines[0]).map(h=>h.trim().toLowerCase());
-      const iType=header.findIndex(h=>h.includes("activity type")||h==="type");
-      const iPace=header.findIndex(h=>h.includes("avg pace"));
-      const iCad=header.findIndex(h=>h.includes("avg run cadence")||(h.includes("cadence")&&h.includes("run")));
-      const iHR=header.findIndex(h=>h.includes("avg hr")||h==="avg hr"||(h.includes("avg")&&h.includes("hr")));
-      if(iPace<0||iCad<0){setGarmin("Couldn't find 'Avg Pace' and 'Avg Run Cadence' columns. Add those columns in Garmin before exporting.");return;}
-      if(iHR<0){setGarmin("Couldn't find an 'Avg HR' column — add it in Garmin's Activities view, then export again.");return;}
-      // accumulate pace/cadence per zone
-      const acc={};let used=0;
-      for(let i=1;i<lines.length;i++){
-        const c=parseCSVLine(lines[i]);
-        if(iType>=0 && c[iType] && !/run/i.test(c[iType])) continue;
-        const p=paceStrToSec(c[iPace]); const cad=parseFloat(c[iCad]); const hr=parseFloat(c[iHR]);
-        if(!(p>240&&p<1200)||!(cad>90&&cad<230)||!(hr>60&&hr<230)) continue;
-        const z=zoneForHR(hr); if(!z) continue;
-        (acc[z]=acc[z]||{ps:0,cs:0,n:0}); acc[z].ps+=p; acc[z].cs+=cad; acc[z].n++; used++;
-      }
-      if(!used){setGarmin("No usable running rows found (need pace + cadence + HR).");return;}
-      // one anchor per zone with data, in zone order
-      const anchors=state.zones.filter(z=>acc[z.name]).map(z=>{const a=acc[z.name];const sec=Math.round(a.ps/a.n);return{zone:z.name,pace:`${Math.floor(sec/60)}:${String(sec%60).padStart(2,"0")}`,cadence:Math.round(a.cs/a.n),n:a.n};});
-      state.cal=anchors;renderCal();saveCal();
-      const zlist=anchors.map(a=>`${a.zone}:${a.cadence}`).join("  ");
-      setGarmin(`Sorted ${used} run(s) into ${anchors.length} zone(s) — ${zlist}. Tweak any row if needed.`);
-    }catch(err){setGarmin("Couldn't read that file — is it the Activities CSV from Garmin?");}
-  };
-  r.readAsText(f);
-};
-function setGarmin(msg){const el=$("#garminStatus");if(el)el.textContent=msg;}
-$("#addSeg").onclick=()=>{const l=state.segs.at(-1);const f=l?+l.endMile:0;state.segs.push(state.planMode==="zone"?{startMile:f,endMile:f+3,zone:state.zones[2]?.name||"Z3"}:{startMile:f,endMile:f+3,pace:"8:40"});renderSegs();};
+$("#addSeg").onclick=()=>{const l=state.segs.at(-1);const f=l?+l.endMile:0;state.segs.push({startMile:f,endMile:f+3,pace:"8:40"});renderSegs();};
 $("#repeat").onchange=(e)=>state.repeat=e.target.checked;
 function toggleMode(id,key){const el=$(id);el.onclick=()=>{state.modes[key]=!state.modes[key];el.setAttribute("aria-pressed",state.modes[key]);};el.onkeydown=(ev)=>{if(ev.key===" "||ev.key==="Enter"){ev.preventDefault();el.click();}};}
 toggleMode("#mDirect","direct");toggleMode("#mHalf","half");
 const cadColor=(cad)=>{const t=Math.max(0,Math.min(1,(cad-162)/26));const a=[12,102,228],b=[130,112,219];return`rgb(${a.map((v,i)=>Math.round(v+(b[i]-v)*t)).join(",")})`;};
 
 function constantCadence(){
-  const entries=Array.isArray(state.cal)?state.cal:[];
-  const withCad=entries.filter(e=>+(e?.cadence||0)>0);
-  if(!withCad.length)return 165;
-  // If Garmin imported sample counts, weight by `n` so real data dominates.
-  const hasN=withCad.some(e=>+(e?.n||0)>0);
-  if(hasN){
-    const sum=withCad.reduce((s,e)=>s+(+e.cadence)*Math.max(1,+e.n||0),0);
-    const w=withCad.reduce((s,e)=>s+Math.max(1,+e.n||0),0);
-    return Math.round(sum/Math.max(1,w));
-  }
-  const avg=withCad.reduce((s,e)=>s+(+e.cadence),0)/withCad.length;
-  return Math.round(avg);
+  return Math.round(+state.spm||170);
 }
 
 function plannedCadences(){
@@ -627,31 +523,18 @@ function plannedCadences(){
 }
 /** Seconds of music required per cadence band (segments sharing a cadence are summed). */
 function plannedCadenceNeeds(){
-  const zoneAnchor=(name)=>zoneAnchorFor(name)||state.cal[0]||{pace:"9:00",cadence:165};
   const cadence=constantCadence();
-  const byCad=new Map();
+  let totalSec=0;
   for(const seg of state.segs){
-    let paceSec;
-    if(state.planMode==="zone"){
-      const a=zoneAnchor(seg.zone);
-      paceSec=paceToSeconds(a.pace);
-    }else{
-      paceSec=paceToSeconds(seg.pace||"9:00");
-    }
-    if(!(cadence>0))continue;
-    const sec=Math.max(0,(+seg.endMile-+seg.startMile))*paceSec;
-    byCad.set(cadence,(byCad.get(cadence)||0)+sec);
+    const paceSec=paceToSeconds(seg.pace||"9:00");
+    totalSec+=Math.max(0,(+seg.endMile-+seg.startMile))*paceSec;
   }
-  return[...byCad.entries()].map(([cadence,sec])=>({cadence,sec:Math.round(sec)}));
+  return cadence>0?[{cadence,sec:Math.round(totalSec)}]:[];
 }
 function packOpts(extra={}){
   const modes=Object.entries(state.modes).filter(([,v])=>v).map(([k])=>k);
   const cadenceModel=()=>constantCadence();
-  const zoneAnchor=(name)=>zoneAnchorFor(name)||state.cal[0]||{pace:"9:00",cadence:165};
-  const resolveSegment=state.planMode==="zone"
-    ? (seg)=>{const a=zoneAnchor(seg.zone);return{paceSec:paceToSeconds(a.pace),cadence:constantCadence(),label:seg.zone};}
-    : undefined;
-  return{cadenceModel,tol:state.tol,modes,allowRepeats:state.repeat,resolveSegment,excludedIds:excludedIds,...extra};
+  return{cadenceModel,tol:state.tol,modes,allowRepeats:state.repeat,excludedIds:excludedIds,...extra};
 }
 function applyPlaylistResult(res,candidates){
   if(candidates){
@@ -868,7 +751,7 @@ function getExportPlaylistName(){
   if(fromInput)return fromInput.slice(0,100);
   return (playlistExportName||defaultExportName()).slice(0,100);
 }
-function plannedSeconds(){let s=0;for(const seg of state.segs){let paceSec;if(state.planMode==="zone"){const a=zoneAnchorFor(seg.zone)||state.cal[0]||{pace:"9:00"};paceSec=paceToSeconds(a.pace);}else paceSec=paceToSeconds(seg.pace||"9:00");s+=Math.max(0,(+seg.endMile-+seg.startMile))*paceSec;}return Math.round(s);}
+function plannedSeconds(){let s=0;for(const seg of state.segs){const paceSec=paceToSeconds(seg.pace||"9:00");s+=Math.max(0,(+seg.endMile-+seg.startMile))*paceSec;}return Math.round(s);}
 async function shipPlaylist(btn){
   const refs=lastPlaylist.map(t=>t.ref||t.id).filter(Boolean);
   if(!refs.length)return;
@@ -1079,7 +962,7 @@ function renderResults(res){
   $("#results-area").scrollIntoView({behavior:matchMedia("(prefers-reduced-motion:reduce)").matches?"auto":"smooth",block:"start"});
 }
 
-loadCal();$("#maxHR").value=state.maxHR;renderZones();renderCal();renderSegs();renderSeeds();
+loadCal();$("#spmInput").value=state.spm;renderSegs();renderSeeds();
 const _svc=new URLSearchParams(location.search).get("service");if(_svc&&(_svc==="tidal"||_svc==="spotify"))setService(_svc);else checkLogin();
 </script>
 </body>
