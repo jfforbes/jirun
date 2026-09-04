@@ -9,7 +9,7 @@
 //   GETSONGBPM_API_KEY
 //   LASTFM_API_KEY
 //   FREQBLOG_API_KEY (optional second BPM source)
-//   BPM_CACHE_MAX (optional; default 1000 track groups in bpm-cache.json)
+//   BPM_CACHE_MAX (optional; default 100000 track groups in bpm-cache.json)
 // AcousticBrainz needs no key (MusicBrainz recording MBID → rhythm.bpm).
 // Redirect URI to register in BOTH dashboards: http://localhost:8080/callback
 // Run: node server.mjs
@@ -235,7 +235,7 @@ function mbFetch(url) {
 const mbidResolveCache = new Map(); // cacheKey → [{id,score}] | null
 const BPM_CACHE_FILE = path.join(__dirname, "bpm-cache.json");
 /** Cap unique track groups (each lookup may write several alias keys). File stays small; no DB needed. */
-const BPM_CACHE_MAX_TRACKS = Math.max(100, Math.min(50000, parseInt(env("BPM_CACHE_MAX") || "1000", 10) || 1000));
+const BPM_CACHE_MAX_TRACKS = Math.max(100, Math.min(200000, parseInt(env("BPM_CACHE_MAX") || "100000", 10) || 100000));
 let bpmCache = {}; try { bpmCache = JSON.parse(fs.readFileSync(BPM_CACHE_FILE, "utf8")); } catch (_) {}
 let cacheDirty = false;
 function saveBpmCache() {
