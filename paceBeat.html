@@ -205,7 +205,7 @@
       <label class="toggle" style="grid-column:1/-1">
         <input type="checkbox" id="repeat" style="width:auto" /> Allow repeats (needed to fill long runs)</label>
     </div>
-    <div class="legend"><span><b class="tag direct" style="padding:1px 5px">direct</b> beat = cadence</span><span><b class="tag half" style="padding:1px 5px">half</b> step every beat</span></div>
+    <div class="legend"><span><b class="tag direct" style="padding:1px 5px">direct</b> beat = cadence</span><span><b class="tag half" style="padding:1px 5px">half</b> step every beat · ½ tolerance</span></div>
   </section>
 
   <div id="pool-progress-slot" hidden></div>
@@ -218,7 +218,18 @@
 const paceToSeconds=(p)=>{if(typeof p==="number")return p;const[m,s]=String(p).split(":").map(Number);return(m||0)*60+(s||0);};
 const secondsToPace=(x)=>`${Math.floor(x/60)}:${String(Math.round(x%60)).padStart(2,"0")}`;
 const fmtClock=(t)=>{const h=Math.floor(t/3600),m=Math.floor((t%3600)/60),s=Math.round(t%60);const mm=String(m).padStart(h?2:1,"0"),ss=String(s).padStart(2,"0");return h?`${h}:${mm}:${ss}`:`${mm}:${ss}`;};
-function bpmMatch(bpm,cad,tol,modes){const c=[];if(modes.includes("direct"))c.push({mode:"direct",target:cad});if(modes.includes("half"))c.push({mode:"half",target:cad/2});let b=null;for(const x of c){const d=Math.abs(bpm-x.target);if(d<=tol&&(!b||d<b.diff))b={...x,diff:d};}return b;}
+function bpmMatch(bpm,cad,tol,modes){
+  const c=[];
+  if(modes.includes("direct"))c.push({mode:"direct",target:cad,tol});
+  // Half-time uses half the BPM window (±4 direct → ±2 half).
+  if(modes.includes("half"))c.push({mode:"half",target:cad/2,tol:Math.max(0,tol/2)});
+  let b=null;
+  for(const x of c){
+    const d=Math.abs(bpm-x.target);
+    if(d<=x.tol&&(!b||d<b.diff))b={mode:x.mode,target:x.target,diff:d};
+  }
+  return b;
+}
 function keepMatchedTracksBySeg(plan,opts){
   const{tol=2,modes=["direct","half"],excludedIds}=opts;
   const excluded=excludedIds instanceof Set?excludedIds:new Set(excludedIds||[]);

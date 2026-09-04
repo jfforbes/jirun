@@ -110,12 +110,12 @@ async function mapLimit(arr, limit, fn) {
 }
 const isoToSec = (d) => { if (!d) return 210; const m = /PT(?:(\d+)M)?(?:(\d+)S)?/.exec(d); return (+(m?.[1] || 0)) * 60 + (+(m?.[2] || 0)) || 210; };
 
-/** Same BPM match rules as the client — used so pool expansion keys off usable music. */
+/** Same BPM match rules as the client — used so pool expansion keys off usable music.
+ *  Half-time uses half the tolerance (±4 direct → ±2 at cadence/2). */
 function bpmMatch(bpm, cad, tol, modes) {
-  const c = [];
-  if (modes.includes("direct")) c.push(cad);
-  if (modes.includes("half")) c.push(cad / 2);
-  for (const target of c) if (Math.abs(bpm - target) <= tol) return true;
+  const t = Math.max(0, +tol || 0);
+  if (modes.includes("direct") && Math.abs(bpm - cad) <= t) return true;
+  if (modes.includes("half") && Math.abs(bpm - cad / 2) <= t / 2) return true;
   return false;
 }
 /**
@@ -675,9 +675,10 @@ async function bpmForTrack(track) {
 async function bpmFor(artist, title) {
   return bpmForTrack({ artist, title });
 }
-/** Target BPM centers (direct ± tol and optional half-time) we still care about. */
+/** Target BPM centers (direct ± tol and optional half-time ± tol/2) we still care about. */
 function cadenceBpmCenters(targets) {
   const tol = +targets?.tol || 3;
+  const halfTol = Math.floor(tol / 2);
   const modes = Array.isArray(targets?.modes) && targets.modes.length ? targets.modes : ["direct", "half"];
   const centers = new Set();
   const needs = Array.isArray(targets?.cadenceNeeds) ? targets.cadenceNeeds : [];
@@ -687,7 +688,7 @@ function cadenceBpmCenters(targets) {
     if (modes.includes("direct")) for (let d = -tol; d <= tol; d++) centers.add(cad + d);
     if (modes.includes("half")) {
       const h = Math.round(cad / 2);
-      for (let d = -tol; d <= tol; d++) if (h + d >= 40) centers.add(h + d);
+      for (let d = -halfTol; d <= halfTol; d++) if (h + d >= 40) centers.add(h + d);
     }
   }
   if (!centers.size && Array.isArray(targets?.cadences)) {
