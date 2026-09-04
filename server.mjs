@@ -9,6 +9,7 @@
 //   GETSONGBPM_API_KEY
 //   LASTFM_API_KEY
 //   FREQBLOG_API_KEY (optional second BPM source)
+//   BPM_CACHE_MAX (optional; default 100000 track groups in bpm-cache.json)
 // AcousticBrainz needs no key (MusicBrainz recording MBID → rhythm.bpm).
 // Redirect URI to register in BOTH dashboards: http://localhost:8080/callback
 // Run: node server.mjs
@@ -233,9 +234,15 @@ function mbFetch(url) {
 }
 const mbidResolveCache = new Map(); // cacheKey → [{id,score}] | null
 const BPM_CACHE_FILE = path.join(__dirname, "bpm-cache.json");
+/** Cap unique track groups (each lookup may write several alias keys). File stays small; no DB needed. */
+const BPM_CACHE_MAX_TRACKS = Math.max(100, Math.min(200000, parseInt(env("BPM_CACHE_MAX") || "100000", 10) || 100000));
 let bpmCache = {}; try { bpmCache = JSON.parse(fs.readFileSync(BPM_CACHE_FILE, "utf8")); } catch (_) {}
 let cacheDirty = false;
-function saveBpmCache() { if (!cacheDirty) return; try { fs.writeFileSync(BPM_CACHE_FILE, JSON.stringify(bpmCache)); cacheDirty = false; } catch (_) {} }
+function saveBpmCache() {
+  if (!cacheDirty) return;
+  pruneBpmCache(BPM_CACHE_MAX_TRACKS);
+  try { fs.writeFileSync(BPM_CACHE_FILE, JSON.stringify(bpmCache)); cacheDirty = false; } catch (_) {}
+}
 const FREQBLOG_KEY = env("FREQBLOG_API_KEY") || "";
 /** Normalize for fuzzy title/artist matching across services. */
 function cleanMusicToken(s) {
@@ -252,13 +259,16 @@ function normTrackKey(artist, title) {
   return `${cleanMusicToken(artist)}|${cleanMusicToken(title)}`;
 }
 function makeCacheEntry(bpm, meta = {}) {
-  if (!(Number(bpm) > 0)) return null;
+  const hasBpm = Number(bpm) > 0;
+  // Persist misses too (with updatedAt) so LRU can age them out.
+  if (!hasBpm && meta.source !== "miss" && !meta.allowMiss) return null;
   return {
-    bpm: Math.round(Number(bpm)),
+    bpm: hasBpm ? Math.round(Number(bpm)) : null,
     source: meta.source || "unknown",
-    confidence: Number(meta.confidence) || 0.5,
+    confidence: Number(meta.confidence) || 0,
     updatedAt: Date.now(),
     ...meta,
+    bpm: hasBpm ? Math.round(Number(bpm)) : null,
   };
 }
 function cacheEntryBpm(entry) {
@@ -283,8 +293,68 @@ function cacheStoreKeys(artist, title, { isrc = null, trackId = null, service = 
   if (service && trackId) keys.push(`track:${service}:${trackId}`);
   return keys;
 }
+function cacheEntryUpdatedAt(entry) {
+  if (entry && typeof entry === "object" && Number(entry.updatedAt) > 0) return Number(entry.updatedAt);
+  return 0;
+}
+function cacheEntryPinned(entry) {
+  return !!(entry && typeof entry === "object" && entry.user);
+}
+/** Drop oldest track groups until ≤ maxTracks. Alias keys for one lookup share groupId. */
+function pruneBpmCache(maxTracks = BPM_CACHE_MAX_TRACKS) {
+  const groups = new Map(); // groupId → { keys, updatedAt, pinned }
+  for (const [k, v] of Object.entries(bpmCache)) {
+    let groupId;
+    let updatedAt = 0;
+    let pinned = false;
+    if (v && typeof v === "object") {
+      updatedAt = cacheEntryUpdatedAt(v);
+      pinned = cacheEntryPinned(v);
+      if (v.groupId) groupId = `g:${v.groupId}`;
+      else if (v.trackId != null && v.service) groupId = `track:${v.service}:${v.trackId}`;
+      else if (v.isrc) groupId = `isrc:${String(v.isrc).toUpperCase()}`;
+      else if (k.startsWith("norm:")) groupId = k;
+      else groupId = `solo:${k}`;
+    } else {
+      groupId = `solo:${k}`;
+    }
+    const g = groups.get(groupId) || { keys: [], updatedAt: 0, pinned: false };
+    g.keys.push(k);
+    g.updatedAt = Math.max(g.updatedAt, updatedAt);
+    g.pinned = g.pinned || pinned;
+    groups.set(groupId, g);
+  }
+  if (groups.size <= maxTracks) return false;
+  const ranked = [...groups.values()].sort((a, b) => {
+    if (a.pinned !== b.pinned) return a.pinned ? 1 : -1; // pinned last (kept)
+    return a.updatedAt - b.updatedAt; // oldest first
+  });
+  let drop = groups.size - maxTracks;
+  let removed = false;
+  for (const g of ranked) {
+    if (drop <= 0) break;
+    if (g.pinned) continue;
+    for (const k of g.keys) {
+      if (k in bpmCache) {
+        delete bpmCache[k];
+        removed = true;
+      }
+    }
+    drop--;
+  }
+  if (removed) cacheDirty = true;
+  return removed;
+}
+function touchCacheEntry(entry) {
+  if (!entry || typeof entry !== "object") return entry;
+  if (Number(entry.updatedAt) > Date.now() - 60_000) return entry; // skip noisy rewrites
+  entry.updatedAt = Date.now();
+  cacheDirty = true;
+  return entry;
+}
 function cacheBpm(artist, title, bpm, meta = {}) {
-  const entry = makeCacheEntry(bpm, meta);
+  const groupId = meta.groupId || crypto.randomUUID();
+  const entry = makeCacheEntry(bpm, { ...meta, groupId });
   const val = entry || null;
   for (const k of cacheStoreKeys(artist, title, meta)) {
     bpmCache[k] = val;
@@ -295,8 +365,21 @@ function readCachedBpm(artist, title, { isrc = null, trackId = null, service = n
   const keys = cacheStoreKeys(artist, title, { isrc, trackId, service });
   for (const k of keys) {
     if (!(k in bpmCache)) continue;
-    const bpm = cacheEntryBpm(bpmCache[k]);
-    return { bpm, key: k, entry: bpmCache[k] };
+    let entry = bpmCache[k];
+    // Upgrade legacy bare numbers / nulls so LRU + prune have metadata.
+    if (typeof entry === "number") {
+      entry = { bpm: entry > 0 ? entry : null, source: "legacy", confidence: 0.5, updatedAt: Date.now(), groupId: crypto.randomUUID() };
+      bpmCache[k] = entry;
+      cacheDirty = true;
+    } else if (entry === null) {
+      entry = { bpm: null, source: "miss", confidence: 0, updatedAt: Date.now(), groupId: crypto.randomUUID() };
+      bpmCache[k] = entry;
+      cacheDirty = true;
+    } else {
+      touchCacheEntry(entry);
+    }
+    const bpm = cacheEntryBpm(entry);
+    return { bpm, key: k, entry };
   }
   return { bpm: null, key: null, entry: null };
 }
@@ -2247,6 +2330,7 @@ const server = http.createServer(async (req, res) => {
         spotify: { loggedIn: !!(SERVICES.spotify.store.access || SERVICES.spotify.store.refresh), hasCreds: !!SERVICES.spotify.clientId },
         bpmKey: !!GSB_KEY, freqblogKey: !!FREQBLOG_KEY, lastfmKey: !!LASTFM_KEY, acousticbrainz: true, country: COUNTRY,
         bpmCacheEntries: Object.keys(bpmCache).filter((k) => !k.startsWith("norm:")).length,
+        bpmCacheMax: BPM_CACHE_MAX_TRACKS,
       });
     }
     if (url.pathname === "/api/search") {
