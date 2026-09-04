@@ -1,6 +1,6 @@
 // server.mjs — jirun bridge (dual-service: Tidal + Spotify)
 // Discovery: Last.fm (similar artists). Tempo: GetSongBPM (+ Deezer, optional
-// FreqBlog, AcousticBrainz; Tidal catalog BPM as final fallback). Catalog + playlist:
+// FreqBlog; Tidal catalog BPM; AcousticBrainz ISRC-only last). Catalog + playlist:
 // Tidal OR Spotify, chosen by which service the user logs into.
 //
 // credentials.txt (or env vars) — Tidal needs its pair, Spotify needs its pair:
@@ -485,11 +485,13 @@ async function musicBrainzFindRecordings(artist, title, isrc = null, limit = 5) 
     : `at:${normTrackKey(artist, title)}`;
   if (mbidResolveCache.has(cacheKey)) return mbidResolveCache.get(cacheKey) || [];
 
+  // Prefer a single ISRC query. Title/artist fan-out is 1+ req/s serialized and too slow for pools.
   const queries = [];
   if (isrc) queries.push(`isrc:${String(isrc).toUpperCase()}`);
-  const a = mbQuote(artist), t = mbQuote(title);
-  if (t && a) queries.push(`recording:"${t}" AND artist:"${a}"`);
-  if (t && a) queries.push(`recording:${t} AND artist:${a}`);
+  else {
+    const a = mbQuote(artist), t = mbQuote(title);
+    if (t && a) queries.push(`recording:"${t}" AND artist:"${a}"`);
+  }
 
   const wantArt = cleanMusicToken(artist);
   const wantTitle = cleanMusicToken(title);
@@ -509,15 +511,14 @@ async function musicBrainzFindRecordings(artist, title, isrc = null, limit = 5) 
         const credit = Array.isArray(h?.["artist-credit"]) ? h["artist-credit"] : [];
         const hArt = cleanMusicToken(credit.map((c) => c?.name || c?.artist?.name || "").join(" "));
         let score = Number(h?.score) || 0;
-        if (isrc && queries[0].startsWith("isrc:")) score += 50;
+        if (isrc) score += 50;
         if (hTitle && wantTitle && (hTitle === wantTitle || hTitle.includes(wantTitle) || wantTitle.includes(hTitle))) score += 20;
         if (hArt && wantArt && (hArt === wantArt || hArt.includes(wantArt) || wantArt.includes(hArt))) score += 20;
         return { id, score, title: h?.title || title };
       }).filter(Boolean).sort((x, y) => y.score - x.score);
       if (scored.length) {
         best = scored;
-        // ISRC hit or strong match is enough.
-        if (isrc || scored[0].score >= 40) break;
+        break;
       }
     } catch (_) {}
   }
@@ -541,31 +542,35 @@ async function acousticBrainzBpmForMbid(mbid) {
     return null;
   }
 }
-/** AcousticBrainz tempo via MusicBrainz recording MBID (ISRC preferred). */
+/** AcousticBrainz via MusicBrainz — ISRC-only in pool path (MB is ≤1 req/s). */
+let abInFlight = 0;
+const AB_MAX_INFLIGHT = 2;
 async function bpmFromAcousticBrainz(artist, title, isrc = null) {
+  // Without ISRC, MB title search serializes the whole pool — skip and let other sources win.
+  if (!isrc) return { bpm: null, ok: true };
+  if (abInFlight >= AB_MAX_INFLIGHT) return { bpm: null, ok: false };
+  abInFlight++;
   try {
-    const recs = await musicBrainzFindRecordings(artist, title, isrc, 5);
+    const recs = await musicBrainzFindRecordings(artist, title, isrc, 2);
     if (!recs.length) {
-      // Empty array from cache after a successful MB search = definitive miss.
-      // null cache (network fail) surfaces as empty here too after first fail — treat as soft miss.
-      return { bpm: null, ok: mbidResolveCache.get(isrc ? `isrc:${String(isrc).toUpperCase()}` : `at:${normTrackKey(artist, title)}`) != null };
+      return { bpm: null, ok: mbidResolveCache.get(`isrc:${String(isrc).toUpperCase()}`) != null };
     }
-    for (const rec of recs) {
+    for (const rec of recs.slice(0, 2)) {
       const bpm = await acousticBrainzBpmForMbid(rec.id);
       if (!(bpm > 0)) continue;
-      const viaIsrc = !!(isrc && rec.score >= 50);
-      const conf = viaIsrc ? 0.9 : rec.score >= 40 ? 0.86 : rec.score >= 20 ? 0.78 : 0.65;
       return {
         bpm,
         ok: true,
-        source: viaIsrc ? "acousticbrainz:isrc" : "acousticbrainz",
-        confidence: conf,
+        source: "acousticbrainz:isrc",
+        confidence: 0.9,
         mbid: rec.id,
       };
     }
     return { bpm: null, ok: true };
   } catch (_) {
     return { bpm: null, ok: false };
+  } finally {
+    abInFlight--;
   }
 }
 function pickConsensus(candidates) {
@@ -625,7 +630,7 @@ async function bpmForTrack(track) {
   const isrc = track?.isrc || null;
   const trackId = track?.id || track?.ref || null;
   const service = track?.service || null;
-  // Catalog BPM (e.g. Tidal attributes.bpm) is a final fallback — try cache + APIs first.
+  // Catalog BPM already on the track (e.g. Tidal attributes.bpm) — used after cheap APIs, before AcousticBrainz.
   const catalogBpm = parseCatalogBpm(track?.bpm);
 
   const cached = readCachedBpm(artist, title, { isrc, trackId, service });
@@ -640,33 +645,35 @@ async function bpmForTrack(track) {
     return bpm;
   }
 
-  const gsb = await bpmFromGetSong(artist, title);
+  // Cheap externals in parallel — don't wait on AcousticBrainz/MusicBrainz yet.
+  const [gsb, dz] = await Promise.all([
+    bpmFromGetSong(artist, title),
+    bpmFromDeezer(artist, title, isrc),
+  ]);
   const fb = gsb.bpm == null ? await bpmFromFreqBlog(artist, title) : { bpm: null, ok: false };
-  const dz = await bpmFromDeezer(artist, title, isrc);
   let winner = pickConsensus([
     gsb.bpm != null ? { bpm: gsb.bpm, source: "getsong:search", confidence: 0.8 } : null,
     fb.bpm != null ? { bpm: fb.bpm, source: "freqblog", confidence: 0.84 } : null,
     dz.bpm != null ? { bpm: dz.bpm, source: dz.source || "deezer", confidence: dz.confidence || 0.78 } : null,
   ].filter(Boolean));
-  // AcousticBrainz fills gaps when commercial BPM APIs miss (and can join consensus).
-  let ab = { bpm: null, ok: false };
-  if (!winner?.bpm) {
-    ab = await bpmFromAcousticBrainz(artist, title, isrc);
-    if (ab.bpm != null) {
-      winner = { bpm: ab.bpm, source: ab.source || "acousticbrainz", confidence: ab.confidence || 0.8, mbid: ab.mbid };
-    }
-  }
   if (winner?.bpm) {
     cacheBpm(artist, title, winner.bpm, { ...winner, isrc, trackId, service });
     return winner.bpm;
   }
-  // Tidal/catalog native tempo last — free when already on the track, after external misses.
+  // Tidal/catalog native next — free when already on the track payload (not a network search).
   if (catalogBpm != null) {
     const src = track?.bpmSource || (service === "tidal" ? "tidal" : "native");
     cacheBpm(artist, title, catalogBpm, { source: src, confidence: 0.88, isrc, trackId, service });
     return catalogBpm;
   }
-  // Only cache definitive misses; leave network failures retriable.
+  // AcousticBrainz last and capped (MusicBrainz ≤1 req/s; ISRC-only).
+  let ab = { bpm: null, ok: false };
+  ab = await bpmFromAcousticBrainz(artist, title, isrc);
+  if (ab.bpm != null) {
+    cacheBpm(artist, title, ab.bpm, { source: ab.source || "acousticbrainz", confidence: ab.confidence || 0.8, mbid: ab.mbid, isrc, trackId, service });
+    return ab.bpm;
+  }
+  // Only cache definitive misses; leave network failures / AB soft-skips retriable.
   if (gsb.ok || fb.ok || dz.ok || ab.ok) {
     cacheBpm(artist, title, null, { source: "miss", confidence: 0, isrc, trackId, service });
   }
