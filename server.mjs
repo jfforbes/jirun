@@ -1,6 +1,6 @@
 // server.mjs — jirun bridge (dual-service: Tidal + Spotify)
-// Discovery: Last.fm (similar artists). Tempo: GetSongBPM (+ Tidal catalog BPM,
-// Deezer, optional FreqBlog, AcousticBrainz via MusicBrainz). Catalog + playlist:
+// Discovery: Last.fm (similar artists). Tempo: GetSongBPM (+ Deezer, optional
+// FreqBlog, AcousticBrainz; Tidal catalog BPM as final fallback). Catalog + playlist:
 // Tidal OR Spotify, chosen by which service the user logs into.
 //
 // credentials.txt (or env vars) — Tidal needs its pair, Spotify needs its pair:
@@ -625,13 +625,9 @@ async function bpmForTrack(track) {
   const isrc = track?.isrc || null;
   const trackId = track?.id || track?.ref || null;
   const service = track?.service || null;
-  // Prefer catalog-native BPM (e.g. Tidal attributes.bpm) over cached misses / external APIs.
-  const native = parseCatalogBpm(track?.bpm);
-  if (native != null) {
-    const src = track?.bpmSource || (service === "tidal" ? "tidal" : "native");
-    cacheBpm(artist, title, native, { source: src, confidence: 0.95, isrc, trackId, service });
-    return native;
-  }
+  // Catalog BPM (e.g. Tidal attributes.bpm) is a final fallback — try cache + APIs first.
+  const catalogBpm = parseCatalogBpm(track?.bpm);
+
   const cached = readCachedBpm(artist, title, { isrc, trackId, service });
   if (cached.key) return cached.bpm;
 
@@ -663,6 +659,12 @@ async function bpmForTrack(track) {
   if (winner?.bpm) {
     cacheBpm(artist, title, winner.bpm, { ...winner, isrc, trackId, service });
     return winner.bpm;
+  }
+  // Tidal/catalog native tempo last — free when already on the track, after external misses.
+  if (catalogBpm != null) {
+    const src = track?.bpmSource || (service === "tidal" ? "tidal" : "native");
+    cacheBpm(artist, title, catalogBpm, { source: src, confidence: 0.88, isrc, trackId, service });
+    return catalogBpm;
   }
   // Only cache definitive misses; leave network failures retriable.
   if (gsb.ok || fb.ok || dz.ok || ab.ok) {
