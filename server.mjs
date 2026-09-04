@@ -132,9 +132,10 @@ function poolNeed(targetSec, targets, candidates) {
     const share = targetSec / targets.cadences.length;
     needs = targets.cadences.map((c) => ({ cadence: +c, need: share, filled: 0 })).filter((n) => n.cadence > 0);
   }
+  const pool = Array.isArray(candidates) ? candidates : [];
   if (!needs.length) {
-    const raw = candidates.reduce((s, t) => s + (t.durationSec || 210), 0);
-    const matched = candidates.reduce((s, t) => s + (t.bpm != null ? (t.durationSec || 210) : 0), 0);
+    const raw = pool.reduce((s, t) => s + (t.durationSec || 210), 0);
+    const matched = pool.reduce((s, t) => s + (t.bpm != null || t.manual ? (t.durationSec || 210) : 0), 0);
     const fillNeed = Math.max(0, targetSec);
     return {
       rawNeed: fillNeed * 8, matchNeed: fillNeed * 1.5, fillNeed, matched, raw,
@@ -154,8 +155,14 @@ function poolNeed(targetSec, targets, candidates) {
   needs = [...byCad.values()];
 
   const tracks = [];
-  for (const t of candidates) {
-    if (t.bpm == null) continue;
+  for (const t of pool) {
+    if (t.bpm == null && !t.manual) continue;
+    // Manual keeps always count; BPM rows must match a cadence band.
+    if (t.manual && t.bpm == null) {
+      // Assign to the neediest cadence (constant-SPM runs have one).
+      tracks.push({ dur: t.durationSec || 210, cads: needs.map((n) => n.cadence) });
+      continue;
+    }
     const cads = needs.filter((n) => bpmMatch(t.bpm, n.cadence, tol, modes)).map((n) => n.cadence);
     if (cads.length) tracks.push({ dur: t.durationSec || 210, cads });
   }
@@ -172,9 +179,9 @@ function poolNeed(targetSec, targets, candidates) {
 
   const fillNeed = needs.reduce((s, n) => s + n.need, 0);
   const matched = needs.reduce((s, n) => s + Math.min(n.filled, n.need), 0);
-  const raw = candidates.reduce((s, t) => s + (t.durationSec || 210), 0);
+  const raw = pool.reduce((s, t) => s + (t.durationSec || 210), 0);
   const canFill = needs.every((n) => n.filled >= n.need * 0.98);
-  // Small packing headroom — stop expanding once the run can be filled.
+  // Small packing headroom — stop expanding once the run can be packed.
   const enough = needs.every((n) => n.filled >= n.need * 1.05);
   return {
     rawNeed: fillNeed * 8,
@@ -193,6 +200,36 @@ function poolNeed(targetSec, targets, candidates) {
       short: Math.max(0, Math.round(n.need - n.filled)),
     })),
   };
+}
+/** Seed regenerate coverage into the live candidate pool (and seen-id set). */
+function injectKeptTracks(candidates, seenIds, targets) {
+  const kept = Array.isArray(targets?.keptTracks) ? targets.keptTracks : [];
+  if (!kept.length) return 0;
+  let n = 0;
+  for (const t of kept) {
+    if (!t || (t.bpm == null && !t.manual)) continue;
+    const id = String(t.id || t.ref || "");
+    if (id) {
+      if (seenIds.has(id)) continue;
+      seenIds.add(id);
+    }
+    candidates.push({
+      id: t.id || t.ref || null,
+      ref: t.ref || t.id || null,
+      service: t.service || null,
+      title: t.title || "",
+      artist: t.artist || "",
+      artistId: t.artistId || null,
+      isrc: t.isrc || null,
+      bpm: t.bpm ?? null,
+      durationSec: t.durationSec || 210,
+      manual: !!t.manual,
+      matchMode: t.matchMode || null,
+      bpmSource: t.manual ? "manual" : (t.bpmSource || "kept"),
+    });
+    n++;
+  }
+  return n;
 }
 /** Overall playlist-build % for the gather phase (never 100 — packing finishes on the client). */
 function playlistGatherPct(phase, { level = 0, maxLevels = 80, need = null, bpmDone = 0, bpmTotal = 0 } = {}) {
@@ -1499,6 +1536,7 @@ async function tidalPool(seeds, targetSec = 0, targets = null, onProgress = null
   let currentLevel = 0;
   const bpmStats = { tried: 0, hit: 0 };
   for (const s of seedList) if (s.id && s.name) idToName.set(String(s.id), s.name);
+  const keptN = injectKeptTracks(candidates, allTrackIds, targets);
   const report = (phase, extra = {}) => {
     if (!onProgress) return;
     const need = poolNeed(targetSec, targets, candidates);
@@ -1686,9 +1724,18 @@ async function tidalPool(seeds, targetSec = 0, targets = null, onProgress = null
       .sort((a, b) => b.score - a.score);
   }
 
-  report("start", { detail: "Gathering full discographies from seed artists" });
+  report("start", {
+    detail: keptN
+      ? `Keeping ${keptN} playlist songs · gathering seed discographies to fill gaps`
+      : "Gathering full discographies from seed artists",
+  });
   await fetchArtists(seedIds, true, "seed discographies");
   await fillFromTempoCatalog("Stamping tempos from BPM catalog");
+  // Kept + seed coverage may already pack the run — skip related-artist grind.
+  if (poolNeed(targetSec, targets, candidates).canFill) {
+    report("done", { detail: keptN ? "Coverage met by kept playlist songs" : "Seed coverage ready" });
+    return candidates;
+  }
 
   // Scored BFS queues — multi-seed votes + Last.fm match + genre fan-out.
   const idQueue = makeScoredQueue();
@@ -2032,6 +2079,7 @@ async function spotifyPool(seeds, targetSec = 0, targets = null, onProgress = nu
   const pendingByKey = new Map();
   let currentLevel = 0;
   const bpmStats = { tried: 0, hit: 0 };
+  const keptN = injectKeptTracks(candidates, seenRef, targets);
   const report = (phase, extra = {}) => {
     if (!onProgress) return;
     const need = poolNeed(targetSec, targets, candidates);
@@ -2163,9 +2211,17 @@ async function spotifyPool(seeds, targetSec = 0, targets = null, onProgress = nu
     return fresh;
   }
 
-  report("start", { detail: "Gathering full discographies from seed artists" });
+  report("start", {
+    detail: keptN
+      ? `Keeping ${keptN} playlist songs · gathering seed discographies to fill gaps`
+      : "Gathering full discographies from seed artists",
+  });
   await fetchNames(seedNames, "seed discographies", { seedWeight: true });
   await fillFromTempoCatalog("Stamping tempos from BPM catalog");
+  if (poolNeed(targetSec, targets, candidates).canFill) {
+    report("done", { detail: keptN ? "Coverage met by kept playlist songs" : "Seed coverage ready" });
+    return candidates;
+  }
 
   const nameQueue = makeScoredQueue();
   const genreTried = new Set();

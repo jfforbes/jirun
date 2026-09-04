@@ -655,6 +655,34 @@ function plannedCadenceNeeds(){
   }
   return cadence>0?[{cadence,sec:Math.round(totalSec)}]:[];
 }
+/** Compact kept-playlist rows so the server credits existing coverage on regenerate. */
+function keptTracksForPool(keepBySeg){
+  if(!Array.isArray(keepBySeg))return[];
+  const out=[];
+  const seen=new Set();
+  for(const seg of keepBySeg){
+    for(const t of seg||[]){
+      const id=String(t?.id||t?.ref||"");
+      const k=id||`${t?.artist||""}|${t?.title||""}`;
+      if(!k||seen.has(k))continue;
+      seen.add(k);
+      out.push({
+        id:id||null,
+        ref:t.ref||t.id||null,
+        title:t.title||"",
+        artist:t.artist||"",
+        artistId:t.artistId||null,
+        bpm:t.bpm??null,
+        durationSec:t.durationSec||210,
+        isrc:t.isrc||null,
+        service:t.service||state.service,
+        manual:!!t.manual,
+        matchMode:t.matchMode||null,
+      });
+    }
+  }
+  return out;
+}
 function packOpts(extra={}){
   const modes=Object.entries(state.modes).filter(([,v])=>v).map(([k])=>k);
   const cadenceModel=()=>constantCadence();
@@ -809,7 +837,14 @@ async function runPoolSearch({keepMatchedOnly=false,includePlaylistArtists=false
         ?`Searching from ${seeds.length} artists (${nSeed} backlog + ${nPl} from playlist)…`
         :`Searching from ${seeds.length} seed artist${seeds.length===1?"":"s"}…`,
     });
-    const targets={cadences:plannedCadences(),cadenceNeeds:plannedCadenceNeeds(),tol:state.tol,modes};
+    const targets={
+      cadences:plannedCadences(),
+      cadenceNeeds:plannedCadenceNeeds(),
+      tol:state.tol,
+      modes,
+      // Credit already-kept playlist time so regenerate can stop once gaps are filled.
+      keptTracks:keepBySeg?keptTracksForPool(keepBySeg):[],
+    };
     let candidates;
     try{
       candidates=await api.pool(seeds,plannedSeconds(),targets,loading.update,{
