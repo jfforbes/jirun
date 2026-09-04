@@ -1,6 +1,6 @@
 // server.mjs — jirun bridge (dual-service: Tidal + Spotify)
-// Discovery: Last.fm (similar artists). Tempo: GetSongBPM (+ Tidal catalog BPM,
-// Deezer, optional FreqBlog, AcousticBrainz via MusicBrainz). Catalog + playlist:
+// Discovery: Last.fm (similar artists). Tempo: GetSongBPM (+ Deezer, optional
+// FreqBlog, AcousticBrainz; Tidal catalog BPM as final fallback). Catalog + playlist:
 // Tidal OR Spotify, chosen by which service the user logs into.
 //
 // credentials.txt (or env vars) — Tidal needs its pair, Spotify needs its pair:
