@@ -1,6 +1,6 @@
 // server.mjs — jirun bridge (dual-service: Tidal + Spotify)
-// Discovery: Last.fm (similar artists). Tempo: GetSongBPM (+ Deezer, optional
-// FreqBlog, AcousticBrainz via MusicBrainz). Catalog + playlist:
+// Discovery: Last.fm (similar artists). Tempo: GetSongBPM (+ Tidal catalog BPM,
+// Deezer, optional FreqBlog, AcousticBrainz via MusicBrainz). Catalog + playlist:
 // Tidal OR Spotify, chosen by which service the user logs into.
 //
 // credentials.txt (or env vars) — Tidal needs its pair, Spotify needs its pair:
@@ -266,6 +266,12 @@ function cacheEntryBpm(entry) {
   if (typeof entry === "number") return entry > 0 ? entry : null;
   if (typeof entry === "object" && Number(entry.bpm) > 0) return Math.round(Number(entry.bpm));
   return null;
+}
+/** Accept catalog/API BPM values in a runnable cadence range. */
+function parseCatalogBpm(v) {
+  const n = Number(v);
+  if (!(n >= 40 && n <= 240)) return null;
+  return Math.round(n);
 }
 function cacheStoreKeys(artist, title, { isrc = null, trackId = null, service = null } = {}) {
   const keys = [];
@@ -536,6 +542,13 @@ async function bpmForTrack(track) {
   const isrc = track?.isrc || null;
   const trackId = track?.id || track?.ref || null;
   const service = track?.service || null;
+  // Prefer catalog-native BPM (e.g. Tidal attributes.bpm) over cached misses / external APIs.
+  const native = parseCatalogBpm(track?.bpm);
+  if (native != null) {
+    const src = track?.bpmSource || (service === "tidal" ? "tidal" : "native");
+    cacheBpm(artist, title, native, { source: src, confidence: 0.95, isrc, trackId, service });
+    return native;
+  }
   const cached = readCachedBpm(artist, title, { isrc, trackId, service });
   if (cached.key) return cached.bpm;
 
@@ -890,6 +903,7 @@ function tidalMapTrack(res, included = []) {
     const ag = (art?.relationships?.genres?.data || []).map((g) => g.id);
     genres = included.filter((x) => x.type === "genres" && ag.includes(x.id)).map((x) => x.attributes?.name).filter(Boolean);
   }
+  const bpm = parseCatalogBpm(a.bpm);
   return {
     id: res.id,
     ref: res.id,
@@ -898,7 +912,8 @@ function tidalMapTrack(res, included = []) {
     artist,
     artistId: artistId ? String(artistId) : null,
     isrc: a.isrc || null,
-    bpm: null,
+    bpm,
+    bpmSource: bpm != null ? "tidal" : undefined,
     durationSec: isoToSec(a.duration),
     genres: [...new Set(genres)].slice(0, 4),
   };
