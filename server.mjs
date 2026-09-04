@@ -1450,18 +1450,24 @@ async function tidalResolveArtist(name) {
   tidalArtistIdCache[k] = id;
   return id;
 }
-async function tidalArtistTrackIds(aid, limit) {
+/** Per-artist track caps: seeds get a full discography pull; related stay shallow. */
+const SEED_DISCOGRAPHY_CAP = 2500;
+const RELATED_ARTIST_TRACK_CAP = 35;
+async function tidalArtistTrackIds(aid, limit = RELATED_ARTIST_TRACK_CAP) {
+  const max = Number.isFinite(limit) && limit > 0 ? Math.floor(limit) : SEED_DISCOGRAPHY_CAP;
   const ids = [];
   let pathq = `/artists/${aid}/relationships/tracks?countryCode=${COUNTRY}&collapseBy=FINGERPRINT`;
   const rel = (n) => (n ? (n.startsWith("http") ? n.replace(TIDAL_API, "") : n) : null);
-  for (let page = 0; page < 6 && pathq && ids.length < limit; page++) {
+  // Seeds may need many pages; related artists stay on a short crawl.
+  const maxPages = max >= SEED_DISCOGRAPHY_CAP ? 200 : Math.max(6, Math.ceil(max / 15) + 2);
+  for (let page = 0; page < maxPages && pathq && ids.length < max; page++) {
     try {
       const j = await tapi(pathq);
       for (const d of j.data || []) if (d?.id) ids.push(d.id);
       pathq = rel(j.links?.next);
     } catch (_) { break; }
   }
-  return ids.slice(0, limit);
+  return ids.slice(0, max);
 }
 const POOL_BUDGET_MS = 25 * 60 * 1000; // keep expanding related artists until cadences can fill
 /** Shared expansion caps — deep BFS until the playlist can be packed. */
@@ -1493,8 +1499,6 @@ async function tidalPool(seeds, targetSec = 0, targets = null, onProgress = null
   let currentLevel = 0;
   const bpmStats = { tried: 0, hit: 0 };
   for (const s of seedList) if (s.id && s.name) idToName.set(String(s.id), s.name);
-  // With many seeds, pull fewer tracks each so every seed gets BPM coverage before the time ceiling.
-  const seedTrackCap = Math.max(20, Math.min(80, Math.floor(1200 / Math.max(1, seedIds.length))));
   const report = (phase, extra = {}) => {
     if (!onProgress) return;
     const need = poolNeed(targetSec, targets, candidates);
@@ -1632,8 +1636,8 @@ async function tidalPool(seeds, targetSec = 0, targets = null, onProgress = null
     fresh.forEach((a) => doneArtists.add(a));
     if (!fresh.length) return [];
     report("tracks", { detail, pendingArtists: fresh.length });
-    const perArtist = seedWeight ? seedTrackCap : 35;
-    const trackLists = await mapLimit(fresh, 6, async (aid) => {
+    const perArtist = seedWeight ? SEED_DISCOGRAPHY_CAP : RELATED_ARTIST_TRACK_CAP;
+    const trackLists = await mapLimit(fresh, seedWeight ? 3 : 6, async (aid) => {
       try { return await tidalArtistTrackIds(aid, perArtist); } catch (_) { return []; }
     });
     const newIds = [];
@@ -1682,8 +1686,8 @@ async function tidalPool(seeds, targetSec = 0, targets = null, onProgress = null
       .sort((a, b) => b.score - a.score);
   }
 
-  report("start", { detail: "Gathering songs from seed artists" });
-  await fetchArtists(seedIds, true, "seed artists");
+  report("start", { detail: "Gathering full discographies from seed artists" });
+  await fetchArtists(seedIds, true, "seed discographies");
   await fillFromTempoCatalog("Stamping tempos from BPM catalog");
 
   // Scored BFS queues — multi-seed votes + Last.fm match + genre fan-out.
@@ -1933,23 +1937,75 @@ async function spotifyHydrateArtistGenres(tracks) {
   }
   return list;
 }
-async function spotifyArtistTracks(name, id = null, limit = 40) {
+async function spotifyArtistAlbumTracks(id, name, limit = SEED_DISCOGRAPHY_CAP) {
   const byRef = new Map();
-  const add = (t) => { if (t?.uri && !byRef.has(t.uri)) byRef.set(t.uri, spotifyMapTrack(t, name)); };
-  if (id) {
-    try { const j = await sapi(`/artists/${id}/top-tracks?market=US`); for (const t of j.tracks || []) add(t); } catch (_) {}
-  }
-  const q = encodeURIComponent(`artist:"${name}"`);
-  for (let offset = 0; offset < 100 && byRef.size < limit; offset += 50) {
+  const add = (t) => {
+    if (!t?.uri || byRef.has(t.uri)) return;
+    // Keep tracks where this artist is credited (skips pure features on others' albums when possible).
+    const credited = (t.artists || []).some((a) => String(a?.id) === String(id));
+    if (!credited) return;
+    byRef.set(t.uri, spotifyMapTrack(t, name));
+  };
+  const albumIds = [];
+  const seenAlbum = new Set();
+  let path = `/artists/${encodeURIComponent(id)}/albums?include_groups=album,single&limit=50&market=US`;
+  for (let page = 0; page < 40 && path && albumIds.length < 400; page++) {
     try {
-      const j = await sapi(`/search?q=${q}&type=track&limit=50&offset=${offset}`);
-      const items = j.tracks?.items || [];
-      if (!items.length) break;
-      for (const t of items) add(t);
-      if (items.length < 50) break;
+      const j = await sapi(path);
+      for (const a of j.items || []) {
+        if (!a?.id || seenAlbum.has(a.id)) continue;
+        seenAlbum.add(a.id);
+        albumIds.push(a.id);
+      }
+      const next = j.next || null;
+      path = next ? next.replace(/^https:\/\/api\.spotify\.com\/v1/, "") : null;
+      if (!(j.items || []).length) break;
     } catch (_) { break; }
   }
-  const out = [...byRef.values()].slice(0, limit);
+  for (let i = 0; i < albumIds.length && byRef.size < limit; i += 20) {
+    const chunk = albumIds.slice(i, i + 20);
+    try {
+      const j = await sapi(`/albums?ids=${chunk.join(",")}&market=US`);
+      for (const al of j.albums || []) {
+        for (const t of al?.tracks?.items || []) add(t);
+        // Album track paging is rare for singles; follow if present.
+        let more = al?.tracks?.next ? al.tracks.next.replace(/^https:\/\/api\.spotify\.com\/v1/, "") : null;
+        while (more && byRef.size < limit) {
+          const tj = await sapi(more);
+          for (const t of tj.items || []) add(t);
+          more = tj.next ? tj.next.replace(/^https:\/\/api\.spotify\.com\/v1/, "") : null;
+        }
+      }
+    } catch (_) {}
+  }
+  return [...byRef.values()].slice(0, limit);
+}
+async function spotifyArtistTracks(name, id = null, limit = RELATED_ARTIST_TRACK_CAP) {
+  const max = Number.isFinite(limit) && limit > 0 ? Math.floor(limit) : SEED_DISCOGRAPHY_CAP;
+  const byRef = new Map();
+  const add = (t) => { if (t?.uri && !byRef.has(t.uri)) byRef.set(t.uri, spotifyMapTrack(t, name)); };
+  // Seeds: walk albums/singles for a real discography. Related: top-tracks + short search.
+  if (id && max >= SEED_DISCOGRAPHY_CAP) {
+    try {
+      const full = await spotifyArtistAlbumTracks(id, name, max);
+      for (const t of full) if (t?.ref && !byRef.has(t.ref)) byRef.set(t.ref, t);
+    } catch (_) {}
+  } else if (id) {
+    try { const j = await sapi(`/artists/${id}/top-tracks?market=US`); for (const t of j.tracks || []) add(t); } catch (_) {}
+  }
+  if (byRef.size < Math.min(max, 40)) {
+    const q = encodeURIComponent(`artist:"${name}"`);
+    for (let offset = 0; offset < 150 && byRef.size < max; offset += 50) {
+      try {
+        const j = await sapi(`/search?q=${q}&type=track&limit=50&offset=${offset}`);
+        const items = j.tracks?.items || [];
+        if (!items.length) break;
+        for (const t of items) add(t);
+        if (items.length < 50) break;
+      } catch (_) { break; }
+    }
+  }
+  const out = [...byRef.values()].slice(0, max);
   await spotifyHydrateArtistGenres(out);
   return out;
 }
@@ -1976,7 +2032,6 @@ async function spotifyPool(seeds, targetSec = 0, targets = null, onProgress = nu
   const pendingByKey = new Map();
   let currentLevel = 0;
   const bpmStats = { tried: 0, hit: 0 };
-  const seedTrackCap = Math.max(20, Math.min(70, Math.floor(1000 / Math.max(1, seedNames.length))));
   const report = (phase, extra = {}) => {
     if (!onProgress) return;
     const need = poolNeed(targetSec, targets, candidates);
@@ -2095,11 +2150,11 @@ async function spotifyPool(seeds, targetSec = 0, targets = null, onProgress = nu
     fresh.forEach((n) => doneNames.add(n.toLowerCase()));
     if (!fresh.length) return [];
     report("tracks", { detail, pendingArtists: fresh.length });
-    const lists = await mapLimit(fresh, 5, async (nm) => {
-      const isSeed = seedNameSet.has(nm.toLowerCase());
+    const lists = await mapLimit(fresh, seedWeight ? 3 : 5, async (nm) => {
+      const isSeed = seedWeight || seedNameSet.has(nm.toLowerCase());
       let id = seedIdByName.get(nm.toLowerCase()) || null;
       if (!id) id = await spotifyResolveArtist(nm).catch(() => null);
-      return spotifyArtistTracks(nm, id, isSeed ? seedTrackCap : 35).catch(() => []);
+      return spotifyArtistTracks(nm, id, isSeed ? SEED_DISCOGRAPHY_CAP : RELATED_ARTIST_TRACK_CAP).catch(() => []);
     });
     const toBpm = [];
     for (const tl of lists) for (const t of tl) if (t && !seenRef.has(t.ref)) { seenRef.add(t.ref); toBpm.push(t); }
@@ -2108,8 +2163,8 @@ async function spotifyPool(seeds, targetSec = 0, targets = null, onProgress = nu
     return fresh;
   }
 
-  report("start", { detail: "Gathering songs from seed artists" });
-  await fetchNames(seedNames, "seed artists", { seedWeight: true });
+  report("start", { detail: "Gathering full discographies from seed artists" });
+  await fetchNames(seedNames, "seed discographies", { seedWeight: true });
   await fillFromTempoCatalog("Stamping tempos from BPM catalog");
 
   const nameQueue = makeScoredQueue();
