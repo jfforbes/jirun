@@ -1,5 +1,6 @@
 // server.mjs — jirun bridge (dual-service: Tidal + Spotify)
-// Discovery: Last.fm (similar artists). Tempo: GetSongBPM. Catalog + playlist:
+// Discovery: Last.fm (similar artists). Tempo: GetSongBPM (+ Tidal catalog BPM,
+// Deezer, optional FreqBlog, AcousticBrainz via MusicBrainz). Catalog + playlist:
 // Tidal OR Spotify, chosen by which service the user logs into.
 //
 // credentials.txt (or env vars) — Tidal needs its pair, Spotify needs its pair:
@@ -8,6 +9,7 @@
 //   GETSONGBPM_API_KEY
 //   LASTFM_API_KEY
 //   FREQBLOG_API_KEY (optional second BPM source)
+// AcousticBrainz needs no key (MusicBrainz recording MBID → rhythm.bpm).
 // Redirect URI to register in BOTH dashboards: http://localhost:8080/callback
 // Run: node server.mjs
 
@@ -211,7 +213,25 @@ function playlistGatherPct(phase, { level = 0, maxLevels = 80, need = null, bpmD
   return Math.max(3, Math.min(86, Math.round(pct)));
 }
 
-/* ---- BPM lookup (GetSongBPM + optional FreqBlog + tempo-catalog) ---- */
+/* ---- BPM lookup (GetSongBPM + Deezer + optional FreqBlog + AcousticBrainz) ---- */
+const MB_UA = "jirun/1.0 (https://github.com/jfforbes/jirun)";
+const MB_BASE = "https://musicbrainz.org/ws/2";
+const AB_BASE = "https://acousticbrainz.org/api/v1";
+/** MusicBrainz asks for ≤1 req/s — serialize + space requests. */
+let mbNextAt = 0;
+let mbChain = Promise.resolve();
+function mbFetch(url) {
+  const run = async () => {
+    const wait = Math.max(0, mbNextAt - Date.now());
+    if (wait) await new Promise((r) => setTimeout(r, wait));
+    mbNextAt = Date.now() + 1100;
+    return fetch(url, { headers: { Accept: "application/json", "User-Agent": MB_UA } });
+  };
+  const p = mbChain.then(run, run);
+  mbChain = p.then(() => {}, () => {});
+  return p;
+}
+const mbidResolveCache = new Map(); // cacheKey → [{id,score}] | null
 const BPM_CACHE_FILE = path.join(__dirname, "bpm-cache.json");
 let bpmCache = {}; try { bpmCache = JSON.parse(fs.readFileSync(BPM_CACHE_FILE, "utf8")); } catch (_) {}
 let cacheDirty = false;
@@ -246,6 +266,12 @@ function cacheEntryBpm(entry) {
   if (typeof entry === "number") return entry > 0 ? entry : null;
   if (typeof entry === "object" && Number(entry.bpm) > 0) return Math.round(Number(entry.bpm));
   return null;
+}
+/** Accept catalog/API BPM values in a runnable cadence range. */
+function parseCatalogBpm(v) {
+  const n = Number(v);
+  if (!(n >= 40 && n <= 240)) return null;
+  return Math.round(n);
 }
 function cacheStoreKeys(artist, title, { isrc = null, trackId = null, service = null } = {}) {
   const keys = [];
@@ -366,6 +392,99 @@ async function bpmFromDeezer(artist, title, isrc = null) {
     return { bpm: null, ok: false };
   }
 }
+/** Escape Lucene-ish specials for MusicBrainz search phrases. */
+function mbQuote(s) {
+  return String(s || "").replace(/\\/g, "\\\\").replace(/"/g, '\\"');
+}
+async function musicBrainzFindRecordings(artist, title, isrc = null, limit = 5) {
+  const cacheKey = isrc
+    ? `isrc:${String(isrc).toUpperCase()}`
+    : `at:${normTrackKey(artist, title)}`;
+  if (mbidResolveCache.has(cacheKey)) return mbidResolveCache.get(cacheKey) || [];
+
+  const queries = [];
+  if (isrc) queries.push(`isrc:${String(isrc).toUpperCase()}`);
+  const a = mbQuote(artist), t = mbQuote(title);
+  if (t && a) queries.push(`recording:"${t}" AND artist:"${a}"`);
+  if (t && a) queries.push(`recording:${t} AND artist:${a}`);
+
+  const wantArt = cleanMusicToken(artist);
+  const wantTitle = cleanMusicToken(title);
+  let best = [];
+  let sawOk = false;
+  for (const q of queries) {
+    try {
+      const r = await mbFetch(`${MB_BASE}/recording?query=${encodeURIComponent(q)}&fmt=json&limit=${limit}`);
+      if (!r.ok) continue;
+      sawOk = true;
+      const j = await r.json();
+      const hits = Array.isArray(j?.recordings) ? j.recordings : [];
+      const scored = hits.map((h) => {
+        const id = h?.id;
+        if (!id) return null;
+        const hTitle = cleanMusicToken(h?.title || "");
+        const credit = Array.isArray(h?.["artist-credit"]) ? h["artist-credit"] : [];
+        const hArt = cleanMusicToken(credit.map((c) => c?.name || c?.artist?.name || "").join(" "));
+        let score = Number(h?.score) || 0;
+        if (isrc && queries[0].startsWith("isrc:")) score += 50;
+        if (hTitle && wantTitle && (hTitle === wantTitle || hTitle.includes(wantTitle) || wantTitle.includes(hTitle))) score += 20;
+        if (hArt && wantArt && (hArt === wantArt || hArt.includes(wantArt) || wantArt.includes(hArt))) score += 20;
+        return { id, score, title: h?.title || title };
+      }).filter(Boolean).sort((x, y) => y.score - x.score);
+      if (scored.length) {
+        best = scored;
+        // ISRC hit or strong match is enough.
+        if (isrc || scored[0].score >= 40) break;
+      }
+    } catch (_) {}
+  }
+  const out = best.slice(0, limit);
+  mbidResolveCache.set(cacheKey, out.length ? out : (sawOk ? [] : null));
+  return out;
+}
+async function acousticBrainzBpmForMbid(mbid) {
+  if (!mbid) return null;
+  try {
+    const r = await fetch(`${AB_BASE}/${encodeURIComponent(mbid)}/low-level`, {
+      headers: { Accept: "application/json", "User-Agent": MB_UA },
+    });
+    if (r.status === 404) return null;
+    if (!r.ok) return null;
+    const j = await r.json();
+    const bpm = Number(j?.rhythm?.bpm);
+    if (!(bpm >= 40 && bpm <= 240)) return null;
+    return Math.round(bpm);
+  } catch (_) {
+    return null;
+  }
+}
+/** AcousticBrainz tempo via MusicBrainz recording MBID (ISRC preferred). */
+async function bpmFromAcousticBrainz(artist, title, isrc = null) {
+  try {
+    const recs = await musicBrainzFindRecordings(artist, title, isrc, 5);
+    if (!recs.length) {
+      // Empty array from cache after a successful MB search = definitive miss.
+      // null cache (network fail) surfaces as empty here too after first fail — treat as soft miss.
+      return { bpm: null, ok: mbidResolveCache.get(isrc ? `isrc:${String(isrc).toUpperCase()}` : `at:${normTrackKey(artist, title)}`) != null };
+    }
+    for (const rec of recs) {
+      const bpm = await acousticBrainzBpmForMbid(rec.id);
+      if (!(bpm > 0)) continue;
+      const viaIsrc = !!(isrc && rec.score >= 50);
+      const conf = viaIsrc ? 0.9 : rec.score >= 40 ? 0.86 : rec.score >= 20 ? 0.78 : 0.65;
+      return {
+        bpm,
+        ok: true,
+        source: viaIsrc ? "acousticbrainz:isrc" : "acousticbrainz",
+        confidence: conf,
+        mbid: rec.id,
+      };
+    }
+    return { bpm: null, ok: true };
+  } catch (_) {
+    return { bpm: null, ok: false };
+  }
+}
 function pickConsensus(candidates) {
   const good = (candidates || []).filter((c) => Number(c?.bpm) > 0);
   if (!good.length) return null;
@@ -423,6 +542,13 @@ async function bpmForTrack(track) {
   const isrc = track?.isrc || null;
   const trackId = track?.id || track?.ref || null;
   const service = track?.service || null;
+  // Prefer catalog-native BPM (e.g. Tidal attributes.bpm) over cached misses / external APIs.
+  const native = parseCatalogBpm(track?.bpm);
+  if (native != null) {
+    const src = track?.bpmSource || (service === "tidal" ? "tidal" : "native");
+    cacheBpm(artist, title, native, { source: src, confidence: 0.95, isrc, trackId, service });
+    return native;
+  }
   const cached = readCachedBpm(artist, title, { isrc, trackId, service });
   if (cached.key) return cached.bpm;
 
@@ -438,17 +564,25 @@ async function bpmForTrack(track) {
   const gsb = await bpmFromGetSong(artist, title);
   const fb = gsb.bpm == null ? await bpmFromFreqBlog(artist, title) : { bpm: null, ok: false };
   const dz = await bpmFromDeezer(artist, title, isrc);
-  const winner = pickConsensus([
+  let winner = pickConsensus([
     gsb.bpm != null ? { bpm: gsb.bpm, source: "getsong:search", confidence: 0.8 } : null,
     fb.bpm != null ? { bpm: fb.bpm, source: "freqblog", confidence: 0.84 } : null,
     dz.bpm != null ? { bpm: dz.bpm, source: dz.source || "deezer", confidence: dz.confidence || 0.78 } : null,
   ].filter(Boolean));
+  // AcousticBrainz fills gaps when commercial BPM APIs miss (and can join consensus).
+  let ab = { bpm: null, ok: false };
+  if (!winner?.bpm) {
+    ab = await bpmFromAcousticBrainz(artist, title, isrc);
+    if (ab.bpm != null) {
+      winner = { bpm: ab.bpm, source: ab.source || "acousticbrainz", confidence: ab.confidence || 0.8, mbid: ab.mbid };
+    }
+  }
   if (winner?.bpm) {
     cacheBpm(artist, title, winner.bpm, { ...winner, isrc, trackId, service });
     return winner.bpm;
   }
   // Only cache definitive misses; leave network failures retriable.
-  if (gsb.ok || fb.ok || dz.ok) {
+  if (gsb.ok || fb.ok || dz.ok || ab.ok) {
     cacheBpm(artist, title, null, { source: "miss", confidence: 0, isrc, trackId, service });
   }
   return null;
@@ -769,6 +903,7 @@ function tidalMapTrack(res, included = []) {
     const ag = (art?.relationships?.genres?.data || []).map((g) => g.id);
     genres = included.filter((x) => x.type === "genres" && ag.includes(x.id)).map((x) => x.attributes?.name).filter(Boolean);
   }
+  const bpm = parseCatalogBpm(a.bpm);
   return {
     id: res.id,
     ref: res.id,
@@ -777,7 +912,8 @@ function tidalMapTrack(res, included = []) {
     artist,
     artistId: artistId ? String(artistId) : null,
     isrc: a.isrc || null,
-    bpm: null,
+    bpm,
+    bpmSource: bpm != null ? "tidal" : undefined,
     durationSec: isoToSec(a.duration),
     genres: [...new Set(genres)].slice(0, 4),
   };
@@ -2109,7 +2245,7 @@ const server = http.createServer(async (req, res) => {
         ok: true,
         tidal: { loggedIn: !!(SERVICES.tidal.store.access || SERVICES.tidal.store.refresh), hasCreds: !!SERVICES.tidal.clientId },
         spotify: { loggedIn: !!(SERVICES.spotify.store.access || SERVICES.spotify.store.refresh), hasCreds: !!SERVICES.spotify.clientId },
-        bpmKey: !!GSB_KEY, freqblogKey: !!FREQBLOG_KEY, lastfmKey: !!LASTFM_KEY, country: COUNTRY,
+        bpmKey: !!GSB_KEY, freqblogKey: !!FREQBLOG_KEY, lastfmKey: !!LASTFM_KEY, acousticbrainz: true, country: COUNTRY,
         bpmCacheEntries: Object.keys(bpmCache).filter((k) => !k.startsWith("norm:")).length,
       });
     }
@@ -2268,7 +2404,7 @@ const server = http.createServer(async (req, res) => {
 });
 server.listen(PORT, () => {
   const have = (n) => (SERVICES[n].clientId ? "✓" : "—");
-  console.log(`jirun bridge on http://localhost:${PORT}/  (tidal ${have("tidal")}, spotify ${have("spotify")}, bpm ${GSB_KEY ? "✓" : "—"}, freqblog ${FREQBLOG_KEY ? "✓" : "—"}, lastfm ${LASTFM_KEY ? "✓" : "—"})`);
+  console.log(`jirun bridge on http://localhost:${PORT}/  (tidal ${have("tidal")}, spotify ${have("spotify")}, bpm ${GSB_KEY ? "✓" : "—"}, freqblog ${FREQBLOG_KEY ? "✓" : "—"}, lastfm ${LASTFM_KEY ? "✓" : "—"}, acousticbrainz ✓)`);
   console.log(`Redirect URI to register in both dashboards: ${REDIRECT_URI}`);
 });
 // Pool builds can run longer than Node's default 5-minute request timeout.
