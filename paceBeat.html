@@ -477,6 +477,28 @@ let lastPlaylist=[];
 let lastResult=null;
 let lastCandidates=[];
 let poolBusy=false;
+/* Render free tier spins down after ~15m with no inbound traffic. Long /api/pool
+   streams are mostly outbound progress, so ping health while the tab is open. */
+const KEEP_ALIVE_MS=8*60*1000;
+const KEEP_ALIVE_BUSY_MS=2*60*1000;
+let keepAliveTimer=null;
+async function pingKeepAlive(){
+  try{await fetch("/api/health",{cache:"no-store"});}catch(_){}
+}
+function scheduleKeepAlive(){
+  if(keepAliveTimer)clearTimeout(keepAliveTimer);
+  const ms=poolBusy?KEEP_ALIVE_BUSY_MS:KEEP_ALIVE_MS;
+  keepAliveTimer=setTimeout(async()=>{
+    if(poolBusy||document.visibilityState==="visible")await pingKeepAlive();
+    scheduleKeepAlive();
+  },ms);
+}
+function startRenderKeepAlive(){
+  scheduleKeepAlive();
+  document.addEventListener("visibilitychange",()=>{
+    if(document.visibilityState==="visible")pingKeepAlive().finally(()=>scheduleKeepAlive());
+  });
+}
 let excludedIds=new Set();
 let playlistExportName=null;
 
@@ -732,6 +754,7 @@ async function runPoolSearch({keepMatchedOnly=false,includePlaylistArtists=false
   if(!combined.length)return;
 
   poolBusy=true;
+  scheduleKeepAlive();
   const abort=new AbortController();
   // Freeze kept BPM-matched tracks so regenerate shows them immediately while the pool expands.
   const keepBySeg=keepMatchedOnly&&lastResult?keepMatchedTracksBySeg(lastResult.plan,packOpts()):null;
@@ -818,6 +841,7 @@ async function runPoolSearch({keepMatchedOnly=false,includePlaylistArtists=false
     renderSeeds();
   }finally{
     poolBusy=false;
+    scheduleKeepAlive();
     if(lastResult)renderResults(lastResult,{scroll:false});
   }
 }
@@ -1164,6 +1188,7 @@ function renderResults(res,opts={}){
 }
 
 loadCal();$("#spmInput").value=state.spm;renderSegs();renderSeeds();
+startRenderKeepAlive();
 const _svc=new URLSearchParams(location.search).get("service");if(_svc&&(_svc==="tidal"||_svc==="spotify"))setService(_svc);else checkLogin();
 </script>
 </body>
