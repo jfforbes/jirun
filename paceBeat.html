@@ -126,6 +126,8 @@
   .btn.secondary:hover{border-color:var(--pace);color:var(--pace)}
   .legend{display:flex;gap:14px;font-size:11px;color:var(--muted);margin-top:6px;flex-wrap:wrap}
   a{color:var(--pace)}
+  #pool-progress-slot{margin:0}
+  #pool-progress-slot:not([hidden]){margin-bottom:4px}
   .pool-progress{padding:20px 8px 8px;text-align:center}
   .pool-progress .stop-row{margin-top:14px;max-width:280px;margin-left:auto;margin-right:auto}
   .pool-progress .stop-row .btn{margin-top:0}
@@ -206,6 +208,7 @@
     <div class="legend"><span><b class="tag direct" style="padding:1px 5px">direct</b> beat = cadence</span><span><b class="tag half" style="padding:1px 5px">half</b> step every beat</span></div>
   </section>
 
+  <div id="pool-progress-slot" hidden></div>
   <div id="results-area"></div>
   <footer style="text-align:center;font-size:11px;color:var(--muted);margin:14px 0 4px">BPM data by <a href="https://getsongbpm.com" target="_blank" rel="noopener" style="color:var(--pace);font-weight:600">GetSongBPM</a> · <a href="https://acousticbrainz.org" target="_blank" rel="noopener" style="color:var(--pace);font-weight:600">AcousticBrainz</a></footer>
   <div class="cta"><button id="build" disabled>Refine the backlog first</button></div>
@@ -352,7 +355,7 @@ const api={
     if(!r.ok)throw new Error(j.error||r.status);
     return j;
   },
-  async pool(seeds,targetSec,targets,onProgress,{signal}={}){
+  async pool(seeds,targetSec,targets,onProgress,{signal,onSnapshot}={}){
     let r;
     try{r=await fetch(`/api/pool`,{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify({service:state.service,targetSec:targetSec||0,targets:targets||null,seeds:seeds.map(s=>({id:s.id,name:s.name||s.title||""}))}),signal});}
     catch(e){
@@ -405,6 +408,7 @@ const api={
           if(msg.type==="progress"){if(typeof onProgress==="function")onProgress(msg);}
           else if(msg.type==="snapshot"){
             latest=Array.isArray(msg.candidates)?msg.candidates:latest;
+            if(typeof onSnapshot==="function"&&Array.isArray(latest))onSnapshot(latest,msg);
             if(typeof onProgress==="function"){
               onProgress({
                 stage:"gather",
@@ -472,6 +476,7 @@ const $=(s)=>document.querySelector(s);
 let lastPlaylist=[];
 let lastResult=null;
 let lastCandidates=[];
+let poolBusy=false;
 let excludedIds=new Set();
 let playlistExportName=null;
 
@@ -501,10 +506,16 @@ async function checkLogin(){await api.health();const btn=$("#loginBtn");const sv
   if(h.loggedIn){setConn("on",HEALTH.bpmKey?`Logged in — playlists will land in ${SVC_NAME[svc]}.`:"Logged in, but no BPM key. Add GETSONGBPM_API_KEY to credentials.txt.");btn.style.display="none";showImport(true);}
   else if(h.hasCreds){setConn("off",`Not logged in to ${SVC_NAME[svc]} — tap below.`);btn.style.display="block";showImport(false);}
   else{setConn("err",`No ${SVC_NAME[svc]} credentials. Add ${svc.toUpperCase()}_CLIENT_ID / _SECRET to credentials.txt.`);btn.style.display="none";showImport(false);}}
-function setService(svc){state.service=svc;document.querySelectorAll("#serviceTabs button").forEach(b=>b.setAttribute("aria-pressed",b.dataset.svc===svc));state.seeds=[];lastPlaylist=[];lastResult=null;lastCandidates=[];excludedIds=new Set();playlistExportName=null;$("#results-area").innerHTML="";renderSeeds();$("#results").hidden=true;checkLogin();}
+function clearPoolProgress(){
+  const slot=$("#pool-progress-slot");
+  if(!slot)return;
+  slot.innerHTML="";
+  slot.hidden=true;
+}
+function setService(svc){state.service=svc;document.querySelectorAll("#serviceTabs button").forEach(b=>b.setAttribute("aria-pressed",b.dataset.svc===svc));state.seeds=[];lastPlaylist=[];lastResult=null;lastCandidates=[];excludedIds=new Set();playlistExportName=null;clearPoolProgress();$("#results-area").innerHTML="";renderSeeds();$("#results").hidden=true;checkLogin();}
 document.querySelectorAll("#serviceTabs button").forEach(b=>b.onclick=()=>setService(b.dataset.svc));
 $("#loginBtn").onclick=()=>{location.href=`/login?service=${state.service}`;};
-$("#logoutBtn").onclick=async()=>{await api.logout();state.seeds=[];lastPlaylist=[];lastResult=null;lastCandidates=[];excludedIds=new Set();playlistExportName=null;renderSeeds();$("#results-area").innerHTML="";await checkLogin();};
+$("#logoutBtn").onclick=async()=>{await api.logout();state.seeds=[];lastPlaylist=[];lastResult=null;lastCandidates=[];excludedIds=new Set();playlistExportName=null;clearPoolProgress();renderSeeds();$("#results-area").innerHTML="";await checkLogin();};
 $("#loadPlaylists").onclick=async()=>{
   const sel=$("#playlistPick");sel.style.display="block";sel.innerHTML=`<option value="">Loading playlists…</option>`;
   try{const pls=await api.playlists();sel.innerHTML=`<option value="">Import from a playlist…</option>`+pls.map(p=>`<option value="${p.id}">${(p.name||"Untitled").replace(/</g,"&lt;")}</option>`).join("");}
@@ -555,6 +566,7 @@ function resetRunState(){
   excludedIds=new Set();
   playlistExportName=null;
   closeAddTrackPanel();
+  clearPoolProgress();
   const area=$("#results-area");
   if(area)area.innerHTML="";
 }
@@ -615,14 +627,14 @@ function packOpts(extra={}){
   const cadenceModel=()=>constantCadence();
   return{cadenceModel,tol:state.tol,modes,allowRepeats:state.repeat,excludedIds:excludedIds,...extra};
 }
-function applyPlaylistResult(res,candidates){
+function applyPlaylistResult(res,candidates,opts={}){
   if(candidates){
     lastCandidates=mergeCandidates(lastCandidates,candidates);
     res.poolMeta=candidates.meta||res.poolMeta||lastResult?.poolMeta||null;
   }
   lastResult=res;
   lastPlaylist=res.plan.flatMap((p)=>p.tracks);
-  renderResults(res);
+  renderResults(res,{scroll:opts.scroll!==false});
 }
 function mergeCandidates(prev,next){
   const by=new Map();
@@ -707,8 +719,10 @@ function mergeArtistSeeds(...lists){
   });
 }
 async function runPoolSearch({keepMatchedOnly=false,includePlaylistArtists=false,includeSeeds=true}={}){
+  if(poolBusy)return;
   const modes=Object.entries(state.modes).filter(([,v])=>v).map(([k])=>k);
   const area=$("#results-area");
+  const progressSlot=$("#pool-progress-slot");
   if(!modes.length){area.innerHTML=`<section><div class="empty">Turn on at least one sync mode (Automation).</div></section>`;return;}
   if(!LOGGEDIN){area.innerHTML=`<section><div class="empty">Log in first (button up top).</div></section>`;return;}
 
@@ -717,56 +731,95 @@ async function runPoolSearch({keepMatchedOnly=false,includePlaylistArtists=false
   const combined=mergeArtistSeeds(fromBacklog,fromPlaylist);
   if(!combined.length)return;
 
+  poolBusy=true;
   const abort=new AbortController();
-  const loading=startLoading(area,{onStop:()=>abort.abort()});
+  // Freeze kept BPM-matched tracks so regenerate shows them immediately while the pool expands.
+  const keepBySeg=keepMatchedOnly&&lastResult?keepMatchedTracksBySeg(lastResult.plan,packOpts()):null;
+  if(keepBySeg){
+    const preview=buildPlaylist(state.segs,lastCandidates,packOpts({keepBySeg}));
+    preview.poolMeta=lastResult?.poolMeta||lastCandidates.meta||null;
+    applyPlaylistResult(preview,null,{scroll:true});
+  }else{
+    area.innerHTML="";
+  }
+
+  const loading=startLoading(progressSlot,{onStop:()=>abort.abort()});
   const nPl=fromPlaylist.length,nSeed=fromBacklog.length;
+  let lastLiveAt=0;
+  const liveRepack=(snapCandidates)=>{
+    if(!keepBySeg||!Array.isArray(snapCandidates)||!snapCandidates.length)return;
+    const now=Date.now();
+    if(now-lastLiveAt<900)return;
+    lastLiveAt=now;
+    const merged=mergeCandidates(lastCandidates,snapCandidates);
+    const live=buildPlaylist(state.segs,merged,packOpts({keepBySeg}));
+    live.poolMeta=lastResult?.poolMeta||merged.meta||null;
+    applyPlaylistResult(live,null,{scroll:false});
+  };
   if(includePlaylistArtists&&nPl){
     loading.update({stage:"gather",phase:"resolve",pct:3,detail:`Resolving ${combined.length} artists (${nSeed} backlog + ${nPl} from playlist)…`});
   }
-  const seeds=await resolveArtistSeeds(combined);
-  if(!seeds.length){
-    loading.stop();
-    area.innerHTML=`<section><div class="empty">Couldn't resolve artists on ${SVC_NAME[state.service]}. Add them to the backlog and try again.</div></section>`;
-    if(lastResult)setTimeout(()=>renderResults(lastResult),1200);
-    return;
-  }
-  loading.update({
-    stage:"gather",
-    phase:"start",
-    pct:6,
-    detail:includePlaylistArtists&&nPl
-      ?`Searching from ${seeds.length} artists (${nSeed} backlog + ${nPl} from playlist)…`
-      :`Searching from ${seeds.length} seed artist${seeds.length===1?"":"s"}…`,
-  });
-  const targets={cadences:plannedCadences(),cadenceNeeds:plannedCadenceNeeds(),tol:state.tol,modes};
-  let candidates;
-  try{candidates=await api.pool(seeds,plannedSeconds(),targets,loading.update,{signal:abort.signal});}
-  catch(e){
-    loading.stop();
-    if(e.code==="stopped-empty"||e.code==="aborted"){
-      area.innerHTML=`<section><div class="empty">Stopped before any BPM-matched songs came back. Wait a bit longer next time, or add more seeds.</div></section>`;
-      if(lastResult)setTimeout(()=>renderResults(lastResult),1600);
+  try{
+    const seeds=await resolveArtistSeeds(combined);
+    if(!seeds.length){
+      loading.stop();
+      if(!keepBySeg)area.innerHTML=`<section><div class="empty">Couldn't resolve artists on ${SVC_NAME[state.service]}. Add them to the backlog and try again.</div></section>`;
+      else loading.showError(`Couldn't resolve artists on ${SVC_NAME[state.service]}. Kept playlist songs are still below.`);
       return;
     }
-    area.innerHTML=`<section><div class="empty">Sprint blocked: ${e.message}</div></section>`;
-    return;
+    loading.update({
+      stage:"gather",
+      phase:"start",
+      pct:6,
+      detail:includePlaylistArtists&&nPl
+        ?`Searching from ${seeds.length} artists (${nSeed} backlog + ${nPl} from playlist)…`
+        :`Searching from ${seeds.length} seed artist${seeds.length===1?"":"s"}…`,
+    });
+    const targets={cadences:plannedCadences(),cadenceNeeds:plannedCadenceNeeds(),tol:state.tol,modes};
+    let candidates;
+    try{
+      candidates=await api.pool(seeds,plannedSeconds(),targets,loading.update,{
+        signal:abort.signal,
+        onSnapshot:liveRepack,
+      });
+    }catch(e){
+      loading.stop();
+      if(e.code==="stopped-empty"||e.code==="aborted"){
+        if(!keepBySeg){
+          area.innerHTML=`<section><div class="empty">Stopped before any BPM-matched songs came back. Wait a bit longer next time, or add more seeds.</div></section>`;
+        }else{
+          loading.showError("Stopped before new songs arrived. Kept playlist songs are still below.");
+        }
+        return;
+      }
+      if(!keepBySeg)area.innerHTML=`<section><div class="empty">Sprint blocked: ${e.message}</div></section>`;
+      else loading.showError(`Sprint blocked: ${e.message}`);
+      return;
+    }
+    if(!candidates.length){
+      loading.stop();
+      if(!keepBySeg)area.innerHTML=`<section><div class="empty">No candidates with BPM came back. Add more seeds, widen tolerance, or check /api/bpmtest.</div></section>`;
+      else loading.showError("No new BPM matches came back. Kept playlist songs are still below.");
+      return;
+    }
+    const stoppedEarly=!!candidates.meta?.stopped;
+    loading.update({
+      stage:"pack",
+      phase:"pack",
+      pct:94,
+      detail:stoppedEarly
+        ?"Stopped early — building playlist from songs so far…"
+        :keepMatchedOnly?"Keeping BPM-matched songs, then expanding…":"Building playlist from matched songs",
+    });
+    const res=buildPlaylist(state.segs,mergeCandidates(lastCandidates,candidates),packOpts({keepBySeg}));
+    loading.update({stage:"pack",phase:"pack",pct:100,detail:stoppedEarly?"Playlist ready (stopped early)":"Playlist ready"});
+    loading.stop();
+    applyPlaylistResult(res,candidates,{scroll:true});
+    renderSeeds();
+  }finally{
+    poolBusy=false;
+    if(lastResult)renderResults(lastResult,{scroll:false});
   }
-  if(!candidates.length){loading.stop();area.innerHTML=`<section><div class="empty">No candidates with BPM came back. Add more seeds, widen tolerance, or check /api/bpmtest.</div></section>`;return;}
-  const stoppedEarly=!!candidates.meta?.stopped;
-  loading.update({
-    stage:"pack",
-    phase:"pack",
-    pct:94,
-    detail:stoppedEarly
-      ?"Stopped early — building playlist from songs so far…"
-      :keepMatchedOnly?"Keeping BPM-matched songs, then expanding…":"Building playlist from matched songs",
-  });
-  const keepBySeg=keepMatchedOnly&&lastResult?keepMatchedTracksBySeg(lastResult.plan,packOpts()):null;
-  const res=buildPlaylist(state.segs,mergeCandidates(lastCandidates,candidates),packOpts({keepBySeg}));
-  loading.update({stage:"pack",phase:"pack",pct:100,detail:stoppedEarly?"Playlist ready (stopped early)":"Playlist ready"});
-  loading.stop();
-  applyPlaylistResult(res,candidates);
-  renderSeeds();
 }
 $("#build").onclick=()=>{
   const hasPlaylist=lastPlaylist.length>0;
@@ -817,15 +870,18 @@ function poolProgressView(p){
   if(p?.elapsedSec!=null)bits.push(`${p.elapsedSec}s`);
   return {detail, pct, meta:bits.join(" · ")};
 }
-function startLoading(area,{onStop}={}){
+function startLoading(slot,{onStop}={}){
   let view=poolProgressView({stage:"gather",pct:2,detail:"Starting playlist build"});
   let canStop=false;
   let stopping=false;
+  let finished=false;
+  if(slot){slot.hidden=false;}
   const render=()=>{
+    if(!slot||finished)return;
     const indeterminate=view.pct==null;
     const width=indeterminate?"":`style="width:${view.pct}%"`;
     const stopLabel=stopping?"Stopping…":canStop?"Stop & use playlist":"Stop when songs appear";
-    area.innerHTML=`<section class="pool-progress" aria-live="polite">
+    slot.innerHTML=`<section class="pool-progress" aria-live="polite">
       <p class="status">${view.detail}</p>
       <div class="bar${indeterminate?" indeterminate":""}" role="progressbar"${indeterminate?"":` aria-valuemin="0" aria-valuemax="100" aria-valuenow="${view.pct}"`}><i ${width}></i></div>
       <div class="meta">${view.meta||"Building your cadence-matched playlist"}</div>
@@ -846,6 +902,7 @@ function startLoading(area,{onStop}={}){
   render();
   return {
     update(msg){
+      if(finished)return;
       // Never let a gather update shrink the bar (avoids jumpy backwards progress).
       const next=poolProgressView(msg);
       if(view.pct!=null&&next.pct!=null&&next.pct<view.pct&&msg?.stage!=="pack")next.pct=view.pct;
@@ -855,7 +912,17 @@ function startLoading(area,{onStop}={}){
       if(msg?.phase==="pack")canStop=false;
       render();
     },
-    stop(){},
+    showError(message){
+      finished=false;
+      if(!slot)return;
+      slot.hidden=false;
+      slot.innerHTML=`<section class="pool-progress" aria-live="polite"><p class="status">${message}</p></section>`;
+      setTimeout(()=>{if(slot.querySelector(".status")?.textContent===message)clearPoolProgress();},2800);
+    },
+    stop(){
+      finished=true;
+      clearPoolProgress();
+    },
   };
 }
 function planName(){const dist=Math.max(0,...state.segs.map(s=>+s.endMile||0)).toFixed(1).replace(/\.0$/,"");const d=new Date().toISOString().slice(0,10);return `run ${dist}mi ${d}`;}
@@ -1024,7 +1091,8 @@ async function correctTrackBpm(segIdx,trackIdx){
   repacked.poolMeta=lastResult.poolMeta||lastCandidates.meta||null;
   applyPlaylistResult(repacked,null);
 }
-function renderResults(res){
+function renderResults(res,opts={}){
+  const scroll=opts.scroll!==false;
   const strip=res.plan.map(p=>{const w=res.totalPlannedSec?Math.max(6,(p.segDuration/res.totalPlannedSec)*100):33;return`<div class="band" style="flex:${w} 1 0;background:${cadColor(p.cadence)}">${Math.round(p.cadence)}</div>`;}).join("");
   const bpmRate=res.poolMeta?.bpmHitRate;
   const bpmHint=typeof bpmRate==="number"&&bpmRate<0.65
@@ -1061,9 +1129,10 @@ function renderResults(res){
       <label for="exportName">Playlist name</label>
       <input id="exportName" type="text" maxlength="100" value="${exportNameVal.replace(/"/g,"&quot;")}" placeholder="${defaultExportName().replace(/"/g,"&quot;")}" />
     </div>`:"";
+  const searching=poolBusy;
   const actions=`<div class="actions">
-      <button type="button" class="btn secondary" id="searchAgainBtn"${plArtists.length||state.seeds.length?"":" disabled"} title="Fill gaps using backlog seeds plus artists still on this playlist">${againLabel}</button>
-      <button type="button" class="btn" id="exportBtn"${canExport?"":" disabled"}>Ship to ${SVC_NAME[state.service]}</button>
+      <button type="button" class="btn secondary" id="searchAgainBtn"${searching||!(plArtists.length||state.seeds.length)?" disabled":""} title="Fill gaps using backlog seeds plus artists still on this playlist">${searching?"Searching…":againLabel}</button>
+      <button type="button" class="btn" id="exportBtn"${canExport&&!searching?"":" disabled"}>Ship to ${SVC_NAME[state.service]}</button>
     </div>${exportNameField}${excludedNote}`;
   const bpmMeta=res.poolMeta&&res.poolMeta.poolSize!=null
     ?`<div><div class="k">BPM hit</div><div class="v">${res.poolMeta.bpmHit||0}/${res.poolMeta.poolSize}</div></div>`:"";
@@ -1075,10 +1144,10 @@ function renderResults(res){
     btn.onclick=()=>correctTrackBpm(+btn.dataset.seg,+btn.dataset.track);
   });
   $("#results-area").querySelectorAll("[data-open-add]").forEach((btn)=>{
-    btn.onclick=()=>{addTrackSeg=+btn.dataset.openAdd;addTrackHits=[];addTrackHl=-1;renderResults(lastResult);};
+    btn.onclick=()=>{addTrackSeg=+btn.dataset.openAdd;addTrackHits=[];addTrackHl=-1;renderResults(lastResult,{scroll:false});};
   });
   $("#results-area").querySelectorAll("[data-cancel-add]").forEach((btn)=>{
-    btn.onclick=()=>{closeAddTrackPanel();renderResults(lastResult);};
+    btn.onclick=()=>{closeAddTrackPanel();renderResults(lastResult,{scroll:false});};
   });
   if(addTrackSeg!=null)wireAddTrackPanel($("#results-area"));
   const again=$("#searchAgainBtn");
@@ -1087,8 +1156,11 @@ function renderResults(res){
   if(exportNameInput){
     exportNameInput.oninput=()=>{playlistExportName=exportNameInput.value;};
   }
-  const eb=$("#exportBtn");if(eb&&canExport)eb.onclick=()=>shipPlaylist(eb);
-  $("#results-area").scrollIntoView({behavior:matchMedia("(prefers-reduced-motion:reduce)").matches?"auto":"smooth",block:"start"});
+  const eb=$("#exportBtn");if(eb&&canExport&&!searching)eb.onclick=()=>shipPlaylist(eb);
+  if(scroll){
+    const focus=$("#pool-progress-slot:not([hidden])")||$("#results-area");
+    focus.scrollIntoView({behavior:matchMedia("(prefers-reduced-motion:reduce)").matches?"auto":"smooth",block:"start"});
+  }
 }
 
 loadCal();$("#spmInput").value=state.spm;renderSegs();renderSeeds();
