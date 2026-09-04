@@ -2163,8 +2163,8 @@ async function spotifyPool(seeds, targetSec = 0, targets = null, onProgress = nu
     return fresh;
   }
 
-  report("start", { detail: "Gathering songs from seed artists" });
-  await fetchNames(seedNames, "seed artists", { seedWeight: true });
+  report("start", { detail: "Gathering full discographies from seed artists" });
+  await fetchNames(seedNames, "seed discographies", { seedWeight: true });
   await fillFromTempoCatalog("Stamping tempos from BPM catalog");
 
   const nameQueue = makeScoredQueue();
