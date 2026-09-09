@@ -3,6 +3,11 @@
 // FreqBlog; Tidal catalog BPM; AcousticBrainz ISRC-only last). Catalog + playlist:
 // Tidal OR Spotify, chosen by which service the user logs into.
 //
+// Spotify notes (Feb/Mar 2026 Development Mode): /search limit max is 10 (paginate
+// with offset); batch GET /albums|/artists|/tracks?ids= removed; artist top-tracks
+// removed; playlist track routes are /items (response field `item`). Always pass
+// market= on catalog calls — user.country was removed from GET /me.
+//
 // credentials.txt (or env vars) — Tidal needs its pair, Spotify needs its pair:
 //   TIDAL_CLIENT_ID / TIDAL_CLIENT_SECRET
 //   SPOTIFY_CLIENT_ID / SPOTIFY_CLIENT_SECRET
@@ -10,6 +15,7 @@
 //   LASTFM_API_KEY
 //   FREQBLOG_API_KEY (optional second BPM source)
 //   BPM_CACHE_MAX (optional; default 100000 track groups in bpm-cache.json)
+//   SPOTIFY_MARKET (optional; default TIDAL_COUNTRY or US)
 // AcousticBrainz needs no key (MusicBrainz recording MBID → rhythm.bpm).
 // Redirect URI to register in BOTH dashboards: http://localhost:8080/callback
 // Run: node server.mjs
@@ -1896,6 +1902,9 @@ async function tidalCreatePlaylist(name, refs) {
 }
 
 /* ============ SPOTIFY ============ */
+/** Feb 2026 Dev Mode: /search limit max dropped from 50 → 10. */
+const SPOTIFY_SEARCH_LIMIT = 10;
+const SPOTIFY_MARKET = env("SPOTIFY_MARKET") || COUNTRY || "US";
 async function sapi(pq, { method = "GET", body } = {}) {
   let t = await accessToken("spotify");
   const opts = { method, headers: { Authorization: `Bearer ${t}`, "Content-Type": "application/json" } };
@@ -1905,23 +1914,41 @@ async function sapi(pq, { method = "GET", body } = {}) {
   if (!r.ok) throw new Error(`${r.status} on ${pq}: ${(await r.text()).slice(0, 200)}`);
   const txt = await r.text(); return txt ? JSON.parse(txt) : {};
 }
+/** Paginated /search — always cap limit at 10 and pass market (user.country was removed). */
+async function spotifySearch(type, q, { limit = SPOTIFY_SEARCH_LIMIT, offset = 0 } = {}) {
+  const want = Math.min(SPOTIFY_SEARCH_LIMIT, Math.max(1, limit || SPOTIFY_SEARCH_LIMIT));
+  const path = `/search?q=${encodeURIComponent(q)}&type=${encodeURIComponent(type)}&limit=${want}&offset=${Math.max(0, offset)}&market=${encodeURIComponent(SPOTIFY_MARKET)}`;
+  return sapi(path);
+}
 async function spotifySearchArtists(q) {
-  const j = await sapi(`/search?q=${encodeURIComponent(q)}&type=artist&limit=10`);
-  return (j.artists?.items || []).map((a) => ({ id: a.id, name: a.name }));
+  const j = await spotifySearch("artist", q, { limit: SPOTIFY_SEARCH_LIMIT });
+  return (j.artists?.items || []).filter(Boolean).map((a) => ({ id: a.id, name: a.name }));
 }
 /** Spotify supports genre:"..." artist search — useful fan-out when Last.fm tags map cleanly. */
 async function spotifyArtistsByGenre(genre, limit = 20) {
   const g = String(genre || "").trim();
   if (!g) return [];
+  const want = Math.max(1, Math.min(50, limit || 20));
+  const out = [];
+  const seen = new Set();
   try {
     const q = `genre:"${g}"`;
-    const j = await sapi(`/search?q=${encodeURIComponent(q)}&type=artist&limit=${Math.min(50, Math.max(1, limit))}`);
-    return (j.artists?.items || [])
-      .filter((a) => a?.id && a?.name)
-      .map((a) => ({ id: String(a.id), name: a.name }));
+    for (let offset = 0; offset < want && out.length < want; offset += SPOTIFY_SEARCH_LIMIT) {
+      const j = await spotifySearch("artist", q, { limit: SPOTIFY_SEARCH_LIMIT, offset });
+      const items = (j.artists?.items || []).filter((a) => a?.id && a?.name);
+      if (!items.length) break;
+      for (const a of items) {
+        if (seen.has(a.id)) continue;
+        seen.add(a.id);
+        out.push({ id: String(a.id), name: a.name });
+        if (out.length >= want) break;
+      }
+      if (items.length < SPOTIFY_SEARCH_LIMIT) break;
+    }
   } catch (_) {
-    return [];
+    return out;
   }
+  return out;
 }
 async function spotifySearchTracks(q) {
   const query = (q || "").trim();
@@ -1932,12 +1959,12 @@ async function spotifySearchTracks(q) {
   const id = uri?.[1] || url?.[1] || null;
   if (id) {
     try {
-      const t = await sapi(`/tracks/${encodeURIComponent(id)}`);
+      const t = await sapi(`/tracks/${encodeURIComponent(id)}?market=${encodeURIComponent(SPOTIFY_MARKET)}`);
       return t?.id ? [spotifyMapTrack(t)] : [];
     } catch (_) { /* fall through to text search */ }
   }
-  const j = await sapi(`/search?q=${encodeURIComponent(query)}&type=track&limit=10`);
-  return (j.tracks?.items || []).map((t) => spotifyMapTrack(t));
+  const j = await spotifySearch("track", query, { limit: SPOTIFY_SEARCH_LIMIT });
+  return (j.tracks?.items || []).filter(Boolean).map((t) => spotifyMapTrack(t));
 }
 const spotifyArtistIdCache = {};
 async function spotifyResolveArtist(name) {
@@ -1964,18 +1991,15 @@ async function spotifyHydrateArtistGenres(tracks) {
   const list = Array.isArray(tracks) ? tracks : [];
   const ids = [...new Set(list.map((t) => t?.artistId).filter(Boolean))];
   const missing = ids.filter((id) => !(id in spotifyGenreCache));
-  for (let i = 0; i < missing.length; i += 50) {
-    const chunk = missing.slice(i, i + 50);
+  // Feb 2026: batch GET /artists?ids= removed — fetch one artist at a time.
+  await mapLimit(missing, 8, async (id) => {
     try {
-      const j = await sapi(`/artists?ids=${chunk.join(",")}`);
-      for (const a of j.artists || []) {
-        if (a?.id) spotifyGenreCache[a.id] = Array.isArray(a.genres) ? a.genres.slice(0, 6) : [];
-      }
-      for (const id of chunk) if (!(id in spotifyGenreCache)) spotifyGenreCache[id] = [];
+      const a = await sapi(`/artists/${encodeURIComponent(id)}`);
+      spotifyGenreCache[id] = Array.isArray(a?.genres) ? a.genres.slice(0, 6) : [];
     } catch (_) {
-      for (const id of chunk) if (!(id in spotifyGenreCache)) spotifyGenreCache[id] = [];
+      spotifyGenreCache[id] = [];
     }
-  }
+  });
   for (const t of list) {
     if (!t) continue;
     if (Array.isArray(t.genres) && t.genres.length) continue;
@@ -1984,46 +2008,61 @@ async function spotifyHydrateArtistGenres(tracks) {
   }
   return list;
 }
+async function spotifyFetchAlbumTracks(albumId, add, shouldStop) {
+  try {
+    const al = await sapi(`/albums/${encodeURIComponent(albumId)}?market=${encodeURIComponent(SPOTIFY_MARKET)}`);
+    for (const t of al?.tracks?.items || []) {
+      add(t);
+      if (shouldStop && shouldStop()) return;
+    }
+    let more = al?.tracks?.next ? al.tracks.next.replace(/^https:\/\/api\.spotify\.com\/v1/, "") : null;
+    while (more && !(shouldStop && shouldStop())) {
+      const tj = await sapi(more.includes("market=") ? more : `${more}${more.includes("?") ? "&" : "?"}market=${encodeURIComponent(SPOTIFY_MARKET)}`);
+      for (const t of tj.items || []) {
+        add(t);
+        if (shouldStop && shouldStop()) return;
+      }
+      more = tj.next ? tj.next.replace(/^https:\/\/api\.spotify\.com\/v1/, "") : null;
+    }
+  } catch (_) {}
+}
 async function spotifyArtistAlbumTracks(id, name, limit = SEED_DISCOGRAPHY_CAP) {
   const byRef = new Map();
   const add = (t) => {
+    if (byRef.size >= limit) return;
     if (!t?.uri || byRef.has(t.uri)) return;
     // Keep tracks where this artist is credited (skips pure features on others' albums when possible).
     const credited = (t.artists || []).some((a) => String(a?.id) === String(id));
     if (!credited) return;
     byRef.set(t.uri, spotifyMapTrack(t, name));
   };
+  const full = () => byRef.size >= limit;
   const albumIds = [];
   const seenAlbum = new Set();
-  let path = `/artists/${encodeURIComponent(id)}/albums?include_groups=album,single&limit=50&market=US`;
-  for (let page = 0; page < 40 && path && albumIds.length < 400; page++) {
+  // List enough albums to fill the track budget; related pulls stay shallow.
+  const albumCap = Math.min(400, Math.max(8, Math.ceil(limit / 3) + 4));
+  let path = `/artists/${encodeURIComponent(id)}/albums?include_groups=album,single&limit=50&market=${encodeURIComponent(SPOTIFY_MARKET)}`;
+  for (let page = 0; page < 40 && path && albumIds.length < albumCap; page++) {
     try {
       const j = await sapi(path);
       for (const a of j.items || []) {
         if (!a?.id || seenAlbum.has(a.id)) continue;
         seenAlbum.add(a.id);
         albumIds.push(a.id);
+        if (albumIds.length >= albumCap) break;
       }
       const next = j.next || null;
       path = next ? next.replace(/^https:\/\/api\.spotify\.com\/v1/, "") : null;
       if (!(j.items || []).length) break;
     } catch (_) { break; }
   }
-  for (let i = 0; i < albumIds.length && byRef.size < limit; i += 20) {
-    const chunk = albumIds.slice(i, i + 20);
-    try {
-      const j = await sapi(`/albums?ids=${chunk.join(",")}&market=US`);
-      for (const al of j.albums || []) {
-        for (const t of al?.tracks?.items || []) add(t);
-        // Album track paging is rare for singles; follow if present.
-        let more = al?.tracks?.next ? al.tracks.next.replace(/^https:\/\/api\.spotify\.com\/v1/, "") : null;
-        while (more && byRef.size < limit) {
-          const tj = await sapi(more);
-          for (const t of tj.items || []) add(t);
-          more = tj.next ? tj.next.replace(/^https:\/\/api\.spotify\.com\/v1/, "") : null;
-        }
-      }
-    } catch (_) {}
+  // Feb 2026: batch GET /albums?ids= removed — fetch albums individually.
+  for (let i = 0; i < albumIds.length && !full(); i += 6) {
+    const chunk = albumIds.slice(i, i + 6);
+    await mapLimit(chunk, 6, async (albumId) => {
+      if (full()) return;
+      await spotifyFetchAlbumTracks(albumId, add, full);
+    });
   }
   return [...byRef.values()].slice(0, limit);
 }
@@ -2031,24 +2070,23 @@ async function spotifyArtistTracks(name, id = null, limit = RELATED_ARTIST_TRACK
   const max = Number.isFinite(limit) && limit > 0 ? Math.floor(limit) : SEED_DISCOGRAPHY_CAP;
   const byRef = new Map();
   const add = (t) => { if (t?.uri && !byRef.has(t.uri)) byRef.set(t.uri, spotifyMapTrack(t, name)); };
-  // Seeds: walk albums/singles for a real discography. Related: top-tracks + short search.
-  if (id && max >= SEED_DISCOGRAPHY_CAP) {
+  // Seeds: walk albums/singles for a real discography.
+  // Related: shallow album crawl (top-tracks removed in Feb 2026 Dev Mode) + search pages of 10.
+  if (id) {
     try {
       const full = await spotifyArtistAlbumTracks(id, name, max);
       for (const t of full) if (t?.ref && !byRef.has(t.ref)) byRef.set(t.ref, t);
     } catch (_) {}
-  } else if (id) {
-    try { const j = await sapi(`/artists/${id}/top-tracks?market=US`); for (const t of j.tracks || []) add(t); } catch (_) {}
   }
   if (byRef.size < Math.min(max, 40)) {
-    const q = encodeURIComponent(`artist:"${name}"`);
-    for (let offset = 0; offset < 150 && byRef.size < max; offset += 50) {
+    const q = `artist:"${name}"`;
+    for (let offset = 0; offset < 100 && byRef.size < max; offset += SPOTIFY_SEARCH_LIMIT) {
       try {
-        const j = await sapi(`/search?q=${q}&type=track&limit=50&offset=${offset}`);
-        const items = j.tracks?.items || [];
+        const j = await spotifySearch("track", q, { limit: SPOTIFY_SEARCH_LIMIT, offset });
+        const items = (j.tracks?.items || []).filter(Boolean);
         if (!items.length) break;
         for (const t of items) add(t);
-        if (items.length < 50) break;
+        if (items.length < SPOTIFY_SEARCH_LIMIT) break;
       } catch (_) { break; }
     }
   }
@@ -2399,10 +2437,15 @@ async function spotifyMyPlaylists() {
 }
 async function spotifyPlaylistArtists(id) {
   const artists = new Map();
-  let pathq = `/playlists/${id}/tracks?limit=100`;
+  // Feb 2026: /playlists/{id}/tracks → /items; item field is `item` (was `track`).
+  let pathq = `/playlists/${id}/items?limit=100`;
   for (let page = 0; page < 8 && pathq; page++) {
     const j = await sapi(pathq);
-    for (const it of j.items || []) { const t = it.track; if (!t) continue; for (const a of t.artists || []) if (a.id && !artists.has(a.id)) artists.set(a.id, { id: a.id, name: a.name }); }
+    for (const it of j.items || []) {
+      const t = it.item || it.track;
+      if (!t || t.type === "episode") continue;
+      for (const a of t.artists || []) if (a.id && !artists.has(a.id)) artists.set(a.id, { id: a.id, name: a.name });
+    }
     pathq = j.next ? j.next.replace(SPOTIFY_API, "") : null;
   }
   return [...artists.values()];
