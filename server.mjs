@@ -72,6 +72,33 @@ const SERVICES = {
     pkce: false, store: { access: null, refresh: null, exp: 0 }, verifier: null,
   },
 };
+/* Persist OAuth tokens so Render free-tier spin-down / restart doesn't force re-login. */
+const AUTH_STORE_FILE = path.join(__dirname, "auth-tokens.json");
+function loadAuthStore() {
+  try {
+    const j = JSON.parse(fs.readFileSync(AUTH_STORE_FILE, "utf8"));
+    for (const name of ["tidal", "spotify"]) {
+      const row = j?.[name];
+      if (!row || !(row.refresh || row.access)) continue;
+      SERVICES[name].store = {
+        access: row.access || null,
+        refresh: row.refresh || null,
+        exp: +row.exp || 0,
+      };
+    }
+  } catch (_) {}
+}
+function saveAuthStore() {
+  try {
+    const out = {};
+    for (const name of ["tidal", "spotify"]) {
+      const s = SERVICES[name].store;
+      if (s.refresh || s.access) out[name] = { access: s.access, refresh: s.refresh, exp: s.exp };
+    }
+    fs.writeFileSync(AUTH_STORE_FILE, JSON.stringify(out));
+  } catch (_) {}
+}
+loadAuthStore();
 const b64url = (buf) => buf.toString("base64").replace(/\+/g, "-").replace(/\//g, "_").replace(/=+$/, "");
 function makePkce() { const verifier = b64url(crypto.randomBytes(48)); const challenge = b64url(crypto.createHash("sha256").update(verifier).digest()); return { verifier, challenge }; }
 function authorizeUrl(name) {
@@ -89,16 +116,22 @@ async function exchangeCode(name, code) {
   if (!r.ok) throw new Error(`token ${r.status}: ${await r.text()}`);
   const j = await r.json();
   s.store = { access: j.access_token, refresh: j.refresh_token || null, exp: Date.now() + ((j.expires_in || 3600) - 60) * 1000 };
+  saveAuthStore();
 }
 async function refresh(name) {
   const s = SERVICES[name];
   if (!s.store.refresh) throw new Error("no refresh token");
   const body = new URLSearchParams({ grant_type: "refresh_token", refresh_token: s.store.refresh });
   const r = await fetch(s.token, { method: "POST", headers: { Authorization: basicAuth(s), "Content-Type": "application/x-www-form-urlencoded" }, body });
-  if (!r.ok) throw new Error(`refresh ${r.status}`);
+  if (!r.ok) {
+    s.store = { access: null, refresh: null, exp: 0 };
+    saveAuthStore();
+    throw new Error(`refresh ${r.status}`);
+  }
   const j = await r.json();
   s.store.access = j.access_token; if (j.refresh_token) s.store.refresh = j.refresh_token;
   s.store.exp = Date.now() + ((j.expires_in || 3600) - 60) * 1000;
+  saveAuthStore();
 }
 async function accessToken(name) {
   const s = SERVICES[name];
@@ -2484,7 +2517,7 @@ const server = http.createServer(async (req, res) => {
     }
     if (url.pathname === "/api/logout") {
       const svc = url.searchParams.get("service") || "tidal";
-      if (SERVICES[svc]) { SERVICES[svc].store = { access: null, refresh: null, exp: 0 }; SERVICES[svc].verifier = null; }
+      if (SERVICES[svc]) { SERVICES[svc].store = { access: null, refresh: null, exp: 0 }; SERVICES[svc].verifier = null; saveAuthStore(); }
       return sendJSON(res, 200, { ok: true, service: svc });
     }
     if (url.pathname === "/api/health") {

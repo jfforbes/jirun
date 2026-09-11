@@ -2,4 +2,5 @@
 credentials.txt
 .env
 bpm-cache.json
+auth-tokens.json
 node_modules/

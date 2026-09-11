@@ -345,10 +345,27 @@ function buildPlaylist(segments,candidates,opts){
 /* ===================== DEMO POOL ===================== */
 /* ===================== BRIDGE (Tidal + Spotify) ===================== */
 let LOGGEDIN=false, HEALTH={};
+/** Retry once after a failed fetch — Render free tier cold-starts can take a while. */
+async function fetchWake(url, opts={}, {retries=2,onRetry}={}){
+  let lastErr;
+  for(let attempt=0;attempt<=retries;attempt++){
+    try{
+      const r=await fetch(url,{...opts,cache:opts.cache||"no-store"});
+      return r;
+    }catch(e){
+      lastErr=e;
+      if(attempt>=retries)break;
+      if(typeof onRetry==="function")onRetry(attempt+1);
+      try{await fetch("/api/health",{cache:"no-store"});}catch(_){}
+      await new Promise((r)=>setTimeout(r,1500*(attempt+1)));
+    }
+  }
+  throw lastErr;
+}
 const api={
-  async health(){try{const r=await fetch("/api/health");HEALTH=await r.json();LOGGEDIN=!!(HEALTH[state.service]?.loggedIn);return HEALTH;}catch(e){HEALTH={};LOGGEDIN=false;return{ok:false,error:e.message};}},
-  async search(q){const r=await fetch(`/api/search?service=${state.service}&q=${encodeURIComponent(q)}`);const j=await r.json();if(!r.ok)throw new Error(j.error||r.status);return j;},
-  async searchTracks(q){const r=await fetch(`/api/search-tracks?service=${state.service}&q=${encodeURIComponent(q)}`);const j=await r.json();if(!r.ok)throw new Error(j.error||r.status);return Array.isArray(j)?j:(j.tracks||[]);},
+  async health(){try{const r=await fetchWake("/api/health");HEALTH=await r.json();LOGGEDIN=!!(HEALTH[state.service]?.loggedIn);return HEALTH;}catch(e){HEALTH={};LOGGEDIN=false;return{ok:false,error:e.message};}},
+  async search(q){const r=await fetchWake(`/api/search?service=${state.service}&q=${encodeURIComponent(q)}`);const j=await r.json();if(!r.ok)throw new Error(j.error||r.status);return j;},
+  async searchTracks(q){const r=await fetchWake(`/api/search-tracks?service=${state.service}&q=${encodeURIComponent(q)}`);const j=await r.json();if(!r.ok)throw new Error(j.error||r.status);return Array.isArray(j)?j:(j.tracks||[]);},
   async trackBpm(track){
     const r=await fetch(`/api/track-bpm`,{
       method:"POST",
@@ -489,9 +506,10 @@ let lastResult=null;
 let lastCandidates=[];
 let poolBusy=false;
 /* Render free tier spins down after ~15m with no inbound traffic. Long /api/pool
-   streams are mostly outbound progress, so ping health while the tab is open. */
-const KEEP_ALIVE_MS=8*60*1000;
-const KEEP_ALIVE_BUSY_MS=2*60*1000;
+   streams are mostly outbound progress, so ping health while the tab is open —
+   including when the tab is backgrounded (hidden tabs used to skip pings). */
+const KEEP_ALIVE_MS=4*60*1000;
+const KEEP_ALIVE_BUSY_MS=90*1000;
 let keepAliveTimer=null;
 async function pingKeepAlive(){
   try{await fetch("/api/health",{cache:"no-store"});}catch(_){}
@@ -500,7 +518,7 @@ function scheduleKeepAlive(){
   if(keepAliveTimer)clearTimeout(keepAliveTimer);
   const ms=poolBusy?KEEP_ALIVE_BUSY_MS:KEEP_ALIVE_MS;
   keepAliveTimer=setTimeout(async()=>{
-    if(poolBusy||document.visibilityState==="visible")await pingKeepAlive();
+    await pingKeepAlive();
     scheduleKeepAlive();
   },ms);
 }
@@ -509,9 +527,89 @@ function startRenderKeepAlive(){
   document.addEventListener("visibilitychange",()=>{
     if(document.visibilityState==="visible")pingKeepAlive().finally(()=>scheduleKeepAlive());
   });
+  window.addEventListener("focus",()=>{pingKeepAlive().finally(()=>scheduleKeepAlive());});
 }
 let excludedIds=new Set();
 let playlistExportName=null;
+
+/* Draft: keep seeds + built playlist across refresh until the user ships (exports). */
+const DRAFT_KEY="pb_draft";
+let draftSaveTimer=null;
+function clearDraftStorage(){try{localStorage.removeItem(DRAFT_KEY);}catch(_){}}
+function draftPayload(includeCandidates){
+  const payload={
+    v:1,
+    savedAt:Date.now(),
+    service:state.service,
+    seeds:state.seeds,
+    segs:state.segs,
+    spm:state.spm,
+    tol:state.tol,
+    modes:state.modes,
+    repeat:!!state.repeat,
+    playlistExportName,
+    excludedIds:[...excludedIds],
+    lastResult,
+  };
+  if(includeCandidates&&lastCandidates.length){
+    payload.lastCandidates=lastCandidates.map((t)=>({
+      id:t.id,ref:t.ref,title:t.title,artist:t.artist,artistId:t.artistId,
+      durationSec:t.durationSec,bpm:t.bpm,isrc:t.isrc,genres:t.genres,
+      matchMode:t.matchMode,matchTarget:t.matchTarget,
+    }));
+    if(lastCandidates.meta)payload.lastCandidatesMeta=lastCandidates.meta;
+  }
+  return payload;
+}
+function saveDraftNow(){
+  if(!state.seeds.length&&!lastResult){clearDraftStorage();return;}
+  try{
+    localStorage.setItem(DRAFT_KEY,JSON.stringify(draftPayload(true)));
+  }catch(_){
+    try{localStorage.setItem(DRAFT_KEY,JSON.stringify(draftPayload(false)));}
+    catch(__){/* quota — leave previous draft */}
+  }
+}
+function saveDraft(){
+  if(draftSaveTimer)clearTimeout(draftSaveTimer);
+  draftSaveTimer=setTimeout(()=>{draftSaveTimer=null;saveDraftNow();},200);
+}
+function loadDraft(){
+  try{
+    const raw=localStorage.getItem(DRAFT_KEY);
+    if(!raw)return false;
+    const d=JSON.parse(raw);
+    if(!d||d.v!==1)return false;
+    if(d.service==="tidal"||d.service==="spotify")state.service=d.service;
+    if(Array.isArray(d.seeds))state.seeds=d.seeds.filter((s)=>s&&s.id);
+    if(Array.isArray(d.segs)&&d.segs.length)state.segs=d.segs;
+    if(+d.spm>0)state.spm=+d.spm;
+    if(d.tol!=null&&+d.tol>=0)state.tol=+d.tol;
+    if(d.modes&&typeof d.modes==="object")state.modes={direct:!!d.modes.direct,half:!!d.modes.half};
+    if(typeof d.repeat==="boolean")state.repeat=d.repeat;
+    if(typeof d.playlistExportName==="string")playlistExportName=d.playlistExportName;
+    if(Array.isArray(d.excludedIds))excludedIds=new Set(d.excludedIds.map(String));
+    if(d.lastResult?.plan){
+      lastResult=d.lastResult;
+      lastPlaylist=d.lastResult.plan.flatMap((p)=>p.tracks||[]);
+    }
+    if(Array.isArray(d.lastCandidates)){
+      lastCandidates=d.lastCandidates;
+      if(d.lastCandidatesMeta)lastCandidates.meta=d.lastCandidatesMeta;
+    }
+    return !!(state.seeds.length||lastResult);
+  }catch(_){return false;}
+}
+function syncServiceTabs(){
+  document.querySelectorAll("#serviceTabs button").forEach((b)=>b.setAttribute("aria-pressed",b.dataset.svc===state.service?"true":"false"));
+}
+function syncPlanControls(){
+  const spm=$("#spmInput");if(spm)spm.value=state.spm;
+  const tol=$("#tol");if(tol){tol.value=state.tol;const tv=$("#tolVal");if(tv)tv.textContent="±"+state.tol;}
+  const rep=$("#repeat");if(rep)rep.checked=!!state.repeat;
+  const md=$("#mDirect");if(md)md.setAttribute("aria-pressed",!!state.modes.direct);
+  const mh=$("#mHalf");if(mh)mh.setAttribute("aria-pressed",!!state.modes.half);
+}
 
 /* ---- Theme: light / dark / system ---- */
 function resolveTheme(pref){return pref==="system"?(matchMedia("(prefers-color-scheme: dark)").matches?"dark":"light"):pref;}
@@ -545,10 +643,28 @@ function clearPoolProgress(){
   slot.innerHTML="";
   slot.hidden=true;
 }
-function setService(svc){state.service=svc;document.querySelectorAll("#serviceTabs button").forEach(b=>b.setAttribute("aria-pressed",b.dataset.svc===svc));state.seeds=[];lastPlaylist=[];lastResult=null;lastCandidates=[];excludedIds=new Set();playlistExportName=null;clearPoolProgress();$("#results-area").innerHTML="";renderSeeds();$("#results").hidden=true;checkLogin();}
+function setService(svc){
+  const prev=state.service;
+  state.service=svc;
+  syncServiceTabs();
+  if(prev!==svc){
+    state.seeds=[];lastPlaylist=[];lastResult=null;lastCandidates=[];excludedIds=new Set();playlistExportName=null;
+    clearPoolProgress();clearDraftStorage();
+    $("#results-area").innerHTML="";
+    renderSeeds();
+  }
+  $("#results").hidden=true;
+  checkLogin();
+}
 document.querySelectorAll("#serviceTabs button").forEach(b=>b.onclick=()=>setService(b.dataset.svc));
 $("#loginBtn").onclick=()=>{location.href=`/login?service=${state.service}`;};
-$("#logoutBtn").onclick=async()=>{await api.logout();state.seeds=[];lastPlaylist=[];lastResult=null;lastCandidates=[];excludedIds=new Set();playlistExportName=null;clearPoolProgress();renderSeeds();$("#results-area").innerHTML="";await checkLogin();};
+$("#logoutBtn").onclick=async()=>{
+  await api.logout();
+  state.seeds=[];lastPlaylist=[];lastResult=null;lastCandidates=[];excludedIds=new Set();playlistExportName=null;
+  clearPoolProgress();clearDraftStorage();
+  renderSeeds();$("#results-area").innerHTML="";
+  await checkLogin();
+};
 $("#loadPlaylists").onclick=async()=>{
   const sel=$("#playlistPick");sel.style.display="block";sel.innerHTML=`<option value="">Loading playlists…</option>`;
   try{const pls=await api.playlists();sel.innerHTML=`<option value="">Import from a playlist…</option>`+pls.map(p=>`<option value="${p.id}">${(p.name||"Untitled").replace(/</g,"&lt;")}</option>`).join("");}
@@ -556,7 +672,7 @@ $("#loadPlaylists").onclick=async()=>{
 };
 $("#playlistPick").onchange=async(e)=>{
   const id=e.target.value;if(!id)return;e.target.disabled=true;setConn("off","Importing artists from that playlist…");
-  try{const arts=await api.playlistArtists(id);let added=0;for(const a of arts){if(a&&a.id&&!state.seeds.some(s=>s.id===a.id)){state.seeds.push({id:a.id,name:a.name});added++;}}renderSeeds();setConn("on",`Added ${added} artist(s) from that playlist. Add more, or ship it.`);}
+  try{const arts=await api.playlistArtists(id);let added=0;for(const a of arts){if(a&&a.id&&!state.seeds.some(s=>s.id===a.id)){state.seeds.push({id:a.id,name:a.name});added++;}}renderSeeds();saveDraft();setConn("on",`Added ${added} artist(s) from that playlist. Add more, or ship it.`);}
   catch(err){setConn("err","Playlist import failed: "+err.message);}
   e.target.disabled=false;e.target.value="";
 };
@@ -576,10 +692,26 @@ function renderResultsList(){
 }
 async function runSearch(q){
   const box=$("#results");if(!q.trim()){box.hidden=true;currentHits=[];hlIndex=-1;return;}
-  if(!LOGGEDIN){currentHits=[];box.hidden=false;box.innerHTML=`<div class="empty">Log in first (button up top).</div>`;return;}
+  if(!LOGGEDIN){
+    await api.health();
+    if(!LOGGEDIN){currentHits=[];box.hidden=false;box.innerHTML=`<div class="empty">Log in first (button up top).</div>`;return;}
+  }
   let hits=[];
-  try{hits=await api.search(q);}
-  catch(err){currentHits=[];box.hidden=false;box.innerHTML=`<div class="empty">Search error: ${err.message}</div>`;return;}
+  try{
+    hits=await api.search(q);
+  }catch(err){
+    currentHits=[];box.hidden=false;
+    box.innerHTML=`<div class="empty">Waking the server — retrying search…</div>`;
+    try{
+      await pingKeepAlive();
+      await api.health();
+      if(!LOGGEDIN){box.innerHTML=`<div class="empty">Log in first (button up top).</div>`;return;}
+      hits=await api.search(q);
+    }catch(err2){
+      box.innerHTML=`<div class="empty">Search error: ${err2.message}. If the app was idle, wait a few seconds and try again.</div>`;
+      return;
+    }
+  }
   currentHits=hits;hlIndex=-1;
   if(!hits.length){box.hidden=false;box.innerHTML=`<div class="empty">No matches for "${q}". Try another spelling.</div>`;return;}
   renderResultsList();
@@ -591,7 +723,7 @@ $("#search").addEventListener("keydown",(e)=>{
   else if(e.key==="Enter"){if(hlIndex>=0){e.preventDefault();addSeed(currentHits[hlIndex]);}}
   else if(e.key==="Escape"){$("#results").hidden=true;}
 });
-function addSeed(t){if(state.seeds.some(s=>s.id===t.id))return;state.seeds.push(t);$("#search").value="";$("#results").hidden=true;currentHits=[];hlIndex=-1;renderSeeds();}
+function addSeed(t){if(state.seeds.some(s=>s.id===t.id))return;state.seeds.push(t);$("#search").value="";$("#results").hidden=true;currentHits=[];hlIndex=-1;renderSeeds();saveDraft();}
 function resetRunState(){
   lastPlaylist=[];
   lastResult=null;
@@ -602,11 +734,13 @@ function resetRunState(){
   clearPoolProgress();
   const area=$("#results-area");
   if(area)area.innerHTML="";
+  saveDraft();
 }
 function clearAllSeeds(){
   if(!state.seeds.length)return;
   state.seeds=[];
   resetRunState();
+  clearDraftStorage();
   renderSeeds();
   setConn(LOGGEDIN?"on":"off",LOGGEDIN?"Backlog cleared. Add new artists to start fresh.":"Log in first (button up top).");
 }
@@ -617,6 +751,7 @@ function renderSeeds(){
   wrap.querySelectorAll("button[data-seed]").forEach(b=>b.onclick=()=>{
     state.seeds.splice(+b.dataset.seed,1);
     if(!state.seeds.length)resetRunState();
+    else saveDraft();
     renderSeeds();
   });
   const clearBtn=$("#clearSeedsBtn");
@@ -628,13 +763,13 @@ function renderSeeds(){
 }
 
 function renderSegs(){const tb=$("#segTable tbody");tb.innerHTML="";state.segs.forEach((s,i)=>{const tr=document.createElement("tr");const col3=`<td><input data-sk="pace" data-i="${i}" value="${s.pace||"8:40"}" inputmode="numeric"/></td>`;tr.innerHTML=`<td><input data-sk="startMile" data-i="${i}" value="${s.startMile}" inputmode="decimal"/></td><td><input data-sk="endMile" data-i="${i}" value="${s.endMile}" inputmode="decimal"/></td>${col3}<td><button class="row-x" data-del-seg="${i}">×</button></td>`;tb.appendChild(tr);});}
-$("#spmInput").addEventListener("input",(e)=>{const v=+e.target.value;if(v>0&&v<=260){state.spm=Math.round(v);saveCal();}});
-document.addEventListener("input",(e)=>{const t=e.target;if(t.dataset.sk!=null){state.segs[+t.dataset.i][t.dataset.sk]=t.value;}if(t.id==="tol"){state.tol=+t.value;$("#tolVal").textContent="±"+t.value;}});
-document.addEventListener("click",(e)=>{const t=e.target;if(t.dataset.delSeg!=null){state.segs.splice(+t.dataset.delSeg,1);renderSegs();}});
+$("#spmInput").addEventListener("input",(e)=>{const v=+e.target.value;if(v>0&&v<=260){state.spm=Math.round(v);saveCal();saveDraft();}});
+document.addEventListener("input",(e)=>{const t=e.target;if(t.dataset.sk!=null){state.segs[+t.dataset.i][t.dataset.sk]=t.value;saveDraft();}if(t.id==="tol"){state.tol=+t.value;$("#tolVal").textContent="±"+t.value;saveDraft();}});
+document.addEventListener("click",(e)=>{const t=e.target;if(t.dataset.delSeg!=null){state.segs.splice(+t.dataset.delSeg,1);renderSegs();saveDraft();}});
 
-$("#addSeg").onclick=()=>{const l=state.segs.at(-1);const f=l?+l.endMile:0;state.segs.push({startMile:f,endMile:f+3,pace:"8:40"});renderSegs();};
-$("#repeat").onchange=(e)=>state.repeat=e.target.checked;
-function toggleMode(id,key){const el=$(id);el.onclick=()=>{state.modes[key]=!state.modes[key];el.setAttribute("aria-pressed",state.modes[key]);};el.onkeydown=(ev)=>{if(ev.key===" "||ev.key==="Enter"){ev.preventDefault();el.click();}};}
+$("#addSeg").onclick=()=>{const l=state.segs.at(-1);const f=l?+l.endMile:0;state.segs.push({startMile:f,endMile:f+3,pace:"8:40"});renderSegs();saveDraft();};
+$("#repeat").onchange=(e)=>{state.repeat=e.target.checked;saveDraft();};
+function toggleMode(id,key){const el=$(id);el.onclick=()=>{state.modes[key]=!state.modes[key];el.setAttribute("aria-pressed",state.modes[key]);saveDraft();};el.onkeydown=(ev)=>{if(ev.key===" "||ev.key==="Enter"){ev.preventDefault();el.click();}};}
 toggleMode("#mDirect","direct");toggleMode("#mHalf","half");
 const cadColor=(cad)=>{const t=Math.max(0,Math.min(1,(cad-162)/26));const a=[12,102,228],b=[130,112,219];return`rgb(${a.map((v,i)=>Math.round(v+(b[i]-v)*t)).join(",")})`;};
 
@@ -696,6 +831,7 @@ function applyPlaylistResult(res,candidates,opts={}){
   lastResult=res;
   lastPlaylist=res.plan.flatMap((p)=>p.tracks);
   renderResults(res,{scroll:opts.scroll!==false});
+  saveDraft();
 }
 function mergeCandidates(prev,next){
   const by=new Map();
@@ -1018,6 +1154,8 @@ async function shipPlaylist(btn){
     const link=document.createElement("a");link.href=j.url;link.target="_blank";link.textContent=`Open "${j.name}" in ${svc} (${j.count} tracks)`;
     link.style.cssText="display:block;text-align:center;color:var(--pace);font-size:12.5px;margin-top:8px";
     btn.parentElement.after(link);
+    /* Export done — don't restore this draft after a refresh. */
+    clearDraftStorage();
   }catch(e){btn.disabled=false;btn.textContent=old;btn.style.background="";const m=document.createElement("div");m.className="note";m.textContent="Ship failed: "+e.message;btn.parentElement.after(m);}
 }
 function removeTrack(segIdx,trackIdx){
@@ -1034,6 +1172,7 @@ function removeTrack(segIdx,trackIdx){
   lastResult.trackCount=lastResult.plan.reduce((n,p)=>n+p.tracks.length,0);
   lastPlaylist=lastResult.plan.flatMap((p)=>p.tracks);
   renderResults(lastResult);
+  saveDraft();
 }
 function refreshPlanTotals(){
   if(!lastResult)return;
@@ -1044,6 +1183,7 @@ function refreshPlanTotals(){
   lastResult.totalFilledSec=lastResult.plan.reduce((s,p)=>s+p.filledSec,0);
   lastResult.trackCount=lastResult.plan.reduce((n,p)=>n+p.tracks.length,0);
   lastPlaylist=lastResult.plan.flatMap((p)=>p.tracks);
+  saveDraft();
 }
 function matchTagHtml(t){
   if(t.matchMode==="manual")return`<span class="tag manual">manual</span>`;
@@ -1224,7 +1364,7 @@ function renderResults(res,opts={}){
   if(again)again.onclick=()=>{closeAddTrackPanel();runPoolSearch({keepMatchedOnly:true,includePlaylistArtists:true,includeSeeds:true});};
   const exportNameInput=$("#exportName");
   if(exportNameInput){
-    exportNameInput.oninput=()=>{playlistExportName=exportNameInput.value;};
+    exportNameInput.oninput=()=>{playlistExportName=exportNameInput.value;saveDraft();};
   }
   const eb=$("#exportBtn");if(eb&&canExport&&!searching)eb.onclick=()=>shipPlaylist(eb);
   if(scroll){
@@ -1233,9 +1373,24 @@ function renderResults(res,opts={}){
   }
 }
 
-loadCal();$("#spmInput").value=state.spm;renderSegs();renderSeeds();
+loadCal();
+loadDraft();
+const _svc=new URLSearchParams(location.search).get("service");
+if(_svc&&(_svc==="tidal"||_svc==="spotify")){
+  if(state.service!==_svc){
+    /* OAuth landed on a different service than the draft — drop the other service's draft. */
+    state.seeds=[];lastPlaylist=[];lastResult=null;lastCandidates=[];excludedIds=new Set();playlistExportName=null;
+    clearDraftStorage();
+  }
+  state.service=_svc;
+}
+syncServiceTabs();
+syncPlanControls();
+renderSegs();
+renderSeeds();
+if(lastResult)renderResults(lastResult,{scroll:false});
 startRenderKeepAlive();
-const _svc=new URLSearchParams(location.search).get("service");if(_svc&&(_svc==="tidal"||_svc==="spotify"))setService(_svc);else checkLogin();
+checkLogin();
 </script>
 </body>
 </html>
