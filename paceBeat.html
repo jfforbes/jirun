@@ -633,10 +633,14 @@ async function checkLogin(){await api.health();const btn=$("#loginBtn");const sv
   btn.textContent=`Log in with ${SVC_NAME[svc]}`;
   const imp=$("#loadPlaylists"),pick=$("#playlistPick");
   const showImport=(on)=>{imp.style.display=on?"block":"none";$("#logoutBtn").style.display=on?"block":"none";if(!on){pick.style.display="none";pick.value="";}};
-  if(!HEALTH.ok){setConn("off","Bridge not reachable. Start server.mjs and open the app URL.");btn.style.display="none";showImport(false);return;}
-  if(h.loggedIn){setConn("on",HEALTH.bpmKey?`Logged in — playlists will land in ${SVC_NAME[svc]}.`:"Logged in, but no BPM key. Add GETSONGBPM_API_KEY to credentials.txt.");btn.style.display="none";showImport(true);}
+  if(!HEALTH.ok){setConn("off","Bridge not reachable. Start server.mjs and open the app URL.");btn.style.display="none";showImport(false);}
+  else if(h.loggedIn){setConn("on",HEALTH.bpmKey?`Logged in — playlists will land in ${SVC_NAME[svc]}.`:"Logged in, but no BPM key. Add GETSONGBPM_API_KEY to credentials.txt.");btn.style.display="none";showImport(true);}
   else if(h.hasCreds){setConn("off",`Not logged in to ${SVC_NAME[svc]} — tap below.`);btn.style.display="block";showImport(false);}
-  else{setConn("err",`No ${SVC_NAME[svc]} credentials. Add ${svc.toUpperCase()}_CLIENT_ID / _SECRET to credentials.txt.`);btn.style.display="none";showImport(false);}}
+  else{setConn("err",`No ${SVC_NAME[svc]} credentials. Add ${svc.toUpperCase()}_CLIENT_ID / _SECRET to credentials.txt.`);btn.style.display="none";showImport(false);}
+  /* Draft restore paints before health resolves — refresh so Ship/export reflects login. */
+  if(lastResult)renderResults(lastResult,{scroll:false});
+  else renderSeeds();
+}
 function clearPoolProgress(){
   const slot=$("#pool-progress-slot");
   if(!slot)return;

@@ -72,10 +72,15 @@ const SERVICES = {
     pkce: false, store: { access: null, refresh: null, exp: 0 }, verifier: null,
   },
 };
-/* Persist OAuth tokens so Render free-tier spin-down / restart doesn't force re-login. */
-const AUTH_STORE_FILE = path.join(__dirname, "auth-tokens.json");
+/* Persist OAuth tokens so Render free-tier spin-down / restart doesn't force re-login.
+   Kept as a dotfile and also blocked by the static file deny-list below. */
+const AUTH_STORE_FILE = path.join(__dirname, ".auth-tokens.json");
+const AUTH_STORE_LEGACY = path.join(__dirname, "auth-tokens.json");
 function loadAuthStore() {
   try {
+    if (!fs.existsSync(AUTH_STORE_FILE) && fs.existsSync(AUTH_STORE_LEGACY)) {
+      try { fs.renameSync(AUTH_STORE_LEGACY, AUTH_STORE_FILE); } catch (_) {}
+    }
     const j = JSON.parse(fs.readFileSync(AUTH_STORE_FILE, "utf8"));
     for (const name of ["tidal", "spotify"]) {
       const row = j?.[name];
@@ -2672,8 +2677,17 @@ const server = http.createServer(async (req, res) => {
         scored: rows.slice(0, 15),
       });
     }
-    // static
+    // static — only serve the SPA and intentionally public assets
     const file = url.pathname === "/" ? "paceBeat.html" : url.pathname.slice(1);
+    const base = path.basename(file);
+    const denied = new Set([
+      "credentials.txt", ".env", "bpm-cache.json",
+      "auth-tokens.json", ".auth-tokens.json",
+      "server.mjs", "package.json", "gitignore", ".gitignore",
+    ]);
+    if (denied.has(base) || base.startsWith(".") || file.includes("..") || file.includes("/")) {
+      return sendJSON(res, 404, { error: "not found" });
+    }
     const fp = path.join(__dirname, file);
     if (fp.startsWith(__dirname) && fs.existsSync(fp) && fs.statSync(fp).isFile()) {
       const ext = path.extname(fp);
