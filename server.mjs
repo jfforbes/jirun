@@ -937,6 +937,65 @@ async function lastfmTagTopArtists(tag, limit = 40) {
     return list.map((a) => a?.name).filter(Boolean);
   } catch (_) { return []; }
 }
+/** Fallback genre bank when Last.fm chart tags are unavailable. */
+const RANDOM_GENRE_BANK = [
+  "pop", "rock", "hip-hop", "electronic", "dance", "indie", "r&b", "soul",
+  "house", "techno", "funk", "punk", "metal", "alternative", "folk", "country",
+  "latin", "reggaeton", "afrobeats", "k-pop", "jazz", "disco", "trance",
+  "drum and bass", "garage", "synthpop", "edm", "rap", "indie rock", "pop rock",
+  "soft rock", "classic rock", "new wave", "post-punk", "shoegaze", "ambient",
+  "trap", "dubstep", "hardstyle", "salsa", "cumbia", "gospel", "blues",
+  "singer-songwriter", "britpop", "grunge", "emo", "hyperpop", "lo-fi",
+];
+/** Global Last.fm chart tags — refreshed lazily for random-genre fills. */
+let chartTagCache = { at: 0, tags: [] };
+async function lastfmChartTopTags(limit = 80) {
+  if (!LASTFM_KEY) return [];
+  const now = Date.now();
+  if (chartTagCache.tags.length && now - chartTagCache.at < 6 * 60 * 60 * 1000) {
+    return chartTagCache.tags.slice(0, limit);
+  }
+  try {
+    const u = `${LASTFM_BASE}?method=chart.getTopTags&api_key=${LASTFM_KEY}&format=json&limit=${Math.max(limit, 50)}`;
+    const r = await fetch(u, { headers: { Accept: "application/json" } });
+    if (!r.ok) return chartTagCache.tags.slice(0, limit);
+    const j = await r.json();
+    const raw = j.tags?.tag || j.toptags?.tag || [];
+    const list = (Array.isArray(raw) ? raw : raw ? [raw] : [])
+      .map((t) => String(t?.name || "").trim().toLowerCase())
+      .filter((n) => n.length >= 2 && n.length <= 32 && !/^\d+$/.test(n));
+    if (list.length) {
+      chartTagCache = { at: now, tags: [...new Set(list)] };
+    }
+    return chartTagCache.tags.slice(0, limit);
+  } catch (_) {
+    return chartTagCache.tags.slice(0, limit);
+  }
+}
+function shufflePick(arr, n) {
+  const copy = [...(arr || [])];
+  for (let i = copy.length - 1; i > 0; i--) {
+    const j = Math.floor(Math.random() * (i + 1));
+    const tmp = copy[i];
+    copy[i] = copy[j];
+    copy[j] = tmp;
+  }
+  return copy.slice(0, Math.max(0, n));
+}
+/**
+ * Pick random genres for empty-seed pool builds.
+ * Prefer live Last.fm chart tags; fall back to a built-in bank.
+ */
+async function pickRandomGenres(count = 8, exclude = null) {
+  const skip = exclude instanceof Set
+    ? exclude
+    : new Set([...(exclude || [])].map((g) => String(g || "").toLowerCase()).filter(Boolean));
+  let pool = await lastfmChartTopTags(100);
+  if (pool.length < 16) pool = [...new Set([...pool, ...RANDOM_GENRE_BANK])];
+  else pool = [...new Set([...pool, ...shufflePick(RANDOM_GENRE_BANK, 12)])];
+  pool = pool.filter((g) => g && !skip.has(String(g).toLowerCase()));
+  return shufflePick(pool, count);
+}
 /** Rank genres from candidate tracks; seed artists count heavier. */
 function topGenresFromCandidates(candidates, { artistIds = [], artistNames = [], limit = 8 } = {}) {
   const seedIds = new Set((artistIds || []).map(String).filter(Boolean));
@@ -1569,9 +1628,10 @@ async function tidalPool(seeds, targetSec = 0, targets = null, onProgress = null
     lastSnapLen = candidates.length;
     try { ctrl.onSnapshot(candidates); } catch (_) {}
   };
-  const seedList = seeds.map((s) => (typeof s === "string" ? { id: s, name: "" } : s));
-  const seedIds = seedList.map((s) => String(s.id));
+  const seedList = (Array.isArray(seeds) ? seeds : []).map((s) => (typeof s === "string" ? { id: s, name: "" } : s)).filter((s) => s && (s.id || s.name));
+  const seedIds = seedList.map((s) => String(s.id)).filter(Boolean);
   const seedNames = seedList.map((s) => s.name).filter(Boolean);
+  const noSeeds = !seedIds.length;
   const ARTIST_CAP = POOL_ARTIST_CAP, TRACK_CAP = POOL_TRACK_CAP, MAX_LEVELS = POOL_MAX_LEVELS;
   const knownNames = new Map(); seedNames.forEach((n) => knownNames.set(n.toLowerCase(), n));
   const doneArtists = new Set(), allTrackIds = new Set(), candidates = [];
@@ -1681,7 +1741,7 @@ async function tidalPool(seeds, targetSec = 0, targets = null, onProgress = null
     snap();
     return n;
   }
-  async function ingestTempoFill(detail) {
+  async function ingestTempoFill(detail, { maxArtists = 50, maxTracks = 250 } = {}) {
     if (userStop()) return 0;
     if (poolNeed(targetSec, targets, candidates).canFill) return 0;
     report("bpm", { detail });
@@ -1693,7 +1753,7 @@ async function tidalPool(seeds, targetSec = 0, targets = null, onProgress = null
       onProgress: (p) => report("bpm", { detail: p.detail || detail, tempoBpm: p.tempoBpm }),
       resolveArtist: async (name) => tidalResolveArtist(name),
       fetchArtistTracks: async (name, id) => {
-        const ids = await tidalArtistTrackIds(id, 40);
+        const ids = await tidalArtistTrackIds(id, noSeeds ? 60 : 40);
         const out = [];
         for (let i = 0; i < ids.length; i += 20) {
           const chunk = ids.slice(i, i + 20);
@@ -1705,8 +1765,8 @@ async function tidalPool(seeds, targetSec = 0, targets = null, onProgress = null
         await tidalHydrateGenres(out);
         return out;
       },
-      maxArtists: 50,
-      maxTracks: 250,
+      maxArtists,
+      maxTracks,
     });
     report("bpm", { detail: `Imported ${n} tempo-matched tracks`, stamped: n });
     snap();
@@ -1768,19 +1828,6 @@ async function tidalPool(seeds, targetSec = 0, targets = null, onProgress = null
       .sort((a, b) => b.score - a.score);
   }
 
-  report("start", {
-    detail: keptN
-      ? `Keeping ${keptN} playlist songs · gathering seed discographies to fill gaps`
-      : "Gathering full discographies from seed artists",
-  });
-  await fetchArtists(seedIds, true, "seed discographies");
-  await fillFromTempoCatalog("Stamping tempos from BPM catalog");
-  // Kept + seed coverage may already pack the run — skip related-artist grind.
-  if (poolNeed(targetSec, targets, candidates).canFill) {
-    report("done", { detail: keptN ? "Coverage met by kept playlist songs" : "Seed coverage ready" });
-    return candidates;
-  }
-
   // Scored BFS queues — multi-seed votes + Last.fm match + genre fan-out.
   const idQueue = makeScoredQueue();
   const nameQueue = makeScoredQueue();
@@ -1798,8 +1845,64 @@ async function tidalPool(seeds, targetSec = 0, targets = null, onProgress = null
     knownNames.set(k, name);
     nameQueue.add(k, pts, name);
   };
+  async function enqueueRandomGenres(count, detailPrefix = "Random genres") {
+    const genres = await pickRandomGenres(count, genreTried);
+    for (const g of genres) genreTried.add(String(g).toLowerCase());
+    if (!genres.length) return [];
+    report("similar", {
+      detail: `${detailPrefix} · ${genres.slice(0, 4).join(", ")}${genres.length > 4 ? "…" : ""}`,
+    });
+    if (LASTFM_KEY) {
+      const tagLists = await mapLimit(genres, 4, (g) => lastfmTagTopArtists(g, 40));
+      for (const names of tagLists) {
+        for (const nm of names || []) enqueueName(nm, 1.0);
+      }
+    }
+    return genres;
+  }
+
+  if (noSeeds) {
+    report("start", {
+      detail: keptN
+        ? `Keeping ${keptN} playlist songs · no seeds · target BPMs + random genres`
+        : "No artists · looking up target BPMs, then random genres",
+    });
+    await ingestTempoFill("Looking up songs at your target BPMs", { maxArtists: 90, maxTracks: 450 });
+    if (poolNeed(targetSec, targets, candidates).canFill) {
+      report("done", { detail: "BPM catalog coverage ready" });
+      return candidates;
+    }
+    await enqueueRandomGenres(10, "Random genres");
+  } else {
+    report("start", {
+      detail: keptN
+        ? `Keeping ${keptN} playlist songs · gathering seed discographies to fill gaps`
+        : "Gathering full discographies from seed artists",
+    });
+    await fetchArtists(seedIds, true, "seed discographies");
+    await fillFromTempoCatalog("Stamping tempos from BPM catalog");
+    // Kept + seed coverage may already pack the run — skip related-artist grind.
+    if (poolNeed(targetSec, targets, candidates).canFill) {
+      report("done", { detail: keptN ? "Coverage met by kept playlist songs" : "Seed coverage ready" });
+      return candidates;
+    }
+  }
+
   let expandFromIds = [...seedIds];
   let expandFromNames = [...seedNames];
+  // After tempo ingest with no seeds, expand from artists already in the candidate pool.
+  if (noSeeds && !expandFromNames.length) {
+    const seen = new Set();
+    for (const t of candidates) {
+      const nm = String(t.artist || "").trim();
+      if (!nm) continue;
+      const k = nm.toLowerCase();
+      if (seen.has(k)) continue;
+      seen.add(k);
+      expandFromNames.push(nm);
+      if (expandFromNames.length >= 40) break;
+    }
+  }
 
   for (let level = 1; level <= MAX_LEVELS; level++) {
     currentLevel = level;
@@ -1814,7 +1917,9 @@ async function tidalPool(seeds, targetSec = 0, targets = null, onProgress = null
     report("expand", {
       detail: shortNote
         ? `Ring ${level} · still short on ${shortNote} · queue ${idQueue.size() + nameQueue.size()}`
-        : `Gathering songs · related artists ring ${level} · queue ${idQueue.size() + nameQueue.size()}`,
+        : noSeeds
+          ? `Gathering songs · BPM + random genres · ring ${level} · queue ${idQueue.size() + nameQueue.size()}`
+          : `Gathering songs · related artists ring ${level} · queue ${idQueue.size() + nameQueue.size()}`,
       level,
       pendingQueue: idQueue.size() + nameQueue.size(),
     });
@@ -1839,22 +1944,27 @@ async function tidalPool(seeds, targetSec = 0, targets = null, onProgress = null
       }
     }
 
-    // Genre-overlap fan-out: after seeds (ring 1) and again mid-run if still short.
-    if (LASTFM_KEY && doneArtists.size < ARTIST_CAP && (level === 1 || (level >= 4 && level % 4 === 0))) {
-      const genres = topGenresFromCandidates(candidates, {
-        artistIds: level === 1 ? seedIds : [],
-        artistNames: level === 1 ? seedNames : [],
-        limit: level === 1 ? 6 : 4,
-      }).filter((g) => !genreTried.has(g));
-      for (const g of genres) genreTried.add(g);
-      if (genres.length) {
+    // Genre fan-out: seed-weighted genres normally; random genres when backlog is empty.
+    if (doneArtists.size < ARTIST_CAP && (level === 1 || (level >= 4 && level % 4 === 0))) {
+      let genres = [];
+      if (noSeeds) {
+        genres = await pickRandomGenres(level === 1 ? 8 : 5, genreTried);
+      } else if (LASTFM_KEY) {
+        genres = topGenresFromCandidates(candidates, {
+          artistIds: level === 1 ? seedIds : [],
+          artistNames: level === 1 ? seedNames : [],
+          limit: level === 1 ? 6 : 4,
+        }).filter((g) => !genreTried.has(String(g).toLowerCase()));
+      }
+      for (const g of genres) genreTried.add(String(g).toLowerCase());
+      if (genres.length && LASTFM_KEY) {
         report("similar", {
-          detail: `Genre fan-out · ${genres.slice(0, 3).join(", ")}${genres.length > 3 ? "…" : ""}`,
+          detail: `${noSeeds ? "Random genres" : "Genre fan-out"} · ${genres.slice(0, 3).join(", ")}${genres.length > 3 ? "…" : ""}`,
           level,
         });
         const tagLists = await mapLimit(genres, 4, (g) => lastfmTagTopArtists(g, level <= 2 ? 35 : 25));
         for (const names of tagLists) {
-          for (const nm of names || []) enqueueName(nm, 0.85);
+          for (const nm of names || []) enqueueName(nm, noSeeds ? 1.0 : 0.85);
         }
       }
     }
@@ -1903,7 +2013,10 @@ async function tidalPool(seeds, targetSec = 0, targets = null, onProgress = null
 
   await fillFromTempoCatalog("Final tempo catalog pass");
   if (!userStop() && !poolNeed(targetSec, targets, candidates).canFill) {
-    await ingestTempoFill("Importing songs at your target tempos");
+    await ingestTempoFill(
+      "Importing songs at your target tempos",
+      noSeeds ? { maxArtists: 90, maxTracks: 450 } : {},
+    );
   }
   // One more related-artist push if still short and we have queue/budget left.
   if (!userStop() && !poolNeed(targetSec, targets, candidates).canFill && !hardStop() && idQueue.size() && doneArtists.size < ARTIST_CAP) {
@@ -2145,8 +2258,9 @@ async function spotifyPool(seeds, targetSec = 0, targets = null, onProgress = nu
     lastSnapLen = candidates.length;
     try { ctrl.onSnapshot(candidates); } catch (_) {}
   };
-  const seedList = seeds.map((s) => (typeof s === "string" ? { name: s } : s));
+  const seedList = (Array.isArray(seeds) ? seeds : []).map((s) => (typeof s === "string" ? { name: s } : s)).filter((s) => s && (s.name || s.id));
   const seedNames = seedList.map((s) => s.name).filter(Boolean);
+  const noSeeds = !seedNames.length;
   const ARTIST_CAP = POOL_ARTIST_CAP, TRACK_CAP = POOL_TRACK_CAP, MAX_LEVELS = POOL_MAX_LEVELS;
   const knownNames = new Map(); seedNames.forEach((n) => knownNames.set(n.toLowerCase(), n));
   const seedNameSet = new Set(seedNames.map((n) => n.toLowerCase()));
@@ -2249,7 +2363,7 @@ async function spotifyPool(seeds, targetSec = 0, targets = null, onProgress = nu
     snap();
     return n;
   }
-  async function ingestTempoFill(detail) {
+  async function ingestTempoFill(detail, { maxArtists = 50, maxTracks = 250 } = {}) {
     if (userStop()) return 0;
     if (poolNeed(targetSec, targets, candidates).canFill) return 0;
     report("bpm", { detail });
@@ -2260,9 +2374,9 @@ async function spotifyPool(seeds, targetSec = 0, targets = null, onProgress = nu
       stats: bpmStats,
       onProgress: (p) => report("bpm", { detail: p.detail || detail, tempoBpm: p.tempoBpm }),
       resolveArtist: async (name) => spotifyResolveArtist(name),
-      fetchArtistTracks: async (name, id) => spotifyArtistTracks(name, id, 40),
-      maxArtists: 50,
-      maxTracks: 250,
+      fetchArtistTracks: async (name, id) => spotifyArtistTracks(name, id, noSeeds ? 60 : 40),
+      maxArtists,
+      maxTracks,
     });
     report("bpm", { detail: `Imported ${n} tempo-matched tracks`, stamped: n });
     snap();
@@ -2287,18 +2401,6 @@ async function spotifyPool(seeds, targetSec = 0, targets = null, onProgress = nu
     return fresh;
   }
 
-  report("start", {
-    detail: keptN
-      ? `Keeping ${keptN} playlist songs · gathering seed discographies to fill gaps`
-      : "Gathering full discographies from seed artists",
-  });
-  await fetchNames(seedNames, "seed discographies", { seedWeight: true });
-  await fillFromTempoCatalog("Stamping tempos from BPM catalog");
-  if (poolNeed(targetSec, targets, candidates).canFill) {
-    report("done", { detail: keptN ? "Coverage met by kept playlist songs" : "Seed coverage ready" });
-    return candidates;
-  }
-
   const nameQueue = makeScoredQueue();
   const genreTried = new Set();
   const enqueueName = (nm, pts = 1) => {
@@ -2309,7 +2411,71 @@ async function spotifyPool(seeds, targetSec = 0, targets = null, onProgress = nu
     knownNames.set(k, name);
     nameQueue.add(k, pts, name);
   };
+  async function enqueueGenreArtists(genres, { lastfmLimit = 40, spotifyLimit = 15, pts = 1.0 } = {}) {
+    const list = (genres || []).map((g) => String(g || "").trim()).filter(Boolean);
+    if (!list.length) return;
+    report("similar", {
+      detail: `${noSeeds ? "Random genres" : "Genre fan-out"} · ${list.slice(0, 3).join(", ")}${list.length > 3 ? "…" : ""}`,
+      level: currentLevel || 1,
+    });
+    if (LASTFM_KEY) {
+      const tagLists = await mapLimit(list, 4, (g) => lastfmTagTopArtists(g, lastfmLimit));
+      for (const names of tagLists) {
+        for (const nm of names || []) enqueueName(nm, pts * 0.85);
+      }
+    }
+    const spotLists = await mapLimit(list, 3, (g) => spotifyArtistsByGenre(g, spotifyLimit));
+    for (const arts of spotLists) {
+      for (const a of arts || []) {
+        if (a?.name) {
+          if (a.id) seedIdByName.set(a.name.toLowerCase(), a.id);
+          enqueueName(a.name, pts);
+        }
+      }
+    }
+  }
+
+  if (noSeeds) {
+    report("start", {
+      detail: keptN
+        ? `Keeping ${keptN} playlist songs · no seeds · target BPMs + random genres`
+        : "No artists · looking up target BPMs, then random genres",
+    });
+    await ingestTempoFill("Looking up songs at your target BPMs", { maxArtists: 90, maxTracks: 450 });
+    if (poolNeed(targetSec, targets, candidates).canFill) {
+      report("done", { detail: "BPM catalog coverage ready" });
+      return candidates;
+    }
+    const genres = await pickRandomGenres(10, genreTried);
+    for (const g of genres) genreTried.add(String(g).toLowerCase());
+    await enqueueGenreArtists(genres, { lastfmLimit: 40, spotifyLimit: 18, pts: 1.0 });
+  } else {
+    report("start", {
+      detail: keptN
+        ? `Keeping ${keptN} playlist songs · gathering seed discographies to fill gaps`
+        : "Gathering full discographies from seed artists",
+    });
+    await fetchNames(seedNames, "seed discographies", { seedWeight: true });
+    await fillFromTempoCatalog("Stamping tempos from BPM catalog");
+    if (poolNeed(targetSec, targets, candidates).canFill) {
+      report("done", { detail: keptN ? "Coverage met by kept playlist songs" : "Seed coverage ready" });
+      return candidates;
+    }
+  }
+
   let expandFrom = [...seedNames];
+  if (noSeeds && !expandFrom.length) {
+    const seen = new Set();
+    for (const t of candidates) {
+      const nm = String(t.artist || "").trim();
+      if (!nm) continue;
+      const k = nm.toLowerCase();
+      if (seen.has(k)) continue;
+      seen.add(k);
+      expandFrom.push(nm);
+      if (expandFrom.length >= 40) break;
+    }
+  }
 
   for (let level = 1; level <= MAX_LEVELS; level++) {
     currentLevel = level;
@@ -2323,7 +2489,9 @@ async function spotifyPool(seeds, targetSec = 0, targets = null, onProgress = nu
     report("expand", {
       detail: shortNote
         ? `Ring ${level} · still short on ${shortNote} · queue ${nameQueue.size()}`
-        : `Gathering songs · related artists ring ${level} · queue ${nameQueue.size()}`,
+        : noSeeds
+          ? `Gathering songs · BPM + random genres · ring ${level} · queue ${nameQueue.size()}`
+          : `Gathering songs · related artists ring ${level} · queue ${nameQueue.size()}`,
       level,
       pendingQueue: nameQueue.size(),
     });
@@ -2342,34 +2510,25 @@ async function spotifyPool(seeds, targetSec = 0, targets = null, onProgress = nu
       }
     }
 
-    // Genre-overlap fan-out via Last.fm tags + Spotify genre search.
+    // Genre fan-out: seed-weighted normally; random genres when backlog is empty.
     if (doneNames.size < ARTIST_CAP && (level === 1 || (level >= 4 && level % 4 === 0))) {
-      const genres = topGenresFromCandidates(candidates, {
-        artistIds: level === 1 ? [...seedIdByName.values()] : [],
-        artistNames: level === 1 ? seedNames : [],
-        limit: level === 1 ? 6 : 4,
-      }).filter((g) => !genreTried.has(g));
-      for (const g of genres) genreTried.add(g);
+      let genres = [];
+      if (noSeeds) {
+        genres = await pickRandomGenres(level === 1 ? 8 : 5, genreTried);
+      } else {
+        genres = topGenresFromCandidates(candidates, {
+          artistIds: level === 1 ? [...seedIdByName.values()] : [],
+          artistNames: level === 1 ? seedNames : [],
+          limit: level === 1 ? 6 : 4,
+        }).filter((g) => !genreTried.has(String(g).toLowerCase()));
+      }
+      for (const g of genres) genreTried.add(String(g).toLowerCase());
       if (genres.length) {
-        report("similar", {
-          detail: `Genre fan-out · ${genres.slice(0, 3).join(", ")}${genres.length > 3 ? "…" : ""}`,
-          level,
+        await enqueueGenreArtists(genres, {
+          lastfmLimit: level <= 2 ? 35 : 25,
+          spotifyLimit: 15,
+          pts: noSeeds ? 1.0 : 0.9,
         });
-        if (LASTFM_KEY) {
-          const tagLists = await mapLimit(genres, 4, (g) => lastfmTagTopArtists(g, level <= 2 ? 35 : 25));
-          for (const names of tagLists) {
-            for (const nm of names || []) enqueueName(nm, 0.85);
-          }
-        }
-        const spotLists = await mapLimit(genres, 3, (g) => spotifyArtistsByGenre(g, 15));
-        for (const arts of spotLists) {
-          for (const a of arts || []) {
-            if (a?.name) {
-              if (a.id) seedIdByName.set(a.name.toLowerCase(), a.id);
-              enqueueName(a.name, 1.0);
-            }
-          }
-        }
       }
     }
 
@@ -2382,7 +2541,10 @@ async function spotifyPool(seeds, targetSec = 0, targets = null, onProgress = nu
     if (userStop()) break;
     if (level === 1 || level % 2 === 0) await fillFromTempoCatalog(`Tempo catalog after ring ${level}`);
     if (level >= 3 && level % 3 === 0 && !poolNeed(targetSec, targets, candidates).canFill) {
-      await ingestTempoFill(`Importing target-tempo songs · ring ${level}`);
+      await ingestTempoFill(
+        `Importing target-tempo songs · ring ${level}`,
+        noSeeds ? { maxArtists: 70, maxTracks: 350 } : {},
+      );
     }
     expandFrom = batch;
     if (poolNeed(targetSec, targets, candidates).canFill) break;
@@ -2390,7 +2552,10 @@ async function spotifyPool(seeds, targetSec = 0, targets = null, onProgress = nu
 
   await fillFromTempoCatalog("Final tempo catalog pass");
   if (!userStop() && !poolNeed(targetSec, targets, candidates).canFill) {
-    await ingestTempoFill("Importing songs at your target tempos");
+    await ingestTempoFill(
+      "Importing songs at your target tempos",
+      noSeeds ? { maxArtists: 90, maxTracks: 450 } : {},
+    );
   }
   if (!userStop() && !poolNeed(targetSec, targets, candidates).canFill && !hardStop() && nameQueue.size() && doneNames.size < ARTIST_CAP) {
     const extra = nameQueue
@@ -2571,7 +2736,7 @@ const server = http.createServer(async (req, res) => {
       const body = await readBody(req);
       const svc = body.service || "tidal";
       const seeds = Array.isArray(body.seeds) ? body.seeds : [];
-      if (!seeds.length) return sendJSON(res, 400, { error: "no seeds" });
+      // Empty seeds = BPM catalog + random genres mode (no artist backlog).
       const targets = body.targets && typeof body.targets === "object" ? body.targets : null;
       // Stream NDJSON progress so the UI can show live status during long builds.
       res.writeHead(200, {

@@ -153,7 +153,7 @@
       <button type="button" data-theme="system" aria-pressed="true">System</button>
     </div>
   </div>
-  <p class="sub">Sprint planning for people who actually sprint. Refine your backlog, estimate your zones, ship the playlist.</p>
+  <p class="sub">Sprint planning for people who actually sprint. Refine your backlog — or leave it empty and ship from target BPMs + random genres.</p>
 
   <section class="hero" aria-label="Backlog">
     <div class="modes" id="serviceTabs">
@@ -211,7 +211,7 @@
   <div id="pool-progress-slot" hidden></div>
   <div id="results-area"></div>
   <footer style="text-align:center;font-size:11px;color:var(--muted);margin:14px 0 4px">BPM data by <a href="https://getsongbpm.com" target="_blank" rel="noopener" style="color:var(--pace);font-weight:600">GetSongBPM</a> · <a href="https://acousticbrainz.org" target="_blank" rel="noopener" style="color:var(--pace);font-weight:600">AcousticBrainz</a></footer>
-  <div class="cta"><button id="build" disabled>Refine the backlog first</button></div>
+  <div class="cta"><button id="build">Ship by BPM · random genres 🚀</button></div>
 
 <script type="module">
 /* ===================== ENGINE (verified) ===================== */
@@ -761,9 +761,13 @@ function renderSeeds(){
   const clearBtn=$("#clearSeedsBtn");
   if(clearBtn)clearBtn.onclick=()=>clearAllSeeds();
   $("#seedCount").textContent=`${state.seeds.length}`;
-  const has=state.seeds.length>0;const btn=$("#build");btn.disabled=!has;
+  const hasSeeds=state.seeds.length>0;
   const fromPl=lastPlaylist.length?artistsFromPlaylist(lastPlaylist).length:0;
-  btn.textContent=!has?"Refine the backlog first":fromPl?`Ship it again 🚀`:"Ship it 🚀";
+  const btn=$("#build");
+  btn.disabled=false;
+  if(fromPl)btn.textContent=`Ship it again 🚀`;
+  else if(hasSeeds)btn.textContent="Ship it 🚀";
+  else btn.textContent="Ship by BPM · random genres 🚀";
 }
 
 function renderSegs(){const tb=$("#segTable tbody");tb.innerHTML="";state.segs.forEach((s,i)=>{const tr=document.createElement("tr");const col3=`<td><input data-sk="pace" data-i="${i}" value="${s.pace||"8:40"}" inputmode="numeric"/></td>`;tr.innerHTML=`<td><input data-sk="startMile" data-i="${i}" value="${s.startMile}" inputmode="decimal"/></td><td><input data-sk="endMile" data-i="${i}" value="${s.endMile}" inputmode="decimal"/></td>${col3}<td><button class="row-x" data-del-seg="${i}">×</button></td>`;tb.appendChild(tr);});}
@@ -930,7 +934,7 @@ async function runPoolSearch({keepMatchedOnly=false,includePlaylistArtists=false
   const fromBacklog=includeSeeds?state.seeds.map((s)=>({id:s.id?String(s.id):null,name:s.name||s.title||""})): [];
   const fromPlaylist=includePlaylistArtists?artistsFromPlaylist(lastPlaylist):[];
   const combined=mergeArtistSeeds(fromBacklog,fromPlaylist);
-  if(!combined.length)return;
+  const bpmRandomMode=!combined.length;
 
   poolBusy=true;
   scheduleKeepAlive();
@@ -962,8 +966,8 @@ async function runPoolSearch({keepMatchedOnly=false,includePlaylistArtists=false
     loading.update({stage:"gather",phase:"resolve",pct:3,detail:`Resolving ${combined.length} artists (${nSeed} backlog + ${nPl} from playlist)…`});
   }
   try{
-    const seeds=await resolveArtistSeeds(combined);
-    if(!seeds.length){
+    const seeds=bpmRandomMode?[]:await resolveArtistSeeds(combined);
+    if(!bpmRandomMode&&!seeds.length){
       loading.stop();
       if(!keepBySeg)area.innerHTML=`<section><div class="empty">Couldn't resolve artists on ${SVC_NAME[state.service]}. Add them to the backlog and try again.</div></section>`;
       else loading.showError(`Couldn't resolve artists on ${SVC_NAME[state.service]}. Kept playlist songs are still below.`);
@@ -973,9 +977,11 @@ async function runPoolSearch({keepMatchedOnly=false,includePlaylistArtists=false
       stage:"gather",
       phase:"start",
       pct:6,
-      detail:includePlaylistArtists&&nPl
-        ?`Searching from ${seeds.length} artists (${nSeed} backlog + ${nPl} from playlist)…`
-        :`Searching from ${seeds.length} seed artist${seeds.length===1?"":"s"}…`,
+      detail:bpmRandomMode
+        ?"No artists · looking up target BPMs, then random genres…"
+        :includePlaylistArtists&&nPl
+          ?`Searching from ${seeds.length} artists (${nSeed} backlog + ${nPl} from playlist)…`
+          :`Searching from ${seeds.length} seed artist${seeds.length===1?"":"s"}…`,
     });
     const targets={
       cadences:plannedCadences(),
@@ -995,7 +1001,7 @@ async function runPoolSearch({keepMatchedOnly=false,includePlaylistArtists=false
       loading.stop();
       if(e.code==="stopped-empty"||e.code==="aborted"){
         if(!keepBySeg){
-          area.innerHTML=`<section><div class="empty">Stopped before any BPM-matched songs came back. Wait a bit longer next time, or add more seeds.</div></section>`;
+          area.innerHTML=`<section><div class="empty">Stopped before any BPM-matched songs came back. Wait a bit longer next time${bpmRandomMode?"":", or add more seeds"}.</div></section>`;
         }else{
           loading.showError("Stopped before new songs arrived. Kept playlist songs are still below.");
         }
@@ -1007,7 +1013,7 @@ async function runPoolSearch({keepMatchedOnly=false,includePlaylistArtists=false
     }
     if(!candidates.length){
       loading.stop();
-      if(!keepBySeg)area.innerHTML=`<section><div class="empty">No candidates with BPM came back. Add more seeds, widen tolerance, or check /api/bpmtest.</div></section>`;
+      if(!keepBySeg)area.innerHTML=`<section><div class="empty">No candidates with BPM came back. ${bpmRandomMode?"Widen tolerance or check /api/bpmtest.":"Add more seeds, widen tolerance, or check /api/bpmtest."}</div></section>`;
       else loading.showError("No new BPM matches came back. Kept playlist songs are still below.");
       return;
     }
