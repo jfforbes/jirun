@@ -51,7 +51,21 @@ const env = (k) => process.env[k] || FILE[k];
 const COUNTRY = env("TIDAL_COUNTRY") || "US";
 const REDIRECT_URI = env("REDIRECT_URI") || env("TIDAL_REDIRECT_URI") || `http://localhost:${PORT}/callback`;
 const GSB_KEY = env("GETSONGBPM_API_KEY") || "";
-const GSB_BASE = "https://api.getsong.co";
+const GSB_BASE = env("GETSONGBPM_API_BASE") || "https://api.getsongbpm.com";
+const GSB_BASES = [...new Set([GSB_BASE, "https://api.getsongbpm.com", "https://api.getsong.co"].filter(Boolean))];
+async function gsbFetch(pathQuery) {
+  if (!GSB_KEY) return null;
+  let lastErr = null;
+  for (const base of GSB_BASES) {
+    try {
+      const r = await fetch(`${base}${pathQuery}`, { headers: { Accept: "application/json" } });
+      if (r.status === 404 || r.status === 401 || r.status === 403) { lastErr = r.status; continue; }
+      if (!r.ok) { lastErr = r.status; continue; }
+      return await r.json();
+    } catch (e) { lastErr = e; }
+  }
+  return null;
+}
 const LASTFM_KEY = env("LASTFM_API_KEY") || "";
 const LASTFM_BASE = "https://ws.audioscrobbler.com/2.0/";
 const TIDAL_API = "https://openapi.tidal.com/v2";
@@ -476,12 +490,9 @@ async function bpmFromGetSong(artist, title) {
   let best = null;
   for (const lookup of lookups) {
     try {
-      const r = await fetch(`${GSB_BASE}/search/?api_key=${GSB_KEY}&type=both&limit=8&lookup=${encodeURIComponent(lookup)}`, {
-        headers: { Accept: "application/json" },
-      });
-      if (!r.ok) continue;
+      const j = await gsbFetch(`/search/?api_key=${encodeURIComponent(GSB_KEY)}&type=both&limit=8&lookup=${encodeURIComponent(lookup)}`);
+      if (!j) continue;
       sawOk = true;
-      const j = await r.json();
       const hits = Array.isArray(j.search) ? j.search : [];
       const wantArt = (artist || "").toLowerCase();
       const wantTitle = (title || "").toLowerCase();
@@ -680,11 +691,8 @@ async function gsbArtistTempoMap(artistName) {
   if (gsbArtistMaps.has(k)) return gsbArtistMaps.get(k);
   let map = null;
   try {
-    const r = await fetch(`${GSB_BASE}/artist/?api_key=${GSB_KEY}&lookup=${encodeURIComponent(name)}`, {
-      headers: { Accept: "application/json" },
-    });
-    if (r.ok) {
-      const j = await r.json();
+    const j = await gsbFetch(`/artist/?api_key=${encodeURIComponent(GSB_KEY)}&lookup=${encodeURIComponent(name)}`);
+    if (j) {
       const arts = Array.isArray(j.artist) ? j.artist : j.artist ? [j.artist] : Array.isArray(j.search) ? j.search : [];
       const want = cleanMusicToken(name);
       const pick = arts.find((a) => cleanMusicToken(a?.name || a?.artist?.name || "") === want)
@@ -794,11 +802,8 @@ function cadenceBpmCenters(targets) {
 async function gsbSongsAtBpm(bpm, limit = 100) {
   if (!GSB_KEY || !(bpm > 0)) return [];
   try {
-    const r = await fetch(`${GSB_BASE}/tempo/?api_key=${GSB_KEY}&bpm=${Math.round(bpm)}&limit=${limit}`, {
-      headers: { Accept: "application/json" },
-    });
-    if (!r.ok) return [];
-    const j = await r.json();
+    const j = await gsbFetch(`/tempo/?api_key=${encodeURIComponent(GSB_KEY)}&bpm=${Math.round(bpm)}&limit=${limit}`);
+    if (!j) return [];
     const raw = j.tempo || j.search || j.songs || j.data || [];
     const list = Array.isArray(raw) ? raw : [];
     return list.map((hit) => {
@@ -1709,9 +1714,15 @@ async function tidalResolveArtist(name) {
   if (k in tidalArtistIdCache) return tidalArtistIdCache[k];
   let id = null;
   try {
-    const hits = await tidalArtistsByHandle(name);
+    // Full artist search (suggestions + handle + fuzzy) — handle-only misses most preferred-genre names.
+    const hits = await tidalSearchArtists(name);
     id = hits[0]?.id || null;
-  } catch (_) {}
+  } catch (_) {
+    try {
+      const hits = await tidalArtistsByHandle(name);
+      id = hits[0]?.id || null;
+    } catch (_) {}
+  }
   tidalArtistIdCache[k] = id;
   return id;
 }
@@ -1914,13 +1925,16 @@ async function tidalPool(seeds, targetSec = 0, targets = null, onProgress = null
     snap();
     return n;
   }
-async function fetchArtists(ids, seedWeight, detail) {
+async function fetchArtists(ids, seedWeight, detail, opts = {}) {
     if (userStop()) return [];
     const fresh = ids.filter((a) => a && !doneArtists.has(a));
     fresh.forEach((a) => doneArtists.add(a));
     if (!fresh.length) return [];
     report("tracks", { detail, pendingArtists: fresh.length });
-    const perArtist = seedWeight ? SEED_DISCOGRAPHY_CAP : RELATED_ARTIST_TRACK_CAP;
+    const finishAll = opts.finishAll != null ? !!opts.finishAll : !!seedWeight;
+    const perArtist = Number.isFinite(opts.trackCap) && opts.trackCap > 0
+      ? Math.floor(opts.trackCap)
+      : (seedWeight ? SEED_DISCOGRAPHY_CAP : RELATED_ARTIST_TRACK_CAP);
     const trackLists = await mapLimit(fresh, seedWeight ? 3 : 6, async (aid) => {
       try { return await tidalArtistTrackIds(aid, perArtist); } catch (_) { return []; }
     });
@@ -1943,7 +1957,7 @@ async function fetchArtists(ids, seedWeight, detail) {
       report("tracks", { detail, trackMeta: meta.length, trackIds: newIds.length });
     }
     await tidalHydrateGenres(meta);
-    await enrichBpm(meta, detail, { finishAll: !!seedWeight });
+    await enrichBpm(meta, detail, { finishAll });
     snap();
     return fresh;
   }
@@ -2019,18 +2033,49 @@ async function fetchArtists(ids, seedWeight, detail) {
     return genres;
   }
 
+  async function bootstrapPreferredArtists(detail = "Preferred genre artists") {
+    // A few well-known artists per preferred genre — enough variety without burning the pool budget.
+    const names = preferredGenreArtistFallback(PREFERRED_GENRES, 3);
+    if (!names.length) return 0;
+    report("similar", { detail: `${detail} · ${names.slice(0, 5).join(", ")}${names.length > 5 ? "…" : ""}` });
+    const resolved = await mapLimit(names, 6, async (nm) => {
+      const id = await tidalResolveArtist(nm).catch(() => null);
+      return id ? { id: String(id), name: nm } : null;
+    });
+    const ids = [];
+    for (const row of resolved) {
+      if (!row?.id) continue;
+      idToName.set(row.id, row.name);
+      ids.push(row.id);
+    }
+    if (!ids.length) {
+      report("similar", { detail: "Preferred genre artists · none resolved on Tidal" });
+      return 0;
+    }
+    // Finish BPM lookups, but cap discography depth so tempo-search still has budget.
+    await fetchArtists(ids, true, detail, { trackCap: 100, finishAll: true });
+    return ids.length;
+  }
+
   if (noSeeds) {
     report("start", {
       detail: keptN
         ? `Keeping ${keptN} playlist songs · no seeds · target BPMs + preferred genres`
         : "No artists · looking up target BPMs, then preferred genres",
     });
-    // Resolve GetSongBPM tempo songs directly on Tidal — don't depend on discography title matches.
+    // 1) Preferred genre artists first (metal/metalcore/house/emo/rap…) — most reliable empty-seed fill.
+    await bootstrapPreferredArtists("Preferred genre artists");
+    if (poolNeed(targetSec, targets, candidates).enough) {
+      report("done", { detail: "Preferred genre coverage ready" });
+      return candidates;
+    }
+    // 2) Direct search for GetSongBPM songs already tagged at the target tempos.
     await ingestTempoSearchFill("Searching songs at your target BPMs", { maxSongs: 240 });
     if (poolNeed(targetSec, targets, candidates).enough) {
       report("done", { detail: "BPM search coverage ready" });
       return candidates;
     }
+    // 3) Tempo-catalog artist import + more genre fan-out.
     await ingestTempoFill("Importing tempo-catalog artists", { maxArtists: 80, maxTracks: 300 });
     if (poolNeed(targetSec, targets, candidates).enough) {
       report("done", { detail: "BPM catalog coverage ready" });
@@ -2573,21 +2618,25 @@ async function spotifyPool(seeds, targetSec = 0, targets = null, onProgress = nu
     snap();
     return n;
   }
-  async function fetchNames(names, detail, { seedWeight = false } = {}) {
+  async function fetchNames(names, detail, { seedWeight = false, trackCap = null, finishAll = null } = {}) {
     if (userStop()) return [];
     const fresh = names.filter((n) => n && !doneNames.has(n.toLowerCase()));
     fresh.forEach((n) => doneNames.add(n.toLowerCase()));
     if (!fresh.length) return [];
     report("tracks", { detail, pendingArtists: fresh.length });
+    const doFinish = finishAll != null ? !!finishAll : !!seedWeight;
     const lists = await mapLimit(fresh, seedWeight ? 3 : 5, async (nm) => {
       const isSeed = seedWeight || seedNameSet.has(nm.toLowerCase());
       let id = seedIdByName.get(nm.toLowerCase()) || null;
       if (!id) id = await spotifyResolveArtist(nm).catch(() => null);
-      return spotifyArtistTracks(nm, id, isSeed ? SEED_DISCOGRAPHY_CAP : RELATED_ARTIST_TRACK_CAP).catch(() => []);
+      const cap = Number.isFinite(trackCap) && trackCap > 0
+        ? Math.floor(trackCap)
+        : (isSeed ? SEED_DISCOGRAPHY_CAP : RELATED_ARTIST_TRACK_CAP);
+      return spotifyArtistTracks(nm, id, cap).catch(() => []);
     });
     const toBpm = [];
     for (const tl of lists) for (const t of tl) if (t && !seenRef.has(t.ref)) { seenRef.add(t.ref); toBpm.push(t); }
-    await enrichBpm(toBpm, detail, { finishAll: seedWeight });
+    await enrichBpm(toBpm, detail, { finishAll: doFinish });
     snap();
     return fresh;
   }
@@ -2636,7 +2685,17 @@ async function spotifyPool(seeds, targetSec = 0, targets = null, onProgress = nu
         ? `Keeping ${keptN} playlist songs · no seeds · target BPMs + preferred genres`
         : "No artists · looking up target BPMs, then preferred genres",
     });
-    // Resolve GetSongBPM tempo songs directly on Spotify — don't depend on discography title matches.
+    // 1) Preferred genre artists first — most reliable empty-seed fill.
+    const prefNames = preferredGenreArtistFallback(PREFERRED_GENRES, 3);
+    if (prefNames.length) {
+      report("similar", { detail: `Preferred genre artists · ${prefNames.slice(0, 5).join(", ")}${prefNames.length > 5 ? "…" : ""}` });
+      await fetchNames(prefNames, "Preferred genre artists", { seedWeight: true, trackCap: 100, finishAll: true });
+      if (poolNeed(targetSec, targets, candidates).enough) {
+        report("done", { detail: "Preferred genre coverage ready" });
+        return candidates;
+      }
+    }
+    // 2) Direct search for GetSongBPM songs at the target tempos.
     await ingestTempoSearchFill("Searching songs at your target BPMs", { maxSongs: 240 });
     if (poolNeed(targetSec, targets, candidates).enough) {
       report("done", { detail: "BPM search coverage ready" });
@@ -3040,10 +3099,10 @@ const server = http.createServer(async (req, res) => {
       if (!GSB_KEY) return sendJSON(res, 200, { error: "GETSONGBPM_API_KEY not set" });
       const artist = url.searchParams.get("artist") || "", title = url.searchParams.get("title") || "";
       if (!title) return sendJSON(res, 400, { error: "add ?title=...&artist=..." });
-      const lookup = encodeURIComponent(`song:${title} artist:${artist}`);
-      const r = await fetch(`${GSB_BASE}/search/?api_key=${GSB_KEY}&type=both&limit=3&lookup=${lookup}`, { headers: { Accept: "application/json" } });
-      const j = await r.json().catch(() => ({}));
-      return sendJSON(res, 200, { status: r.status, results: (j.search || []).map((s) => ({ title: s.title, artist: s.artist?.name, tempo: s.tempo })) });
+      const lookup = `song:${title} artist:${artist}`;
+      const j = await gsbFetch(`/search/?api_key=${encodeURIComponent(GSB_KEY)}&type=both&limit=3&lookup=${encodeURIComponent(lookup)}`);
+      if (!j) return sendJSON(res, 200, { status: 0, results: [], error: "GetSongBPM request failed on all bases" });
+      return sendJSON(res, 200, { status: 200, results: (j.search || []).map((s) => ({ title: s.title, artist: s.artist?.name, tempo: s.tempo })) });
     }
     if (url.pathname === "/api/lasttest") {
       if (!LASTFM_KEY) return sendJSON(res, 200, { error: "LASTFM_API_KEY not set" });
