@@ -908,6 +908,105 @@ async function ingestTempoCatalogTracks({
   return added;
 }
 
+
+/**
+ * Empty-seed path: take GetSongBPM tempo-catalog songs and resolve each track
+ * directly via streaming search (artist + title). Much more reliable than
+ * matching catalog titles against a full discography.
+ *
+ * searchTrack(query) → [{id,ref,title,artist,durationSec,...}, ...]
+ */
+async function ingestTempoSongsViaSearch({
+  targets, candidates, seenIds, stats, onProgress,
+  searchTrack, maxSongs = 220,
+}) {
+  if (!GSB_KEY || typeof searchTrack !== "function") return 0;
+  const centers = cadenceBpmCenters(targets);
+  if (!centers.length) return 0;
+  const songs = [];
+  const seenSong = new Set();
+  for (const bpm of centers) {
+    if (typeof onProgress === "function") {
+      try { onProgress({ phase: "bpm", detail: `Searching ${bpm} BPM catalog songs…`, tempoBpm: bpm }); } catch (_) {}
+    }
+    for (const song of await gsbSongsAtBpm(bpm, 80)) {
+      const a = String(song.artist || "").trim();
+      const t = String(song.title || "").trim();
+      if (!a || !t) continue;
+      const k = `${a.toLowerCase()}|${cleanMusicToken(t)}`;
+      if (seenSong.has(k)) continue;
+      seenSong.add(k);
+      songs.push(song);
+    }
+  }
+  // Prefer variety — shuffle lightly so we don't only take the first BPM center.
+  for (let i = songs.length - 1; i > 0; i--) {
+    const j = Math.floor(Math.random() * (i + 1));
+    const tmp = songs[i]; songs[i] = songs[j]; songs[j] = tmp;
+  }
+  let added = 0;
+  const batch = songs.slice(0, Math.max(maxSongs * 2, maxSongs));
+  await mapLimit(batch, 6, async (song) => {
+    if (added >= maxSongs) return;
+    const q = `${song.artist} ${song.title}`.trim();
+    let hits = [];
+    try { hits = await searchTrack(q); } catch (_) { return; }
+    const hit = (hits || []).find((t) => t && (t.ref || t.id));
+    if (!hit) return;
+    const tid = String(hit.ref || hit.id || "");
+    if (!tid || seenIds.has(tid)) return;
+    if (added >= maxSongs) return;
+    seenIds.add(tid);
+    if (hit.id && String(hit.id) !== tid) seenIds.add(String(hit.id));
+    candidates.push({
+      ...hit,
+      bpm: song.tempo,
+      bpmSource: "tempo-search",
+    });
+    cacheBpm(hit.artist || song.artist, hit.title || song.title, song.tempo, {
+      source: "getsong:tempo-search",
+      confidence: 0.88,
+      isrc: hit.isrc || null,
+      trackId: hit.id || hit.ref || null,
+      service: hit.service || null,
+    });
+    added++;
+    if (stats) { stats.hit++; stats.tried++; }
+  });
+  saveBpmCache();
+  return added;
+}
+
+/** Well-known artists per preferred genre — used when Last.fm tag lookup is empty/unavailable. */
+const PREFERRED_GENRE_ARTISTS = {
+  metal: ["Metallica", "Iron Maiden", "Gojira", "Tool", "Mastodon", "Slipknot", "Pantera", "Disturbed"],
+  metalcore: ["Killswitch Engage", "Parkway Drive", "Architects", "Spiritbox", "August Burns Red", "Bring Me The Horizon", "The Devil Wears Prada", "As I Lay Dying"],
+  "thrash metal": ["Slayer", "Megadeth", "Anthrax", "Testament", "Kreator", "Exodus", "Overkill", "Municipal Waste"],
+  "melodic hardcore": ["Stick To Your Guns", "The Ghost Inside", "Counterparts", "Hundredth", "Verse", "Have Heart", "Terror", "Knocked Loose"],
+  house: ["Disclosure", "Fisher", "Chris Lake", "John Summit", "Peggy Gou", "Fred again..", "CamelPhat", "Duke Dumont"],
+  hardcore: ["Turnstile", "Hatebreed", "Madball", "Terror", "Gorilla Biscuits", "Sick of It All", "Trapped Under Ice", "Gulch"],
+  emo: ["My Chemical Romance", "Dashboard Confessional", "Taking Back Sunday", "Brand New", "Jimmy Eat World", "The Used", "Paramore", "Fall Out Boy"],
+  rap: ["Kendrick Lamar", "J. Cole", "Drake", "Travis Scott", "Eminem", "Tyler, The Creator", "Nicki Minaj", "Run the Jewels"],
+};
+function preferredGenreArtistFallback(genres, limitPerGenre = 8) {
+  const out = [];
+  const seen = new Set();
+  for (const g of genres || []) {
+    const key = String(g || "").trim().toLowerCase();
+    const list = PREFERRED_GENRE_ARTISTS[key] || [];
+    let n = 0;
+    for (const name of list) {
+      if (n >= limitPerGenre) break;
+      const k = name.toLowerCase();
+      if (seen.has(k)) continue;
+      seen.add(k);
+      out.push(name);
+      n++;
+    }
+  }
+  return out;
+}
+
 /* ---- Last.fm (similar artists) ---- */
 async function lastfmSimilar(name, limit = 40) {
   if (!LASTFM_KEY || !name) return [];
@@ -1798,7 +1897,24 @@ async function tidalPool(seeds, targetSec = 0, targets = null, onProgress = null
     snap();
     return n;
   }
-  async function fetchArtists(ids, seedWeight, detail) {
+    async function ingestTempoSearchFill(detail, { maxSongs = 220 } = {}) {
+    if (userStop()) return 0;
+    if (noSeeds ? poolNeed(targetSec, targets, candidates).enough : poolNeed(targetSec, targets, candidates).canFill) return 0;
+    report("bpm", { detail });
+    const n = await ingestTempoSongsViaSearch({
+      targets,
+      candidates,
+      seenIds: allTrackIds,
+      stats: bpmStats,
+      onProgress: (p) => report("bpm", { detail: p.detail || detail, tempoBpm: p.tempoBpm }),
+      searchTrack: async (q) => tidalSearchTracks(q),
+      maxSongs,
+    });
+    report("bpm", { detail: `Search-matched ${n} songs at target BPMs`, stamped: n });
+    snap();
+    return n;
+  }
+async function fetchArtists(ids, seedWeight, detail) {
     if (userStop()) return [];
     const fresh = ids.filter((a) => a && !doneArtists.has(a));
     fresh.forEach((a) => doneArtists.add(a));
@@ -1881,10 +1997,23 @@ async function tidalPool(seeds, targetSec = 0, targets = null, onProgress = null
     report("similar", {
       detail: `${label} · ${genres.slice(0, 4).join(", ")}${genres.length > 4 ? "…" : ""}`,
     });
+    let queued = 0;
     if (LASTFM_KEY) {
       const tagLists = await mapLimit(genres, 4, (g) => lastfmTagTopArtists(g, 40));
       for (const names of tagLists) {
-        for (const nm of names || []) enqueueName(nm, 1.0);
+        for (const nm of names || []) { enqueueName(nm, 1.0); queued++; }
+      }
+    }
+    // Last.fm miss / unavailable — still seed the queue with known artists for preferred genres.
+    if (queued < 8) {
+      for (const nm of preferredGenreArtistFallback(genres, 8)) {
+        enqueueName(nm, 1.1);
+        queued++;
+      }
+      if (queued) {
+        report("similar", {
+          detail: `Genre artist seeds · ${Math.min(queued, 12)} artists from preferred genres`,
+        });
       }
     }
     return genres;
@@ -1896,9 +2025,13 @@ async function tidalPool(seeds, targetSec = 0, targets = null, onProgress = null
         ? `Keeping ${keptN} playlist songs · no seeds · target BPMs + preferred genres`
         : "No artists · looking up target BPMs, then preferred genres",
     });
-    await ingestTempoFill("Looking up songs at your target BPMs", { maxArtists: 100, maxTracks: 500 });
-    // Empty-seed mode needs packing headroom (enough), not a bare canFill sum —
-    // otherwise playlists still come up short after unique-track packing.
+    // Resolve GetSongBPM tempo songs directly on Tidal — don't depend on discography title matches.
+    await ingestTempoSearchFill("Searching songs at your target BPMs", { maxSongs: 240 });
+    if (poolNeed(targetSec, targets, candidates).enough) {
+      report("done", { detail: "BPM search coverage ready" });
+      return candidates;
+    }
+    await ingestTempoFill("Importing tempo-catalog artists", { maxArtists: 80, maxTracks: 300 });
     if (poolNeed(targetSec, targets, candidates).enough) {
       report("done", { detail: "BPM catalog coverage ready" });
       return candidates;
@@ -2423,6 +2556,23 @@ async function spotifyPool(seeds, targetSec = 0, targets = null, onProgress = nu
     snap();
     return n;
   }
+  async function ingestTempoSearchFill(detail, { maxSongs = 220 } = {}) {
+    if (userStop()) return 0;
+    if (noSeeds ? poolNeed(targetSec, targets, candidates).enough : poolNeed(targetSec, targets, candidates).canFill) return 0;
+    report("bpm", { detail });
+    const n = await ingestTempoSongsViaSearch({
+      targets,
+      candidates,
+      seenIds: seenRef,
+      stats: bpmStats,
+      onProgress: (p) => report("bpm", { detail: p.detail || detail, tempoBpm: p.tempoBpm }),
+      searchTrack: async (q) => spotifySearchTracks(q),
+      maxSongs,
+    });
+    report("bpm", { detail: `Search-matched ${n} songs at target BPMs`, stamped: n });
+    snap();
+    return n;
+  }
   async function fetchNames(names, detail, { seedWeight = false } = {}) {
     if (userStop()) return [];
     const fresh = names.filter((n) => n && !doneNames.has(n.toLowerCase()));
@@ -2459,11 +2609,15 @@ async function spotifyPool(seeds, targetSec = 0, targets = null, onProgress = nu
       detail: `${noSeeds ? "Preferred genres" : "Genre fan-out"} · ${list.slice(0, 3).join(", ")}${list.length > 3 ? "…" : ""}`,
       level: currentLevel || 1,
     });
+    let queued = 0;
     if (LASTFM_KEY) {
       const tagLists = await mapLimit(list, 4, (g) => lastfmTagTopArtists(g, lastfmLimit));
       for (const names of tagLists) {
-        for (const nm of names || []) enqueueName(nm, pts * 0.85);
+        for (const nm of names || []) { enqueueName(nm, pts * 0.85); queued++; }
       }
+    }
+    if (noSeeds && queued < 8) {
+      for (const nm of preferredGenreArtistFallback(list, 8)) { enqueueName(nm, pts * 1.05); queued++; }
     }
     const spotLists = await mapLimit(list, 3, (g) => spotifyArtistsByGenre(g, spotifyLimit));
     for (const arts of spotLists) {
@@ -2482,8 +2636,13 @@ async function spotifyPool(seeds, targetSec = 0, targets = null, onProgress = nu
         ? `Keeping ${keptN} playlist songs · no seeds · target BPMs + preferred genres`
         : "No artists · looking up target BPMs, then preferred genres",
     });
-    await ingestTempoFill("Looking up songs at your target BPMs", { maxArtists: 100, maxTracks: 500 });
-    // Empty-seed mode needs packing headroom (enough), not a bare canFill sum.
+    // Resolve GetSongBPM tempo songs directly on Spotify — don't depend on discography title matches.
+    await ingestTempoSearchFill("Searching songs at your target BPMs", { maxSongs: 240 });
+    if (poolNeed(targetSec, targets, candidates).enough) {
+      report("done", { detail: "BPM search coverage ready" });
+      return candidates;
+    }
+    await ingestTempoFill("Importing tempo-catalog artists", { maxArtists: 80, maxTracks: 300 });
     if (poolNeed(targetSec, targets, candidates).enough) {
       report("done", { detail: "BPM catalog coverage ready" });
       return candidates;
@@ -2496,6 +2655,7 @@ async function spotifyPool(seeds, targetSec = 0, targets = null, onProgress = nu
       detail: `${anyPref ? "Preferred genres" : "More genres"} · ${genres.slice(0, 4).join(", ")}${genres.length > 4 ? "…" : ""}`,
     });
     await enqueueGenreArtists(genres, { lastfmLimit: 40, spotifyLimit: 18, pts: 1.0 });
+    for (const nm of preferredGenreArtistFallback(genres, 8)) enqueueName(nm, 1.1);
   } else {
     report("start", {
       detail: keptN

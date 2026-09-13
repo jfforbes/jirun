@@ -1024,7 +1024,7 @@ async function runPoolSearch({keepMatchedOnly=false,includePlaylistArtists=false
     }
     if(!candidates.length){
       loading.stop();
-      if(!keepBySeg)area.innerHTML=`<section><div class="empty">No candidates with BPM came back. ${bpmRandomMode?"Widen tolerance or check /api/bpmtest.":"Add more seeds, widen tolerance, or check /api/bpmtest."}</div></section>`;
+      if(!keepBySeg)area.innerHTML=`<section><div class="empty">No candidates with BPM came back. ${bpmRandomMode?"Tried target BPMs + preferred genres — widen tolerance, check BPM key, or add a few seed artists.":"Add more seeds, widen tolerance, or check /api/bpmtest?title=...&artist=..."}</div></section>`;
       else loading.showError("No new BPM matches came back. Kept playlist songs are still below.");
       return;
     }
