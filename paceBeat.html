@@ -327,7 +327,18 @@ function buildPlaylist(segments,candidates,opts){
       .map((t)=>({t,m:bpmMatch(t.bpm,cad,tol,modes)}))
       .filter((e)=>e.m)
       .sort((a,b)=>a.m.diff-b.m.diff||(a.t.durationSec||0)-(b.t.durationSec||0));
-    const{picks,filled}=rem>0?packTracks(pool,rem,overshootSec,usedG,allowRepeats):{picks:[],filled:0};
+    let picks=[],filled=0;
+    if(rem>0){
+      const first=packTracks(pool,rem,overshootSec,usedG,allowRepeats);
+      picks=first.picks;filled=first.filled;
+      // Always finish the run: if unique packing still left a gap, reuse BPM-matched
+      // songs for the remainder (even when "Allow repeats" is off).
+      if(filled<rem-15&&pool.length){
+        const gap=packTracks(pool,rem-filled,Math.max(overshootSec,180),usedG,true);
+        picks=picks.concat(gap.picks);
+        filled+=gap.filled;
+      }
+    }
     const keptTracks=kept.map((t)=>({
       ...t,
       matchMode:t.matchMode||(bpmMatch(t.bpm,cad,tol,modes)?.mode||"direct"),
@@ -1327,7 +1338,7 @@ function renderResults(res,opts={}){
       <button type="button" class="rm" data-seg="${si}" data-track="${ti}" title="Remove from playlist" aria-label="Remove ${t.title}">×</button>
     </div>`).join("")
       :`<div class="empty">No songs in band. Add a song, Search again, widen tolerance, or allow repeats.</div>`;
-    const note=p.shortfallSec>30?`<div class="note">▲ short by ${fmtClock(p.shortfallSec)} — only ${fmtClock(p.filledSec)} of ${fmtClock(p.segDuration)} matched ~${Math.round(p.cadence)}spm. Remove songs you don't want, add songs, or Search again / Ship it again.${bpmHint}</div>`:"";
+    const note=p.shortfallSec>30?`<div class="note">▲ short by ${fmtClock(p.shortfallSec)} — only ${fmtClock(p.filledSec)} of ${fmtClock(p.segDuration)} matched ~${Math.round(p.cadence)}spm. Search again to pull more songs at this cadence, add songs, or widen tolerance.${bpmHint}</div>`:"";
     const addPanel=addTrackSeg===si
       ?`<div class="add-track add-track-panel" data-seg="${si}"><div class="searchwrap"><input type="search" placeholder="Search a song to add…" autocomplete="off" /><div class="results" hidden></div></div><button type="button" class="addrow" data-cancel-add="${si}" style="margin-top:8px">Cancel</button></div>`
       :`<div class="add-track"><button type="button" class="addrow" data-open-add="${si}">+ add song</button></div>`;
@@ -1338,7 +1349,9 @@ function renderResults(res,opts={}){
   const excludedNote=excludedIds.size?`<div class="hint" style="text-align:center;margin-top:8px">${excludedIds.size} removed · won’t come back on Search again</div>`:"";
   const againLabel=plArtists.length
     ?`Search again · ${plArtists.length} playlist + ${state.seeds.length} seed`
-    :"Search again";
+    :state.seeds.length
+      ?"Search again"
+      :"Search again · BPM + random genres";
   const exportNameVal=(()=>{
     const prev=$("#exportName")?.value?.trim();
     if(prev){playlistExportName=prev;return prev;}
@@ -1351,7 +1364,7 @@ function renderResults(res,opts={}){
     </div>`:"";
   const searching=poolBusy;
   const actions=`<div class="actions">
-      <button type="button" class="btn secondary" id="searchAgainBtn"${searching||!(plArtists.length||state.seeds.length)?" disabled":""} title="Fill gaps using backlog seeds plus artists still on this playlist">${searching?"Searching…":againLabel}</button>
+      <button type="button" class="btn secondary" id="searchAgainBtn"${searching?" disabled":""} title="Fill gaps — uses backlog seeds and playlist artists when present, otherwise target BPMs + random genres">${searching?"Searching…":againLabel}</button>
       <button type="button" class="btn" id="exportBtn"${canExport&&!searching?"":" disabled"}>Ship to ${SVC_NAME[state.service]}</button>
     </div>${exportNameField}${excludedNote}`;
   const bpmMeta=res.poolMeta&&res.poolMeta.poolSize!=null

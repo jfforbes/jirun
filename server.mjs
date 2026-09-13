@@ -225,11 +225,12 @@ function poolNeed(targetSec, targets, candidates) {
   const matched = needs.reduce((s, n) => s + Math.min(n.filled, n.need), 0);
   const raw = pool.reduce((s, t) => s + (t.durationSec || 210), 0);
   const canFill = needs.every((n) => n.filled >= n.need * 0.98);
-  // Small packing headroom — stop expanding once the run can be packed.
-  const enough = needs.every((n) => n.filled >= n.need * 1.05);
+  // Packing without repeats needs real headroom — song lengths leave gaps that
+  // a pure duration sum misses. Empty-seed runs aim for a full playlist every time.
+  const enough = needs.every((n) => n.filled >= n.need * 1.25);
   return {
     rawNeed: fillNeed * 8,
-    matchNeed: fillNeed * 1.05,
+    matchNeed: fillNeed * 1.25,
     fillNeed,
     matched,
     // Uncapped fill (can exceed need) — used for honest progress past 100%.
@@ -1867,12 +1868,14 @@ async function tidalPool(seeds, targetSec = 0, targets = null, onProgress = null
         ? `Keeping ${keptN} playlist songs · no seeds · target BPMs + random genres`
         : "No artists · looking up target BPMs, then random genres",
     });
-    await ingestTempoFill("Looking up songs at your target BPMs", { maxArtists: 90, maxTracks: 450 });
-    if (poolNeed(targetSec, targets, candidates).canFill) {
+    await ingestTempoFill("Looking up songs at your target BPMs", { maxArtists: 100, maxTracks: 500 });
+    // Empty-seed mode needs packing headroom (enough), not a bare canFill sum —
+    // otherwise playlists still come up short after unique-track packing.
+    if (poolNeed(targetSec, targets, candidates).enough) {
       report("done", { detail: "BPM catalog coverage ready" });
       return candidates;
     }
-    await enqueueRandomGenres(10, "Random genres");
+    await enqueueRandomGenres(12, "Random genres");
   } else {
     report("start", {
       detail: keptN
@@ -1887,6 +1890,11 @@ async function tidalPool(seeds, targetSec = 0, targets = null, onProgress = null
       return candidates;
     }
   }
+
+  const coverageReady = () => {
+    const need = poolNeed(targetSec, targets, candidates);
+    return noSeeds ? need.enough : need.canFill;
+  };
 
   let expandFromIds = [...seedIds];
   let expandFromNames = [...seedNames];
@@ -1907,8 +1915,8 @@ async function tidalPool(seeds, targetSec = 0, targets = null, onProgress = null
   for (let level = 1; level <= MAX_LEVELS; level++) {
     currentLevel = level;
     const need = poolNeed(targetSec, targets, candidates);
-    // Stop as soon as every cadence band can pack the run — don't grind for extra buffer.
-    if (need.canFill) break;
+    // Empty-seed: require packing headroom. Seeded: stop once bands can fill.
+    if (coverageReady()) break;
     if (stopNow()) break;
     if (doneArtists.size >= ARTIST_CAP || allTrackIds.size >= TRACK_CAP) break;
 
@@ -1945,10 +1953,11 @@ async function tidalPool(seeds, targetSec = 0, targets = null, onProgress = null
     }
 
     // Genre fan-out: seed-weighted genres normally; random genres when backlog is empty.
-    if (doneArtists.size < ARTIST_CAP && (level === 1 || (level >= 4 && level % 4 === 0))) {
+    // Empty-seed: pull fresh random genres every other ring so we don't stall on one genre set.
+    if (doneArtists.size < ARTIST_CAP && (level === 1 || (noSeeds ? level % 2 === 0 : (level >= 4 && level % 4 === 0)))) {
       let genres = [];
       if (noSeeds) {
-        genres = await pickRandomGenres(level === 1 ? 8 : 5, genreTried);
+        genres = await pickRandomGenres(level === 1 ? 10 : 6, genreTried);
       } else if (LASTFM_KEY) {
         genres = topGenresFromCandidates(candidates, {
           artistIds: level === 1 ? seedIds : [],
@@ -2001,25 +2010,28 @@ async function tidalPool(seeds, targetSec = 0, targets = null, onProgress = null
     await fetchArtists(batch, false, `related artists · ring ${level}`);
     if (level === 1 || level % 2 === 0) await fillFromTempoCatalog(`Tempo catalog after ring ${level}`);
     // If still badly short after a few rings, pull tempo-catalog artists mid-run.
-    if (level >= 3 && level % 3 === 0 && !poolNeed(targetSec, targets, candidates).canFill) {
-      await ingestTempoFill(`Importing target-tempo songs · ring ${level}`);
+    if (level >= 2 && level % 2 === 0 && !coverageReady()) {
+      await ingestTempoFill(
+        `Importing target-tempo songs · ring ${level}`,
+        noSeeds ? { maxArtists: 80, maxTracks: 400 } : {},
+      );
     }
 
     expandFromIds = batch;
     expandFromNames = batch.map((id) => idToName.get(id)).filter(Boolean);
 
-    if (poolNeed(targetSec, targets, candidates).canFill) break;
+    if (coverageReady()) break;
   }
 
   await fillFromTempoCatalog("Final tempo catalog pass");
-  if (!userStop() && !poolNeed(targetSec, targets, candidates).canFill) {
+  if (!userStop() && !coverageReady()) {
     await ingestTempoFill(
       "Importing songs at your target tempos",
-      noSeeds ? { maxArtists: 90, maxTracks: 450 } : {},
+      noSeeds ? { maxArtists: 120, maxTracks: 600 } : {},
     );
   }
   // One more related-artist push if still short and we have queue/budget left.
-  if (!userStop() && !poolNeed(targetSec, targets, candidates).canFill && !hardStop() && idQueue.size() && doneArtists.size < ARTIST_CAP) {
+  if (!userStop() && !coverageReady() && !hardStop() && idQueue.size() && doneArtists.size < ARTIST_CAP) {
     const extra = idQueue.take(POOL_RING_BATCH, { skip: (id) => doneArtists.has(id) }).map((r) => r.key);
     if (extra.length) {
       report("expand", { detail: `Final expansion · ${extra.length} more related artists`, level: currentLevel + 1 });
@@ -2030,10 +2042,11 @@ async function tidalPool(seeds, targetSec = 0, targets = null, onProgress = null
   saveBpmCache();
   snap();
   const finalNeed = poolNeed(targetSec, targets, candidates);
+  const ready = noSeeds ? finalNeed.enough : finalNeed.canFill;
   report("done", {
     detail: userStop()
       ? "Stopped — building playlist from songs so far"
-      : finalNeed.canFill
+      : ready
         ? "Song pool ready — building playlist"
         : hardStop()
           ? "Time ceiling reached — building playlist with what we have"
@@ -2441,12 +2454,13 @@ async function spotifyPool(seeds, targetSec = 0, targets = null, onProgress = nu
         ? `Keeping ${keptN} playlist songs · no seeds · target BPMs + random genres`
         : "No artists · looking up target BPMs, then random genres",
     });
-    await ingestTempoFill("Looking up songs at your target BPMs", { maxArtists: 90, maxTracks: 450 });
-    if (poolNeed(targetSec, targets, candidates).canFill) {
+    await ingestTempoFill("Looking up songs at your target BPMs", { maxArtists: 100, maxTracks: 500 });
+    // Empty-seed mode needs packing headroom (enough), not a bare canFill sum.
+    if (poolNeed(targetSec, targets, candidates).enough) {
       report("done", { detail: "BPM catalog coverage ready" });
       return candidates;
     }
-    const genres = await pickRandomGenres(10, genreTried);
+    const genres = await pickRandomGenres(12, genreTried);
     for (const g of genres) genreTried.add(String(g).toLowerCase());
     await enqueueGenreArtists(genres, { lastfmLimit: 40, spotifyLimit: 18, pts: 1.0 });
   } else {
@@ -2462,6 +2476,11 @@ async function spotifyPool(seeds, targetSec = 0, targets = null, onProgress = nu
       return candidates;
     }
   }
+
+  const coverageReady = () => {
+    const need = poolNeed(targetSec, targets, candidates);
+    return noSeeds ? need.enough : need.canFill;
+  };
 
   let expandFrom = [...seedNames];
   if (noSeeds && !expandFrom.length) {
@@ -2480,7 +2499,7 @@ async function spotifyPool(seeds, targetSec = 0, targets = null, onProgress = nu
   for (let level = 1; level <= MAX_LEVELS; level++) {
     currentLevel = level;
     const need = poolNeed(targetSec, targets, candidates);
-    if (need.canFill) break;
+    if (coverageReady()) break;
     if (stopNow()) break;
     if (doneNames.size >= ARTIST_CAP || candidates.length >= TRACK_CAP) break;
 
@@ -2511,10 +2530,11 @@ async function spotifyPool(seeds, targetSec = 0, targets = null, onProgress = nu
     }
 
     // Genre fan-out: seed-weighted normally; random genres when backlog is empty.
-    if (doneNames.size < ARTIST_CAP && (level === 1 || (level >= 4 && level % 4 === 0))) {
+    // Empty-seed: refresh random genres every other ring so coverage keeps growing.
+    if (doneNames.size < ARTIST_CAP && (level === 1 || (noSeeds ? level % 2 === 0 : (level >= 4 && level % 4 === 0)))) {
       let genres = [];
       if (noSeeds) {
-        genres = await pickRandomGenres(level === 1 ? 8 : 5, genreTried);
+        genres = await pickRandomGenres(level === 1 ? 10 : 6, genreTried);
       } else {
         genres = topGenresFromCandidates(candidates, {
           artistIds: level === 1 ? [...seedIdByName.values()] : [],
@@ -2540,24 +2560,24 @@ async function spotifyPool(seeds, targetSec = 0, targets = null, onProgress = nu
     await fetchNames(batch, `related artists · ring ${level}`);
     if (userStop()) break;
     if (level === 1 || level % 2 === 0) await fillFromTempoCatalog(`Tempo catalog after ring ${level}`);
-    if (level >= 3 && level % 3 === 0 && !poolNeed(targetSec, targets, candidates).canFill) {
+    if ((noSeeds ? level >= 2 && level % 2 === 0 : level >= 3 && level % 3 === 0) && !coverageReady()) {
       await ingestTempoFill(
         `Importing target-tempo songs · ring ${level}`,
-        noSeeds ? { maxArtists: 70, maxTracks: 350 } : {},
+        noSeeds ? { maxArtists: 80, maxTracks: 400 } : {},
       );
     }
     expandFrom = batch;
-    if (poolNeed(targetSec, targets, candidates).canFill) break;
+    if (coverageReady()) break;
   }
 
   await fillFromTempoCatalog("Final tempo catalog pass");
-  if (!userStop() && !poolNeed(targetSec, targets, candidates).canFill) {
+  if (!userStop() && !coverageReady()) {
     await ingestTempoFill(
       "Importing songs at your target tempos",
-      noSeeds ? { maxArtists: 90, maxTracks: 450 } : {},
+      noSeeds ? { maxArtists: 120, maxTracks: 600 } : {},
     );
   }
-  if (!userStop() && !poolNeed(targetSec, targets, candidates).canFill && !hardStop() && nameQueue.size() && doneNames.size < ARTIST_CAP) {
+  if (!userStop() && !coverageReady() && !hardStop() && nameQueue.size() && doneNames.size < ARTIST_CAP) {
     const extra = nameQueue
       .take(POOL_RING_BATCH, { skip: (k) => doneNames.has(k) })
       .map((r) => r.name);
@@ -2570,10 +2590,11 @@ async function spotifyPool(seeds, targetSec = 0, targets = null, onProgress = nu
   saveBpmCache();
   snap();
   const finalNeed = poolNeed(targetSec, targets, candidates);
+  const ready = noSeeds ? finalNeed.enough : finalNeed.canFill;
   report("done", {
     detail: userStop()
       ? "Stopped — building playlist from songs so far"
-      : finalNeed.canFill
+      : ready
         ? "Song pool ready — building playlist"
         : hardStop()
           ? "Time ceiling reached — building playlist with what we have"
