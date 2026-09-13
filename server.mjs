@@ -938,15 +938,31 @@ async function lastfmTagTopArtists(tag, limit = 40) {
     return list.map((a) => a?.name).filter(Boolean);
   } catch (_) { return []; }
 }
+/**
+ * Preferred genres for empty-seed fills — always tried first, then other genres.
+ * Order is intentional (user preference).
+ */
+const PREFERRED_GENRES = [
+  "metal",
+  "metalcore",
+  "thrash metal",
+  "melodic hardcore",
+  "house",
+  "hardcore",
+  "emo",
+  "rap",
+];
 /** Fallback genre bank when Last.fm chart tags are unavailable. */
 const RANDOM_GENRE_BANK = [
+  ...PREFERRED_GENRES,
   "pop", "rock", "hip-hop", "electronic", "dance", "indie", "r&b", "soul",
-  "house", "techno", "funk", "punk", "metal", "alternative", "folk", "country",
+  "techno", "funk", "punk", "alternative", "folk", "country",
   "latin", "reggaeton", "afrobeats", "k-pop", "jazz", "disco", "trance",
-  "drum and bass", "garage", "synthpop", "edm", "rap", "indie rock", "pop rock",
+  "drum and bass", "garage", "synthpop", "edm", "indie rock", "pop rock",
   "soft rock", "classic rock", "new wave", "post-punk", "shoegaze", "ambient",
   "trap", "dubstep", "hardstyle", "salsa", "cumbia", "gospel", "blues",
-  "singer-songwriter", "britpop", "grunge", "emo", "hyperpop", "lo-fi",
+  "singer-songwriter", "britpop", "grunge", "hyperpop", "lo-fi",
+  "death metal", "post-hardcore", "screamo", "nu metal", "progressive metal",
 ];
 /** Global Last.fm chart tags — refreshed lazily for random-genre fills. */
 let chartTagCache = { at: 0, tags: [] };
@@ -984,18 +1000,27 @@ function shufflePick(arr, n) {
   return copy.slice(0, Math.max(0, n));
 }
 /**
- * Pick random genres for empty-seed pool builds.
- * Prefer live Last.fm chart tags; fall back to a built-in bank.
+ * Pick genres for empty-seed pool builds.
+ * Preferred genres (metal/house/hardcore/emo/rap, etc.) come first; remaining
+ * slots are filled from Last.fm chart tags / the built-in bank.
  */
 async function pickRandomGenres(count = 8, exclude = null) {
+  const want = Math.max(0, count | 0);
+  if (!want) return [];
   const skip = exclude instanceof Set
     ? exclude
     : new Set([...(exclude || [])].map((g) => String(g || "").toLowerCase()).filter(Boolean));
+  const preferred = PREFERRED_GENRES.filter((g) => g && !skip.has(String(g).toLowerCase()));
+  const takePreferred = preferred.slice(0, want);
+  if (takePreferred.length >= want) return takePreferred;
+
+  const skipAll = new Set([...skip, ...takePreferred.map((g) => String(g).toLowerCase())]);
   let pool = await lastfmChartTopTags(100);
   if (pool.length < 16) pool = [...new Set([...pool, ...RANDOM_GENRE_BANK])];
   else pool = [...new Set([...pool, ...shufflePick(RANDOM_GENRE_BANK, 12)])];
-  pool = pool.filter((g) => g && !skip.has(String(g).toLowerCase()));
-  return shufflePick(pool, count);
+  pool = pool.filter((g) => g && !skipAll.has(String(g).toLowerCase()));
+  const extras = shufflePick(pool, want - takePreferred.length);
+  return [...takePreferred, ...extras];
 }
 /** Rank genres from candidate tracks; seed artists count heavier. */
 function topGenresFromCandidates(candidates, { artistIds = [], artistNames = [], limit = 8 } = {}) {
@@ -1846,12 +1871,15 @@ async function tidalPool(seeds, targetSec = 0, targets = null, onProgress = null
     knownNames.set(k, name);
     nameQueue.add(k, pts, name);
   };
-  async function enqueueRandomGenres(count, detailPrefix = "Random genres") {
+  async function enqueueRandomGenres(count, detailPrefix = null) {
     const genres = await pickRandomGenres(count, genreTried);
     for (const g of genres) genreTried.add(String(g).toLowerCase());
     if (!genres.length) return [];
+    const prefSet = new Set(PREFERRED_GENRES.map((g) => String(g).toLowerCase()));
+    const anyPref = genres.some((g) => prefSet.has(String(g).toLowerCase()));
+    const label = detailPrefix || (anyPref ? "Preferred genres" : "More genres");
     report("similar", {
-      detail: `${detailPrefix} · ${genres.slice(0, 4).join(", ")}${genres.length > 4 ? "…" : ""}`,
+      detail: `${label} · ${genres.slice(0, 4).join(", ")}${genres.length > 4 ? "…" : ""}`,
     });
     if (LASTFM_KEY) {
       const tagLists = await mapLimit(genres, 4, (g) => lastfmTagTopArtists(g, 40));
@@ -1865,8 +1893,8 @@ async function tidalPool(seeds, targetSec = 0, targets = null, onProgress = null
   if (noSeeds) {
     report("start", {
       detail: keptN
-        ? `Keeping ${keptN} playlist songs · no seeds · target BPMs + random genres`
-        : "No artists · looking up target BPMs, then random genres",
+        ? `Keeping ${keptN} playlist songs · no seeds · target BPMs + preferred genres`
+        : "No artists · looking up target BPMs, then preferred genres",
     });
     await ingestTempoFill("Looking up songs at your target BPMs", { maxArtists: 100, maxTracks: 500 });
     // Empty-seed mode needs packing headroom (enough), not a bare canFill sum —
@@ -1875,7 +1903,7 @@ async function tidalPool(seeds, targetSec = 0, targets = null, onProgress = null
       report("done", { detail: "BPM catalog coverage ready" });
       return candidates;
     }
-    await enqueueRandomGenres(12, "Random genres");
+    await enqueueRandomGenres(PREFERRED_GENRES.length + 4);
   } else {
     report("start", {
       detail: keptN
@@ -1968,7 +1996,7 @@ async function tidalPool(seeds, targetSec = 0, targets = null, onProgress = null
       for (const g of genres) genreTried.add(String(g).toLowerCase());
       if (genres.length && LASTFM_KEY) {
         report("similar", {
-          detail: `${noSeeds ? "Random genres" : "Genre fan-out"} · ${genres.slice(0, 3).join(", ")}${genres.length > 3 ? "…" : ""}`,
+          detail: `${noSeeds ? "Preferred genres" : "Genre fan-out"} · ${genres.slice(0, 3).join(", ")}${genres.length > 3 ? "…" : ""}`,
           level,
         });
         const tagLists = await mapLimit(genres, 4, (g) => lastfmTagTopArtists(g, level <= 2 ? 35 : 25));
@@ -2428,7 +2456,7 @@ async function spotifyPool(seeds, targetSec = 0, targets = null, onProgress = nu
     const list = (genres || []).map((g) => String(g || "").trim()).filter(Boolean);
     if (!list.length) return;
     report("similar", {
-      detail: `${noSeeds ? "Random genres" : "Genre fan-out"} · ${list.slice(0, 3).join(", ")}${list.length > 3 ? "…" : ""}`,
+      detail: `${noSeeds ? "Preferred genres" : "Genre fan-out"} · ${list.slice(0, 3).join(", ")}${list.length > 3 ? "…" : ""}`,
       level: currentLevel || 1,
     });
     if (LASTFM_KEY) {
@@ -2451,8 +2479,8 @@ async function spotifyPool(seeds, targetSec = 0, targets = null, onProgress = nu
   if (noSeeds) {
     report("start", {
       detail: keptN
-        ? `Keeping ${keptN} playlist songs · no seeds · target BPMs + random genres`
-        : "No artists · looking up target BPMs, then random genres",
+        ? `Keeping ${keptN} playlist songs · no seeds · target BPMs + preferred genres`
+        : "No artists · looking up target BPMs, then preferred genres",
     });
     await ingestTempoFill("Looking up songs at your target BPMs", { maxArtists: 100, maxTracks: 500 });
     // Empty-seed mode needs packing headroom (enough), not a bare canFill sum.
@@ -2460,8 +2488,13 @@ async function spotifyPool(seeds, targetSec = 0, targets = null, onProgress = nu
       report("done", { detail: "BPM catalog coverage ready" });
       return candidates;
     }
-    const genres = await pickRandomGenres(12, genreTried);
+    const genres = await pickRandomGenres(PREFERRED_GENRES.length + 4, genreTried);
     for (const g of genres) genreTried.add(String(g).toLowerCase());
+    const prefSet = new Set(PREFERRED_GENRES.map((g) => String(g).toLowerCase()));
+    const anyPref = genres.some((g) => prefSet.has(String(g).toLowerCase()));
+    report("similar", {
+      detail: `${anyPref ? "Preferred genres" : "More genres"} · ${genres.slice(0, 4).join(", ")}${genres.length > 4 ? "…" : ""}`,
+    });
     await enqueueGenreArtists(genres, { lastfmLimit: 40, spotifyLimit: 18, pts: 1.0 });
   } else {
     report("start", {
