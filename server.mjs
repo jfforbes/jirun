@@ -772,31 +772,55 @@ async function bpmForTrack(track) {
 async function bpmFor(artist, title) {
   return bpmForTrack({ artist, title });
 }
-/** Target BPM centers (direct ± tol and optional half-time ± tol/2) we still care about. */
+/**
+ * Target BPM centers to query — exact direct cadence first, then widen by 1 BPM
+ * at a time out to tolerance; half-time bands come after (half the window).
+ * Distance-ordered so tempo catalog / search spend budget on the main SPM
+ * before near-misses.
+ */
 function cadenceBpmCenters(targets) {
-  const tol = +targets?.tol || 3;
+  const tol = Math.max(0, +targets?.tol || 3);
   const halfTol = Math.floor(tol / 2);
   const modes = Array.isArray(targets?.modes) && targets.modes.length ? targets.modes : ["direct", "half"];
-  const centers = new Set();
-  const needs = Array.isArray(targets?.cadenceNeeds) ? targets.cadenceNeeds : [];
-  for (const n of needs) {
-    const cad = Math.round(+n.cadence);
-    if (!(cad > 0)) continue;
-    if (modes.includes("direct")) for (let d = -tol; d <= tol; d++) centers.add(cad + d);
-    if (modes.includes("half")) {
-      const h = Math.round(cad / 2);
-      for (let d = -halfTol; d <= halfTol; d++) if (h + d >= 40) centers.add(h + d);
+  // bpm → { dist, half } — prefer direct over half when both are exact.
+  const best = new Map();
+  const add = (bpm, d, half) => {
+    const b = Math.round(bpm);
+    if (!(b >= 40 && b <= 220)) return;
+    const prev = best.get(b);
+    if (!prev || half < prev.half || (half === prev.half && d < prev.dist)) {
+      best.set(b, { dist: d, half });
     }
+  };
+  const cads = [];
+  for (const n of Array.isArray(targets?.cadenceNeeds) ? targets.cadenceNeeds : []) {
+    const cad = Math.round(+n.cadence);
+    if (cad > 0) cads.push(cad);
   }
-  if (!centers.size && Array.isArray(targets?.cadences)) {
+  if (!cads.length && Array.isArray(targets?.cadences)) {
     for (const c of targets.cadences) {
       const cad = Math.round(+c);
-      if (!(cad > 0)) continue;
-      if (modes.includes("direct")) centers.add(cad);
-      if (modes.includes("half")) centers.add(Math.round(cad / 2));
+      if (cad > 0) cads.push(cad);
     }
   }
-  return [...centers].filter((b) => b >= 40 && b <= 220).sort((a, b) => a - b);
+  for (const cad of cads) {
+    if (modes.includes("direct")) {
+      for (let d = 0; d <= tol; d++) {
+        add(cad + d, d, 0);
+        if (d > 0) add(cad - d, d, 0);
+      }
+    }
+    if (modes.includes("half")) {
+      const h = Math.round(cad / 2);
+      for (let d = 0; d <= halfTol; d++) {
+        add(h + d, d, 1);
+        if (d > 0) add(h - d, d, 1);
+      }
+    }
+  }
+  return [...best.entries()]
+    .sort((a, b) => a[1].half - b[1].half || a[1].dist - b[1].dist || a[0] - b[0])
+    .map(([bpm]) => bpm);
 }
 /** Songs near a target BPM from GetSongBPM's tempo catalog (popular songs at that tempo). */
 async function gsbSongsAtBpm(bpm, limit = 100) {
@@ -809,9 +833,15 @@ async function gsbSongsAtBpm(bpm, limit = 100) {
     return list.map((hit) => {
       const tempo = parseInt(hit.tempo ?? hit.bpm, 10);
       const title = hit.song_title || hit.title || hit.name || "";
-      const artist = hit.artist?.name || (Array.isArray(hit.artist) ? hit.artist[0]?.name : "") || hit.artist_name || "";
+      const artist =
+        hit.artist?.name ||
+        (Array.isArray(hit.artist) ? hit.artist[0]?.name || hit.artist[0] : "") ||
+        (typeof hit.artist === "string" ? hit.artist : "") ||
+        hit.artist_name ||
+        hit.artistName ||
+        "";
       if (!(tempo > 0) || !title) return null;
-      return { title, artist, tempo };
+      return { title, artist: String(artist || "").trim(), tempo };
     }).filter(Boolean);
   } catch (_) {
     return [];
@@ -926,7 +956,7 @@ async function ingestTempoSongsViaSearch({
   searchTrack, maxSongs = 220,
 }) {
   if (!GSB_KEY || typeof searchTrack !== "function") return 0;
-  const centers = cadenceBpmCenters(targets);
+  const centers = cadenceBpmCenters(targets); // exact target BPM first, then ±tol
   if (!centers.length) return 0;
   const songs = [];
   const seenSong = new Set();
@@ -934,6 +964,7 @@ async function ingestTempoSongsViaSearch({
     if (typeof onProgress === "function") {
       try { onProgress({ phase: "bpm", detail: `Searching ${bpm} BPM catalog songs…`, tempoBpm: bpm }); } catch (_) {}
     }
+    const atBpm = [];
     for (const song of await gsbSongsAtBpm(bpm, 80)) {
       const a = String(song.artist || "").trim();
       const t = String(song.title || "").trim();
@@ -941,13 +972,14 @@ async function ingestTempoSongsViaSearch({
       const k = `${a.toLowerCase()}|${cleanMusicToken(t)}`;
       if (seenSong.has(k)) continue;
       seenSong.add(k);
-      songs.push(song);
+      atBpm.push(song);
     }
-  }
-  // Prefer variety — shuffle lightly so we don't only take the first BPM center.
-  for (let i = songs.length - 1; i > 0; i--) {
-    const j = Math.floor(Math.random() * (i + 1));
-    const tmp = songs[i]; songs[i] = songs[j]; songs[j] = tmp;
+    // Shuffle within this exact BPM only — keep exact targets ahead of ±tol bands.
+    for (let i = atBpm.length - 1; i > 0; i--) {
+      const j = Math.floor(Math.random() * (i + 1));
+      const tmp = atBpm[i]; atBpm[i] = atBpm[j]; atBpm[j] = tmp;
+    }
+    songs.push(...atBpm);
   }
   let added = 0;
   const batch = songs.slice(0, Math.max(maxSongs * 2, maxSongs));
@@ -956,19 +988,25 @@ async function ingestTempoSongsViaSearch({
     const q = `${song.artist} ${song.title}`.trim();
     let hits = [];
     try { hits = await searchTrack(q); } catch (_) { return; }
-    const hit = (hits || []).find((t) => t && (t.ref || t.id));
+    // Prefer a hit that already has an artist name; Tidal suggestions often omit it.
+    const list = (hits || []).filter((t) => t && (t.ref || t.id));
+    const hit = list.find((t) => String(t.artist || "").trim() && t.artist !== "?") || list[0];
     if (!hit) return;
     const tid = String(hit.ref || hit.id || "");
     if (!tid || seenIds.has(tid)) return;
     if (added >= maxSongs) return;
     seenIds.add(tid);
     if (hit.id && String(hit.id) !== tid) seenIds.add(String(hit.id));
+    const hitArt = String(hit.artist || "").trim();
+    const artist = (hitArt && hitArt !== "?" ? hitArt : "") || song.artist || hitArt || "";
     candidates.push({
       ...hit,
+      title: hit.title || song.title,
+      artist,
       bpm: song.tempo,
       bpmSource: "tempo-search",
     });
-    cacheBpm(hit.artist || song.artist, hit.title || song.title, song.tempo, {
+    cacheBpm(artist || song.artist, hit.title || song.title, song.tempo, {
       source: "getsong:tempo-search",
       confidence: 0.88,
       isrc: hit.isrc || null,
@@ -1517,7 +1555,13 @@ async function tidalTracksFromSuggestions(payload) {
     if (x?.type === "tracks" && x.id) byId.set(String(x.id), tidalMapTrack(x, included));
   }
   const ids = tidalSuggestionRefs(payload, "tracks");
-  const missing = ids.filter((id) => !byId.has(String(id)));
+  // Also re-fetch tracks that came back without an artist name (common in suggestion payloads).
+  const missing = ids.filter((id) => {
+    const t = byId.get(String(id));
+    if (!t) return true;
+    const art = String(t.artist || "").trim();
+    return !art || art === "?";
+  });
   if (missing.length) {
     for (let i = 0; i < missing.length; i += 20) {
       const chunk = missing.slice(i, i + 20);

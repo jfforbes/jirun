@@ -348,7 +348,7 @@ function buildPlaylist(segments,candidates,opts){
       .filter((t)=>t.bpm!=null&&!excluded.has(trackKey(t)))
       .map((t)=>({t,m:bpmMatch(t.bpm,cad,tol,modes)}))
       .filter((e)=>e.m)
-      .sort((a,b)=>a.m.diff-b.m.diff||(a.t.durationSec||0)-(b.t.durationSec||0));
+      .sort((a,b)=>a.m.diff-b.m.diff||(a.m.mode==="half")-(b.m.mode==="half")||(a.t.durationSec||0)-(b.t.durationSec||0));
     let picks=[],filled=0;
     if(rem>0){
       const first=packTracks(pool,rem,overshootSec,usedG,allowRepeats);
@@ -1314,10 +1314,17 @@ async function addManualTrack(segIdx,track){
 }
 function renderAddTrackHits(box){
   if(!addTrackHits.length){box.hidden=true;return;}
+  // Prefer rows that already have an artist — Tidal suggestions sometimes omit it.
+  addTrackHits=[...addTrackHits].sort((a,b)=>{
+    const aa=String(a.artist||"").trim()&&a.artist!=="?"?0:1;
+    const bb=String(b.artist||"").trim()&&b.artist!=="?"?0:1;
+    return aa-bb;
+  });
   box.hidden=false;
   box.innerHTML=addTrackHits.map((t,i)=>{
     const title=(t.title||"?").replace(/</g,"&lt;");
-    const art=(t.artist||"").replace(/</g,"&lt;");
+    const artRaw=String(t.artist||"").trim();
+    const art=(artRaw&&artRaw!=="?"?artRaw:"Unknown artist").replace(/</g,"&lt;");
     const dur=t.durationSec?fmtClock(t.durationSec):"";
     return`<div class="r${i===addTrackHl?" hl":""}" data-i="${i}"><div><div class="title">${title}</div><div class="meta">${art}${dur?` · ${dur}`:""}</div></div></div>`;
   }).join("");
@@ -1393,7 +1400,7 @@ function renderResults(res,opts={}){
     const showSeg=pageTracks.length>0||!totalTracks||addTrackSeg===si;
     if(!showSeg)return"";
     const tracks=pageTracks.length?pageTracks.map(({t,ti})=>`<div class="track">
-      <div><div class="title">${t.title}</div><div class="art">${t.artist||""}</div>${genreTagsHtml(t)}</div>
+      <div><div class="title">${t.title}</div><div class="art">${(String(t.artist||"").trim()&&t.artist!=="?"?t.artist:"Unknown artist")}</div>${genreTagsHtml(t)}</div>
       <div style="text-align:right"><span class="bpm">${t.bpm??"—"}</span> ${matchTagHtml(t)}</div>
       <div class="dur">${fmtClock(t.durationSec)}</div>
       <button type="button" class="edit" data-seg="${si}" data-track="${ti}" title="Correct BPM" aria-label="Correct BPM for ${t.title}">✎</button>
