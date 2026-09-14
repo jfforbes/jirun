@@ -118,6 +118,11 @@
   .empty{color:var(--muted);font-size:13px;text-align:center;padding:24px 8px}
   .actions{display:grid;grid-template-columns:1fr 1fr;gap:8px;margin-top:10px}
   .actions .btn{margin-top:0}
+  .actions-extra{margin-top:8px}
+  .actions-extra .btn{width:100%;margin-top:0}
+  .pager{display:flex;align-items:center;justify-content:center;gap:10px;margin:4px 0 14px;flex-wrap:wrap}
+  .pager .meta{font-family:var(--mono);font-size:11px;color:var(--muted)}
+  .pager .btn{margin-top:0;width:auto;min-width:88px;padding:8px 12px}
   .export-name{margin-top:10px;display:flex;flex-direction:column;gap:6px}
   .export-name label{font-size:11px;color:var(--muted);letter-spacing:.02em;text-transform:uppercase;font-weight:600}
   .export-name input{width:100%;padding:9px 10px;border:1px solid var(--line);border-radius:3px;background:var(--surface);color:var(--text);font-size:14px}
@@ -537,6 +542,8 @@ let lastPlaylist=[];
 let lastResult=null;
 let lastCandidates=[];
 let poolBusy=false;
+const PLAYLIST_PAGE_SIZE=20;
+let playlistPage=0;
 /* Render free tier spins down after ~15m with no inbound traffic. Long /api/pool
    streams are mostly outbound progress, so ping health while the tab is open —
    including when the tab is backgrounded (hidden tabs used to skip pings). */
@@ -684,7 +691,7 @@ function setService(svc){
   state.service=svc;
   syncServiceTabs();
   if(prev!==svc){
-    state.seeds=[];lastPlaylist=[];lastResult=null;lastCandidates=[];excludedIds=new Set();playlistExportName=null;
+    state.seeds=[];lastPlaylist=[];lastResult=null;lastCandidates=[];excludedIds=new Set();playlistExportName=null;playlistPage=0;
     clearPoolProgress();clearDraftStorage();
     $("#results-area").innerHTML="";
     renderSeeds();
@@ -696,7 +703,7 @@ document.querySelectorAll("#serviceTabs button").forEach(b=>b.onclick=()=>setSer
 $("#loginBtn").onclick=()=>{location.href=`/login?service=${state.service}`;};
 $("#logoutBtn").onclick=async()=>{
   await api.logout();
-  state.seeds=[];lastPlaylist=[];lastResult=null;lastCandidates=[];excludedIds=new Set();playlistExportName=null;
+  state.seeds=[];lastPlaylist=[];lastResult=null;lastCandidates=[];excludedIds=new Set();playlistExportName=null;playlistPage=0;
   clearPoolProgress();clearDraftStorage();
   renderSeeds();$("#results-area").innerHTML="";
   await checkLogin();
@@ -766,11 +773,31 @@ function resetRunState(){
   lastCandidates=[];
   excludedIds=new Set();
   playlistExportName=null;
+  playlistPage=0;
   closeAddTrackPanel();
   clearPoolProgress();
   const area=$("#results-area");
   if(area)area.innerHTML="";
   saveDraft();
+}
+function clearPlaylist(){
+  if(!lastResult)return;
+  if(!confirm("Clear the whole playlist? Your backlog seeds stay."))return;
+  lastPlaylist=[];
+  lastResult=null;
+  excludedIds=new Set();
+  playlistExportName=null;
+  playlistPage=0;
+  closeAddTrackPanel();
+  const area=$("#results-area");
+  if(area)area.innerHTML="";
+  renderSeeds();
+  saveDraft();
+}
+function clampPlaylistPage(trackCount){
+  const pages=Math.max(1,Math.ceil((trackCount||0)/PLAYLIST_PAGE_SIZE));
+  playlistPage=Math.max(0,Math.min(playlistPage,pages-1));
+  return pages;
 }
 function clearAllSeeds(){
   if(!state.seeds.length)return;
@@ -870,6 +897,8 @@ function applyPlaylistResult(res,candidates,opts={}){
   }
   lastResult=res;
   lastPlaylist=res.plan.flatMap((p)=>p.tracks);
+  if(opts.keepPage) clampPlaylistPage(res.trackCount||lastPlaylist.length);
+  else playlistPage=0;
   renderResults(res,{scroll:opts.scroll!==false});
   saveDraft();
 }
@@ -992,7 +1021,7 @@ async function runPoolSearch({keepMatchedOnly=false,includePlaylistArtists=false
     const merged=mergeCandidates(lastCandidates,snapCandidates);
     const live=buildPlaylist(state.segs,merged,packOpts({keepBySeg}));
     live.poolMeta=lastResult?.poolMeta||merged.meta||null;
-    applyPlaylistResult(live,null,{scroll:false});
+    applyPlaylistResult(live,null,{scroll:false,keepPage:true});
   };
   if(includePlaylistArtists&&nPl){
     loading.update({stage:"gather",phase:"resolve",pct:3,detail:`Resolving ${combined.length} artists (${nSeed} backlog + ${nPl} from playlist)…`});
@@ -1213,7 +1242,8 @@ function removeTrack(segIdx,trackIdx){
   lastResult.totalFilledSec=lastResult.plan.reduce((s,p)=>s+p.filledSec,0);
   lastResult.trackCount=lastResult.plan.reduce((n,p)=>n+p.tracks.length,0);
   lastPlaylist=lastResult.plan.flatMap((p)=>p.tracks);
-  renderResults(lastResult);
+  clampPlaylistPage(lastResult.trackCount);
+  renderResults(lastResult,{scroll:false});
   saveDraft();
 }
 function refreshPlanTotals(){
@@ -1279,7 +1309,8 @@ async function addManualTrack(segIdx,track){
   lastCandidates=mergeCandidates(lastCandidates,[row]);
   refreshPlanTotals();
   closeAddTrackPanel();
-  renderResults(lastResult);
+  clampPlaylistPage(lastResult.trackCount);
+  renderResults(lastResult,{scroll:false});
 }
 function renderAddTrackHits(box){
   if(!addTrackHits.length){box.hidden=true;return;}
@@ -1341,7 +1372,7 @@ async function correctTrackBpm(segIdx,trackIdx){
   const keepBySeg=lastResult.plan.map((p)=>p.tracks.slice());
   const repacked=buildPlaylist(state.segs,lastCandidates,packOpts({keepBySeg}));
   repacked.poolMeta=lastResult.poolMeta||lastCandidates.meta||null;
-  applyPlaylistResult(repacked,null);
+  applyPlaylistResult(repacked,null,{keepPage:true});
 }
 function renderResults(res,opts={}){
   const scroll=opts.scroll!==false;
@@ -1350,21 +1381,39 @@ function renderResults(res,opts={}){
   const bpmHint=typeof bpmRate==="number"&&bpmRate<0.65
     ?` BPM coverage was only ${Math.round(bpmRate*100)}% — many seed tracks lack tempo data, so the pool had to import other songs near your cadence.`
     :"";
+  const flat=[];
+  res.plan.forEach((p,si)=>{(p.tracks||[]).forEach((t,ti)=>flat.push({si,ti,t,p}));});
+  const totalTracks=flat.length;
+  const pageCount=clampPlaylistPage(totalTracks);
+  const pageStart=playlistPage*PLAYLIST_PAGE_SIZE;
+  const pageEnd=Math.min(totalTracks,pageStart+PLAYLIST_PAGE_SIZE);
+  const onPage=new Set(flat.slice(pageStart,pageEnd).map((r)=>`${r.si}:${r.ti}`));
   const segs=res.plan.map((p,si)=>{
-    const tracks=p.tracks.length?p.tracks.map((t,ti)=>`<div class="track">
+    const pageTracks=(p.tracks||[]).map((t,ti)=>({t,ti})).filter(({ti})=>onPage.has(`${si}:${ti}`));
+    const showSeg=pageTracks.length>0||!totalTracks||addTrackSeg===si;
+    if(!showSeg)return"";
+    const tracks=pageTracks.length?pageTracks.map(({t,ti})=>`<div class="track">
       <div><div class="title">${t.title}</div><div class="art">${t.artist||""}</div>${genreTagsHtml(t)}</div>
       <div style="text-align:right"><span class="bpm">${t.bpm??"—"}</span> ${matchTagHtml(t)}</div>
       <div class="dur">${fmtClock(t.durationSec)}</div>
       <button type="button" class="edit" data-seg="${si}" data-track="${ti}" title="Correct BPM" aria-label="Correct BPM for ${t.title}">✎</button>
       <button type="button" class="rm" data-seg="${si}" data-track="${ti}" title="Remove from playlist" aria-label="Remove ${t.title}">×</button>
     </div>`).join("")
-      :`<div class="empty">No songs in band. Add a song, Search again, widen tolerance, or allow repeats.</div>`;
-    const note=p.shortfallSec>30?`<div class="note">▲ short by ${fmtClock(p.shortfallSec)} — only ${fmtClock(p.filledSec)} of ${fmtClock(p.segDuration)} matched ~${Math.round(p.cadence)}spm. Search again to pull more songs at this cadence, add songs, or widen tolerance.${bpmHint}</div>`:"";
-    const addPanel=addTrackSeg===si
-      ?`<div class="add-track add-track-panel" data-seg="${si}"><div class="searchwrap"><input type="search" placeholder="Search a song to add…" autocomplete="off" /><div class="results" hidden></div></div><button type="button" class="addrow" data-cancel-add="${si}" style="margin-top:8px">Cancel</button></div>`
-      :`<div class="add-track"><button type="button" class="addrow" data-open-add="${si}">+ add song</button></div>`;
+      :(!totalTracks?`<div class="empty">No songs in band. Add a song, Search again, widen tolerance, or allow repeats.</div>`:"");
+    const segEndsOnPage=!p.tracks.length||onPage.has(`${si}:${p.tracks.length-1}`);
+    const note=segEndsOnPage&&p.shortfallSec>30?`<div class="note">▲ short by ${fmtClock(p.shortfallSec)} — only ${fmtClock(p.filledSec)} of ${fmtClock(p.segDuration)} matched ~${Math.round(p.cadence)}spm. Search again to pull more songs at this cadence, add songs, or widen tolerance.${bpmHint}</div>`:"";
+    const addPanel=segEndsOnPage||addTrackSeg===si
+      ?(addTrackSeg===si
+        ?`<div class="add-track add-track-panel" data-seg="${si}"><div class="searchwrap"><input type="search" placeholder="Search a song to add…" autocomplete="off" /><div class="results" hidden></div></div><button type="button" class="addrow" data-cancel-add="${si}" style="margin-top:8px">Cancel</button></div>`
+        :`<div class="add-track"><button type="button" class="addrow" data-open-add="${si}">+ add song</button></div>`)
+      :"";
     return`<section><div class="seg-head"><span class="miles">Miles ${p.segment.startMile}–${p.segment.endMile} <span style="color:var(--muted);font-weight:400">@ ${p.label}</span></span><span class="cad">${Math.round(p.cadence)} spm · need ${fmtClock(p.segDuration)}</span></div>${tracks}${addPanel}${note}</section>`;
   }).join("");
+  const pager=totalTracks>PLAYLIST_PAGE_SIZE?`<div class="pager" role="navigation" aria-label="Playlist pages">
+      <button type="button" class="btn secondary" id="playlistPrevBtn"${playlistPage<=0?" disabled":""}>Previous</button>
+      <span class="meta">${pageStart+1}–${pageEnd} of ${totalTracks}</span>
+      <button type="button" class="btn secondary" id="playlistNextBtn"${playlistPage>=pageCount-1?" disabled":""}>Next</button>
+    </div>`:"";
   const canExport=LOGGEDIN&&lastPlaylist.some(t=>t.ref||t.id);
   const plArtists=artistsFromPlaylist(lastPlaylist);
   const excludedNote=excludedIds.size?`<div class="hint" style="text-align:center;margin-top:8px">${excludedIds.size} removed · won’t come back on Search again</div>`:"";
@@ -1387,10 +1436,13 @@ function renderResults(res,opts={}){
   const actions=`<div class="actions">
       <button type="button" class="btn secondary" id="searchAgainBtn"${searching?" disabled":""} title="Fill gaps — uses backlog seeds and playlist artists when present, otherwise target BPMs + random genres">${searching?"Searching…":againLabel}</button>
       <button type="button" class="btn" id="exportBtn"${canExport&&!searching?"":" disabled"}>Ship to ${SVC_NAME[state.service]}</button>
+    </div>
+    <div class="actions-extra">
+      <button type="button" class="btn secondary" id="clearPlaylistBtn"${searching?" disabled":""}>Clear playlist</button>
     </div>${exportNameField}${excludedNote}`;
   const bpmMeta=res.poolMeta&&res.poolMeta.poolSize!=null
     ?`<div><div class="k">BPM hit</div><div class="v">${res.poolMeta.bpmHit||0}/${res.poolMeta.poolSize}</div></div>`:"";
-  $("#results-area").innerHTML=`<div class="readout"><div><div class="k">Tracks</div><div class="v">${res.trackCount}</div></div><div><div class="k">Planned</div><div class="v">${fmtClock(res.totalPlannedSec)}</div></div><div><div class="k">Music</div><div class="v">${fmtClock(res.totalFilledSec)}</div></div>${bpmMeta}</div><div class="strip">${strip}</div>${segs}${actions}`;
+  $("#results-area").innerHTML=`<div class="readout"><div><div class="k">Tracks</div><div class="v">${res.trackCount}</div></div><div><div class="k">Planned</div><div class="v">${fmtClock(res.totalPlannedSec)}</div></div><div><div class="k">Music</div><div class="v">${fmtClock(res.totalFilledSec)}</div></div>${bpmMeta}</div><div class="strip">${strip}</div>${pager}${segs}${pager}${actions}`;
   $("#results-area").querySelectorAll(".rm").forEach((btn)=>{
     btn.onclick=()=>removeTrack(+btn.dataset.seg,+btn.dataset.track);
   });
@@ -1406,6 +1458,12 @@ function renderResults(res,opts={}){
   if(addTrackSeg!=null)wireAddTrackPanel($("#results-area"));
   const again=$("#searchAgainBtn");
   if(again)again.onclick=()=>{closeAddTrackPanel();runPoolSearch({keepMatchedOnly:true,includePlaylistArtists:true,includeSeeds:true});};
+  const clearBtn=$("#clearPlaylistBtn");
+  if(clearBtn)clearBtn.onclick=()=>clearPlaylist();
+  const prevBtn=$("#playlistPrevBtn");
+  if(prevBtn)prevBtn.onclick=()=>{if(playlistPage>0){playlistPage--;renderResults(lastResult,{scroll:false});}};
+  const nextBtn=$("#playlistNextBtn");
+  if(nextBtn)nextBtn.onclick=()=>{if(playlistPage<pageCount-1){playlistPage++;renderResults(lastResult,{scroll:false});}};
   const exportNameInput=$("#exportName");
   if(exportNameInput){
     exportNameInput.oninput=()=>{playlistExportName=exportNameInput.value;saveDraft();};
@@ -1417,13 +1475,14 @@ function renderResults(res,opts={}){
   }
 }
 
+
 loadCal();
 loadDraft();
 const _svc=new URLSearchParams(location.search).get("service");
 if(_svc&&(_svc==="tidal"||_svc==="spotify")){
   if(state.service!==_svc){
     /* OAuth landed on a different service than the draft — drop the other service's draft. */
-    state.seeds=[];lastPlaylist=[];lastResult=null;lastCandidates=[];excludedIds=new Set();playlistExportName=null;
+    state.seeds=[];lastPlaylist=[];lastResult=null;lastCandidates=[];excludedIds=new Set();playlistExportName=null;playlistPage=0;
     clearDraftStorage();
   }
   state.service=_svc;
