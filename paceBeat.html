@@ -1417,9 +1417,9 @@ function renderResults(res,opts={}){
     return`<section><div class="seg-head"><span class="miles">Miles ${p.segment.startMile}–${p.segment.endMile} <span style="color:var(--muted);font-weight:400">@ ${p.label}</span></span><span class="cad">${Math.round(p.cadence)} spm · need ${fmtClock(p.segDuration)}</span></div>${tracks}${addPanel}${note}</section>`;
   }).join("");
   const pager=totalTracks>PLAYLIST_PAGE_SIZE?`<div class="pager" role="navigation" aria-label="Playlist pages">
-      <button type="button" class="btn secondary" id="playlistPrevBtn"${playlistPage<=0?" disabled":""}>Previous</button>
-      <span class="meta">${pageStart+1}–${pageEnd} of ${totalTracks}</span>
-      <button type="button" class="btn secondary" id="playlistNextBtn"${playlistPage>=pageCount-1?" disabled":""}>Next</button>
+      <button type="button" class="btn secondary" data-playlist-page="prev"${playlistPage<=0?" disabled":""}>Previous</button>
+      <span class="meta">Page ${playlistPage+1}/${pageCount} · ${pageStart+1}–${pageEnd} of ${totalTracks}</span>
+      <button type="button" class="btn secondary" data-playlist-page="next"${playlistPage>=pageCount-1?" disabled":""}>Next</button>
     </div>`:"";
   const canExport=LOGGEDIN&&lastPlaylist.some(t=>t.ref||t.id);
   const plArtists=artistsFromPlaylist(lastPlaylist);
@@ -1467,16 +1467,29 @@ function renderResults(res,opts={}){
   if(again)again.onclick=()=>{closeAddTrackPanel();runPoolSearch({keepMatchedOnly:true,includePlaylistArtists:true,includeSeeds:true});};
   const clearBtn=$("#clearPlaylistBtn");
   if(clearBtn)clearBtn.onclick=()=>clearPlaylist();
-  const prevBtn=$("#playlistPrevBtn");
-  if(prevBtn)prevBtn.onclick=()=>{if(playlistPage>0){playlistPage--;renderResults(lastResult,{scroll:false});}};
-  const nextBtn=$("#playlistNextBtn");
-  if(nextBtn)nextBtn.onclick=()=>{if(playlistPage<pageCount-1){playlistPage++;renderResults(lastResult,{scroll:false});}};
+  // Pager is rendered above and below the list — wire every button (IDs would only bind the first).
+  $("#results-area").querySelectorAll("[data-playlist-page]").forEach((btn)=>{
+    btn.onclick=()=>{
+      const dir=btn.getAttribute("data-playlist-page");
+      if(dir==="prev"){
+        if(playlistPage<=0)return;
+        playlistPage--;
+      }else if(dir==="next"){
+        if(playlistPage>=pageCount-1)return;
+        playlistPage++;
+      }else return;
+      renderResults(lastResult,{scroll:false,scrollPlaylist:true});
+    };
+  });
   const exportNameInput=$("#exportName");
   if(exportNameInput){
     exportNameInput.oninput=()=>{playlistExportName=exportNameInput.value;saveDraft();};
   }
   const eb=$("#exportBtn");if(eb&&canExport&&!searching)eb.onclick=()=>shipPlaylist(eb);
-  if(scroll){
+  if(opts.scrollPlaylist){
+    const focus=$("#results-area .strip")||$("#results-area");
+    focus?.scrollIntoView({behavior:matchMedia("(prefers-reduced-motion:reduce)").matches?"auto":"smooth",block:"start"});
+  }else if(scroll){
     const focus=$("#pool-progress-slot:not([hidden])")||$("#results-area");
     focus.scrollIntoView({behavior:matchMedia("(prefers-reduced-motion:reduce)").matches?"auto":"smooth",block:"start"});
   }
