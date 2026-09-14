@@ -203,7 +203,7 @@
           <span class="chip" id="mHalf" aria-pressed="true" role="button" tabindex="0">Half-time</span>
         </div></label>
       <label class="toggle" style="grid-column:1/-1">
-        <input type="checkbox" id="repeat" style="width:auto" /> Allow repeats (needed to fill long runs)</label>
+        <input type="checkbox" id="repeat" style="width:auto" /> Allow repeats (rotates matches to fill long runs)</label>
     </div>
     <div class="legend"><span><b class="tag direct" style="padding:1px 5px">direct</b> beat = cadence</span><span><b class="tag half" style="padding:1px 5px">half</b> step every beat · ½ tolerance</span></div>
   </section>
@@ -289,16 +289,33 @@ function packTracks(pool,targetSec,overshootSec,usedG,allowRepeats){
     }
     take(chosen);
   }
+  // Gap-fill with repeats: rotate least-used tracks so one BPM-best song
+  // doesn't get pasted for the entire run (e.g. 60× the same metalcore track).
   if(allowRepeats&&filled<targetSec&&avail.length){
+    const playCount=new Map();
+    for(const e of picks) playCount.set(e.t.id,(playCount.get(e.t.id)||0)+1);
+    let lastId=picks.length?picks[picks.length-1].t.id:null;
     let guard=0;
-    while(filled<targetSec&&guard++<800){
+    while(filled<targetSec&&guard++<2000){
       const rem=targetSec-filled;
-      const fit=avail.filter(e=>durOf(e)<=rem+overshootSec);
-      if(fit.length){take(fit[0]);continue;}
-      const packed=searchPack(avail,rem,6);
-      if(!packed.picks.length)break;
-      for(const e of packed.picks){picks.push(e);filled+=durOf(e);}
-      break;
+      let fit=avail.filter(e=>durOf(e)<=rem+overshootSec);
+      if(!fit.length) fit=avail.filter(e=>durOf(e)<=rem+Math.max(overshootSec,180));
+      if(!fit.length) fit=avail;
+      const ranked=[...fit].sort((a,b)=>{
+        const ca=playCount.get(a.t.id)||0, cb=playCount.get(b.t.id)||0;
+        if(ca!==cb) return ca-cb;
+        if(fit.length>1){
+          const aSame=a.t.id===lastId?1:0, bSame=b.t.id===lastId?1:0;
+          if(aSame!==bSame) return aSame-bSame;
+        }
+        return 0; // keep BPM-sort order among equal play counts
+      });
+      const e=ranked[0];
+      if(!e) break;
+      picks.push(e);
+      playCount.set(e.t.id,(playCount.get(e.t.id)||0)+1);
+      lastId=e.t.id;
+      filled+=durOf(e);
     }
   }
   return{picks,filled};
@@ -331,12 +348,16 @@ function buildPlaylist(segments,candidates,opts){
     if(rem>0){
       const first=packTracks(pool,rem,overshootSec,usedG,allowRepeats);
       picks=first.picks;filled=first.filled;
-      // Always finish the run: if unique packing still left a gap, reuse BPM-matched
-      // songs for the remainder (even when "Allow repeats" is off).
+      // Finish the run with BPM-matched reuse when the pool is diverse enough to
+      // rotate, or when the user explicitly allowed repeats. A 1–2 song pool
+      // would otherwise paste the same track dozens of times.
       if(filled<rem-15&&pool.length){
-        const gap=packTracks(pool,rem-filled,Math.max(overshootSec,180),usedG,true);
-        picks=picks.concat(gap.picks);
-        filled+=gap.filled;
+        const uniqueN=new Set(pool.map((e)=>e.t.id)).size;
+        if(allowRepeats||uniqueN>=4){
+          const gap=packTracks(pool,rem-filled,Math.max(overshootSec,180),usedG,true);
+          picks=picks.concat(gap.picks);
+          filled+=gap.filled;
+        }
       }
     }
     const keptTracks=kept.map((t)=>({
